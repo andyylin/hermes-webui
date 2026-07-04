@@ -74,12 +74,35 @@ def test_project_quick_create_styles_exist_and_are_discrete_to_pointer_layouts()
     assert "@media (hover:none) and (pointer:coarse)" in css
 
 
-def _run_new_session_case(options, active_project=None):
+def _run_new_session_case(
+    options,
+    active_project=None,
+    all_projects=None,
+    profile_default_workspace=None,
+    switch_workspace=None,
+    session=None,
+):
     _DRIVER = r"""
 const fs = require('fs');
 const [path, argsJson] = process.argv.slice(-2);
 const args = JSON.parse(argsJson);
 const src = fs.readFileSync(path, 'utf8');
+
+function extractFunction(source, name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(name + ' not found');
+  const brace = source.indexOf('{', start);
+  let depth = 0;
+  for (let i = brace; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error('function body not closed for ' + name);
+}
 
 function extractAsyncFunction(source, name) {
   const marker = `async function ${name}(`;
@@ -97,6 +120,7 @@ function extractAsyncFunction(source, name) {
   throw new Error('function body not closed for ' + name);
 }
 
+const resolverSrc = extractFunction(src, '_resolveProjectForNewSession');
 const newSessionSrc = extractAsyncFunction(src, 'newSession');
 
 globalThis.window = globalThis;
@@ -119,6 +143,7 @@ globalThis.localStorage = { getItem: () => null, setItem: () => {} };
 globalThis.history = { replaceState: () => {} };
 globalThis.NO_PROJECT_FILTER = '__none__';
 globalThis._activeProject = args.activeProject;
+globalThis._allProjects = args.allProjects || [];
 globalThis._sessionSourceFilter = 'webui';
 globalThis._newSessionInFlight = null;
 globalThis._messagesTruncated = false;
@@ -130,8 +155,8 @@ globalThis.S = {
   messages: [],
   activeProfile: 'default',
   _pendingSessionToolsets: null,
-  _profileSwitchWorkspace: null,
-  _profileDefaultWorkspace: null,
+  _profileSwitchWorkspace: args.switchWorkspace || null,
+  _profileDefaultWorkspace: args.profileDefaultWorkspace || null,
 };
 globalThis._defaultModel = null;
 globalThis._activeProvider = 'openai';
@@ -162,6 +187,7 @@ globalThis.api = async (_url, opts) => {
   return { session: { session_id: 's-1', messages: [], model: 'gpt-4', model_provider: 'openai', workspace: null, message_count: 0, last_usage: {} } };
 };
 
+eval(resolverSrc);
 eval(newSessionSrc);
 
 (async () => {
@@ -175,8 +201,11 @@ eval(newSessionSrc);
 
     payload = {
         "activeProject": active_project,
+        "allProjects": all_projects or [],
         "options": options,
-        "session": {"session_id": "session-1"},
+        "profileDefaultWorkspace": profile_default_workspace,
+        "switchWorkspace": switch_workspace,
+        "session": session if session is not None else {"session_id": "session-1"},
     }
     result = subprocess.run(
         [NODE, "-e", _DRIVER, str(SESSIONS_JS), json.dumps(payload)],
@@ -218,6 +247,88 @@ def test_new_session_falls_back_to_active_project_when_override_missing():
         active_project={"profile": "default", "project_id": "active-project"},
     )
     assert body["project_id"] == "active-project"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_uses_explicit_project_default_workspace_before_profile_default():
+    body = _run_new_session_case(
+        {"project_id": "explicit-project"},
+        active_project="active-project",
+        all_projects=[
+            {
+                "project_id": "explicit-project",
+                "name": "Explicit",
+                "default_workspace": "/workspace/project",
+            },
+            {
+                "project_id": "active-project",
+                "name": "Active",
+                "default_workspace": "/workspace/active",
+            },
+        ],
+        profile_default_workspace="/workspace/profile",
+        session={"session_id": "session-1", "workspace": "/workspace/session"},
+    )
+    assert body["project_id"] == "explicit-project"
+    assert body["workspace"] == "/workspace/project"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_uses_active_project_default_workspace_before_profile_default():
+    body = _run_new_session_case(
+        {},
+        active_project="active-project",
+        all_projects=[
+            {
+                "project_id": "active-project",
+                "name": "Active",
+                "default_workspace": "/workspace/active",
+            },
+        ],
+        profile_default_workspace="/workspace/profile",
+        session={"session_id": "session-1", "workspace": "/workspace/session"},
+    )
+    assert body["project_id"] == "active-project"
+    assert body["workspace"] == "/workspace/active"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_profile_switch_workspace_overrides_project_default_workspace():
+    body = _run_new_session_case(
+        {},
+        active_project="active-project",
+        all_projects=[
+            {
+                "project_id": "active-project",
+                "name": "Active",
+                "default_workspace": "/workspace/active",
+            },
+        ],
+        profile_default_workspace="/workspace/profile",
+        switch_workspace="/workspace/switch",
+        session={"session_id": "session-1", "workspace": "/workspace/session"},
+    )
+    assert body["project_id"] == "active-project"
+    assert body["workspace"] == "/workspace/switch"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_explicit_project_id_none_does_not_use_active_project_default_workspace():
+    body = _run_new_session_case(
+        {"project_id": None},
+        active_project="active-project",
+        all_projects=[
+            {
+                "project_id": "active-project",
+                "name": "Active",
+                "default_workspace": "/workspace/active",
+            },
+        ],
+        profile_default_workspace="/workspace/profile",
+        session={"session_id": "session-1", "workspace": "/workspace/session"},
+    )
+    assert body["project_id"] is None
+    assert body["workspace"] == "/workspace/profile"
 
 
 _HELPER = r"""
@@ -434,3 +545,85 @@ def test_project_chip_quick_create_swallows_duplicate_inflight_rejections():
     assert out["filterProjectId"] == "keep-me"
     assert {"type": "set-filter", "project": {"profile": "default", "project_id": "project-123"}} not in out["calls"]
     assert out["toasts"] == ["New conversation already in progress"]
+
+
+# ── #5457: project default workspace selection ────────────────────────────────
+
+
+def test_resolve_project_helper_exists():
+    """`_resolveProjectForNewSession` must be defined in sessions.js."""
+    src = _read(SESSIONS_JS)
+    assert "function _resolveProjectForNewSession(" in src, (
+        "_resolveProjectForNewSession helper not found in sessions.js"
+    )
+
+
+def test_new_session_workspace_precedence_uses_project_default_before_profile():
+    """Workspace resolution uses project default_workspace before profile/session fallback."""
+    src = _read(SESSIONS_JS)
+    idx = src.find("async function newSession(")
+    assert idx >= 0, "newSession function not found in sessions.js"
+    new_session_src = src[idx: idx + 2500]
+    # The project resolver must be called before building reqBody
+    resolver_idx = new_session_src.find("_resolveProjectForNewSession(")
+    req_body_idx = new_session_src.find("const reqBody=")
+    assert resolver_idx != -1, "_resolveProjectForNewSession not called in newSession"
+    assert resolver_idx < req_body_idx, (
+        "_resolveProjectForNewSession must be called before reqBody is built"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_uses_active_project_default_workspace():
+    """When the active project has default_workspace, newSession() uses it in reqBody.workspace."""
+    all_projects = [
+        {"project_id": "proj-ws", "name": "MyProject", "default_workspace": "/home/user/projws"},
+    ]
+    body = _run_new_session_case({}, active_project="proj-ws", all_projects=all_projects)
+    assert body.get("workspace") == "/home/user/projws", (
+        f"Expected project default workspace, got {body.get('workspace')!r}"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_uses_explicit_project_id_default_workspace():
+    """When project_id is passed explicitly, the matching project's default_workspace is used."""
+    all_projects = [
+        {"project_id": "proj-ws", "name": "MyProject", "default_workspace": "/home/user/projws"},
+    ]
+    body = _run_new_session_case(
+        {"project_id": "proj-ws"},
+        active_project=None,
+        all_projects=all_projects,
+    )
+    assert body.get("workspace") == "/home/user/projws", (
+        f"Expected explicit project default workspace, got {body.get('workspace')!r}"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_project_id_none_does_not_inherit_project_workspace():
+    """project_id:null means no project — project default workspace must NOT be applied."""
+    all_projects = [
+        {"project_id": "proj-ws", "name": "MyProject", "default_workspace": "/home/user/projws"},
+    ]
+    body = _run_new_session_case(
+        {"project_id": None},
+        active_project="proj-ws",
+        all_projects=all_projects,
+    )
+    assert body.get("workspace") is None, (
+        f"project_id:null must not inherit project workspace, got {body.get('workspace')!r}"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_project_without_default_workspace_leaves_workspace_null():
+    """A project with no default_workspace leaves reqBody.workspace as null."""
+    all_projects = [
+        {"project_id": "proj-plain", "name": "PlainProject"},
+    ]
+    body = _run_new_session_case({}, active_project="proj-plain", all_projects=all_projects)
+    assert body.get("workspace") is None, (
+        f"Project with no default_workspace must not set workspace, got {body.get('workspace')!r}"
+    )

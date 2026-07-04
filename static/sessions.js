@@ -945,6 +945,18 @@ function _setNewSessionPending(pending){
   }
 }
 
+function _resolveProjectForNewSession(options){
+  let pid;
+  if(Object.prototype.hasOwnProperty.call(options,'project_id')){
+    pid=options.project_id;
+  }else if(typeof _activeProject!=='undefined'&&_activeProject&&_activeProject!==NO_PROJECT_FILTER){
+    pid=_activeProject;
+  }
+  if(!pid) return null;
+  const _projects=typeof _allProjects!=='undefined'?_allProjects:[];
+  return _projects.find(p=>p.project_id===pid)||null;
+}
+
 async function newSession(flash, options={}){
   if(_newSessionInFlight){
     if(typeof showToast==='function') showToast(_newSessionPendingText(),1500);
@@ -962,10 +974,12 @@ async function newSession(flash, options={}){
     _messagesTruncated=false;
     _oldestIdx=0;
     clearLiveToolCards();
-    // One-shot profile-switch workspace wins first; otherwise prefer the profile default.
+    // One-shot profile-switch workspace wins first; otherwise prefer project default, then profile default.
     const switchWs=S._profileSwitchWorkspace;
     S._profileSwitchWorkspace=null;
-    const inheritWs=switchWs||(S._profileDefaultWorkspace||null)||(S.session?S.session.workspace:null);
+    const _newSessionProj=_resolveProjectForNewSession(options);
+    const projectWs=(_newSessionProj&&_newSessionProj.default_workspace)||null;
+    const inheritWs=switchWs||projectWs||(S._profileDefaultWorkspace||null)||(S.session?S.session.workspace:null);
     const reqBody={
       workspace:inheritWs,
       profile:S.activeProfile||'default',
@@ -8142,6 +8156,63 @@ function _startProjectRename(proj, chip){
   setTimeout(()=>{inp.focus();inp.select();},10);
 }
 
+function _projectWorkspaceDisplayKey(path){
+  return String(path||'').trim().replace(/\\/g,'/').replace(/\/+$/,'');
+}
+
+function _showProjectDefaultWorkspacePicker(proj, wsList, anchorEvent){
+  document.querySelectorAll('.project-ws-picker').forEach(el=>el.remove());
+  const pick=document.createElement('div');
+  pick.className='project-ws-picker';
+  pick.style.cssText='position:fixed;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 0;z-index:9999;min-width:200px;max-width:340px;max-height:300px;overflow-y:auto;box-shadow:0 4px 16px rgba(0,0,0,.35);';
+  const vw=window.innerWidth||document.documentElement.clientWidth||0;
+  const vh=window.innerHeight||document.documentElement.clientHeight||0;
+  const x=Math.max(8,Math.min(anchorEvent.clientX||8,(vw||348)-348));
+  const y=Math.max(8,Math.min(anchorEvent.clientY||8,(vh||316)-316));
+  pick.style.left=x+'px';
+  pick.style.top=y+'px';
+  const makeRow=(label,ws,danger)=>{
+    const row=document.createElement('div');
+    const isCurrent=_projectWorkspaceDisplayKey(ws)===_projectWorkspaceDisplayKey(proj.default_workspace);
+    row.textContent=label+(isCurrent?' ✓':'');
+    row.style.cssText='padding:7px 14px;cursor:pointer;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'+(danger?'color:var(--error,#e94560);':'color:var(--text);');
+    row.onmouseenter=()=>row.style.background='var(--hover-bg)';
+    row.onmouseleave=()=>row.style.background='';
+    row.onclick=async()=>{
+      pick.remove();
+      document.removeEventListener('click',dismiss);
+      try{
+        await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:proj.name,color:proj.color||null,default_workspace:ws||null})});
+        await renderSessionList();
+        showToast(ws?'Default workspace set':'Default workspace cleared');
+      }catch(err){
+        showToast('Failed: '+(err.message||err));
+      }
+    };
+    return row;
+  };
+  if(proj.default_workspace){
+    pick.appendChild(makeRow('Clear default',null,true));
+    const sep=document.createElement('hr');
+    sep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
+    pick.appendChild(sep);
+  }
+  if(!wsList||!wsList.length){
+    const none=document.createElement('div');
+    none.textContent='No saved workspaces';
+    none.style.cssText='padding:7px 14px;font-size:12px;color:var(--text);';
+    pick.appendChild(none);
+  }else{
+    wsList.forEach(ws=>{
+      const label=typeof ws==='string'?ws:(ws.path||ws.name||String(ws));
+      pick.appendChild(makeRow(label,label,false));
+    });
+  }
+  document.body.appendChild(pick);
+  const dismiss=()=>{pick.remove();document.removeEventListener('click',dismiss);};
+  setTimeout(()=>document.addEventListener('click',dismiss),0);
+}
+
 function _showProjectContextMenu(e, proj, chip){
   document.querySelectorAll('.project-ctx-menu').forEach(el=>el.remove());
   const menu=document.createElement('div');
@@ -8183,6 +8254,23 @@ function _showProjectContextMenu(e, proj, chip){
     colorRow.appendChild(dot);
   });
   menu.appendChild(colorRow);
+
+  // Default workspace
+  const wsItem=document.createElement('div');
+  wsItem.textContent='Default workspace'+(proj.default_workspace?' ✓':'');
+  wsItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+  wsItem.onmouseenter=()=>wsItem.style.background='var(--hover-bg)';
+  wsItem.onmouseleave=()=>wsItem.style.background='';
+  wsItem.onclick=async(wsEv)=>{
+    menu.remove();
+    try{
+      const data=await api('/api/workspaces',{method:'GET'});
+      _showProjectDefaultWorkspacePicker(proj,(data&&data.workspaces)||[],wsEv||e);
+    }catch(err){
+      showToast('Failed to load workspaces: '+(err.message||err));
+    }
+  };
+  menu.appendChild(wsItem);
 
   // Divider + Delete
   const sep=document.createElement('hr');
