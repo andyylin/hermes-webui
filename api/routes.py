@@ -12790,7 +12790,10 @@ def _get_project_default_workspace_for_session(project_id: str, active_profile: 
     """Return the stored default_workspace for *project_id* visible to *active_profile*, or None."""
     if not project_id:
         return None
-    for proj in load_projects():
+    from api.projects_db_adapter import canonical_projects_enabled
+    _canonical_enabled = canonical_projects_enabled()
+    _projects = load_projects(include_db=True, profile_name=active_profile) if _canonical_enabled else load_projects()
+    for proj in _projects:
         if proj.get("project_id") == project_id and _profiles_match(proj.get("profile"), active_profile):
             dw = proj.get("default_workspace")
             if not dw:
@@ -13538,6 +13541,17 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
         with _get_session_agent_lock(body["session_id"]):
             s.workspace = new_ws
+            from api.projects_db_adapter import canonical_projects_enabled, project_for_workspace
+            if (
+                "workspace" in body
+                and canonical_projects_enabled()
+                and not getattr(s, "worktree_path", None)
+            ):
+                matched_project = project_for_workspace(
+                    new_ws,
+                    profile_name=getattr(s, "profile", None) or get_active_profile_name(),
+                )
+                s.project_id = matched_project.get("project_id") if matched_project else None
             if "model" in body or "model_provider" in body:
                 model, provider = _session_model_state_from_request(
                     body.get("model", s.model),
@@ -14691,6 +14705,16 @@ def handle_post(handler, parsed) -> bool:
                 return bad(handler, "Project not found", 404)
             if not _profiles_match(target.get("profile"), _session_profile):
                 return bad(handler, "Project not found", 404)
+            from api.projects_db_adapter import bind_project_workspace, canonical_projects_enabled
+            if canonical_projects_enabled() and target.get("project_source") == "projects_db":
+                if not target.get("primary_path") and getattr(s, "workspace", None):
+                    target = bind_project_workspace(
+                        target_pid, str(resolve_trusted_workspace(s.workspace)),
+                        profile_name=_session_profile,
+                    ) or target
+                _target_workspace = target.get("primary_path")
+            else:
+                _target_workspace = None
         # #3746: acquire the per-session agent lock with a bounded timeout
         # instead of blocking indefinitely. The streaming thread holds this same
         # lock during checkpoint saves; on slow file I/O (e.g. WSL/DrvFs) a bare
@@ -14708,6 +14732,8 @@ def handle_post(handler, parsed) -> bool:
             )
         try:
             s.project_id = target_pid
+            if target_pid and _target_workspace and not getattr(s, "worktree_path", None):
+                s.workspace = str(resolve_trusted_workspace(_target_workspace))
             s.save()
         finally:
             _move_lock.release()
@@ -14742,11 +14768,25 @@ def handle_post(handler, parsed) -> bool:
             from api.profiles import _PROFILE_ID_RE
             if not _PROFILE_ID_RE.fullmatch(_requested_profile):
                 return bad(handler, "invalid profile")
+        _project_profile = _requested_profile or get_active_profile_name() or 'default'
+        _canonical_workspace = None
+        if body.get("default_workspace"):
+            try:
+                _canonical_workspace = str(resolve_trusted_workspace(body["default_workspace"]))
+            except (TypeError, ValueError) as _e:
+                return bad(handler, f"invalid default_workspace: {_e}")
+        from api.projects_db_adapter import canonical_projects_enabled, create_project_in_db
+        if canonical_projects_enabled():
+            proj = create_project_in_db(
+                name=name, color=color, profile_name=_project_profile,
+                primary_path=_canonical_workspace,
+            )
+            return j(handler, {"ok": True, "project": proj})
         proj = {
             "project_id": uuid.uuid4().hex[:12],
             "name": name,
             "color": color,
-            "profile": _requested_profile or get_active_profile_name() or 'default',
+            "profile": _project_profile,
             "created_at": time.time(),
         }
         if "default_workspace" in body:
@@ -14767,8 +14807,10 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
         import re as _re
 
-        projects = load_projects()
         active_profile = get_active_profile_name()
+        from api.projects_db_adapter import canonical_projects_enabled, update_project_in_db
+        _canonical_enabled = canonical_projects_enabled()
+        projects = load_projects(include_db=True, profile_name=active_profile) if _canonical_enabled else load_projects()
         proj = next(
             (p for p in projects if project_identity_matches(p, body["project_id"], active_profile)), None
         )
@@ -14776,6 +14818,20 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Project not found", 404)
         if not _profiles_match(proj.get("profile"), active_profile):
             return bad(handler, "Project not found", 404)
+        if _canonical_enabled and proj.get("project_source") == "projects_db":
+            _primary = None
+            _update_primary = "default_workspace" in body
+            if body.get("default_workspace"):
+                _primary = str(resolve_trusted_workspace(body["default_workspace"]))
+            updated = update_project_in_db(
+                body["project_id"], profile_name=active_profile,
+                name=body["name"].strip()[:128],
+                color=body.get("color") if "color" in body else None,
+                primary_path=_primary, update_primary=_update_primary,
+            )
+            if not updated:
+                return bad(handler, "Project not found", 404)
+            return j(handler, {"ok": True, "project": updated})
         proj["name"] = body["name"].strip()[:128]
         if "color" in body:
             color = body["color"]
@@ -14799,8 +14855,10 @@ def handle_post(handler, parsed) -> bool:
             require(body, "project_id")
         except ValueError as e:
             return bad(handler, str(e))
-        projects = load_projects()
         active_profile = get_active_profile_name()
+        from api.projects_db_adapter import canonical_projects_enabled, delete_project_in_db
+        _canonical_enabled = canonical_projects_enabled()
+        projects = load_projects(include_db=True, profile_name=active_profile) if _canonical_enabled else load_projects()
         proj = next(
             (p for p in projects if project_identity_matches(p, body["project_id"], active_profile)), None
         )
@@ -14808,11 +14866,14 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Project not found", 404)
         if not _profiles_match(proj.get("profile"), active_profile):
             return bad(handler, "Project not found", 404)
-        projects = [
-            p for p in projects
-            if not project_identity_matches(p, body["project_id"], active_profile)
-        ]
-        save_projects(projects)
+        if _canonical_enabled and proj.get("project_source") == "projects_db":
+            if not delete_project_in_db(body["project_id"], profile_name=active_profile):
+                return bad(handler, "Project not found", 404)
+        else:
+            projects = [p for p in projects if not project_identity_matches(
+                p, body["project_id"], active_profile
+            )]
+            save_projects(projects)
         # Unassign all sessions that belonged to this project.
         # #3746: this loop is O(N) full-JSON read+save per session, and each
         # save() reserializes the entire messages array. For a project with many

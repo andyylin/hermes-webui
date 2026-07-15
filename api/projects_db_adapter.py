@@ -1,4 +1,5 @@
 """Read-only adapter from hermes_cli.projects_db into WebUI project dicts."""
+
 from __future__ import annotations
 
 import importlib
@@ -6,6 +7,7 @@ import logging
 import shutil
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -29,12 +31,18 @@ def _project_to_webui_dict(project, profile_name: str) -> dict:
         "color": project.color,
         "profile": profile_name,
     }
+    canonical_id = getattr(project, "id", None)
+    if canonical_id is not None:
+        row["canonical_id"] = canonical_id
+        row["project_source"] = "projects_db"
     created_at = getattr(project, "created_at", None)
     if created_at is not None:
         row["created_at"] = created_at
     primary_path = getattr(project, "primary_path", None)
     if primary_path is not None:
         row["primary_path"] = primary_path
+        if canonical_id is not None:
+            row["default_workspace"] = primary_path
     folders = getattr(project, "folders", None)
     if folders is not None:
         row["folders"] = [
@@ -42,6 +50,111 @@ def _project_to_webui_dict(project, profile_name: str) -> dict:
             for folder in folders
         ]
     return row
+
+
+def canonical_projects_enabled() -> bool:
+    try:
+        from api.config import get_config
+
+        return (get_config().get("projects") or {}).get("canonical_store") is True
+    except Exception:
+        return False
+
+
+def _projects_module():
+    return importlib.import_module("hermes_cli.projects_db")
+
+
+def _db_path(profile_name: str | None = None) -> tuple[str, Path]:
+    from api.profiles import get_hermes_home_for_profile
+
+    profile = _active_profile_name(profile_name)
+    return profile, Path(get_hermes_home_for_profile(profile)) / "projects.db"
+
+
+@contextmanager
+def _writable_projects(profile_name: str | None = None):
+    projects_db = _projects_module()
+    profile, db_path = _db_path(profile_name)
+    conn = projects_db.connect(db_path=db_path)
+    try:
+        yield projects_db, conn, profile
+    finally:
+        conn.close()
+
+
+def create_project_in_db(
+    *,
+    name: str,
+    color: str | None,
+    profile_name: str | None = None,
+    slug: str | None = None,
+    primary_path: str | None = None,
+) -> dict:
+    with _writable_projects(profile_name) as (projects_db, conn, profile):
+        project_id = projects_db.create_project(
+            conn,
+            name=name,
+            slug=slug,
+            color=color,
+            primary_path=primary_path,
+            folders=[primary_path] if primary_path else [],
+        )
+        project = projects_db.get_project(conn, project_id)
+        if project is None:
+            raise RuntimeError("project vanished after create")
+        return _project_to_webui_dict(project, profile)
+
+
+def update_project_in_db(
+    project_key: str,
+    *,
+    profile_name: str | None = None,
+    name: str | None = None,
+    color: str | None = None,
+    primary_path: str | None = None,
+    update_primary: bool = False,
+) -> dict | None:
+    with _writable_projects(profile_name) as (projects_db, conn, profile):
+        project = projects_db.get_project(conn, project_key)
+        if project is None:
+            return None
+        projects_db.update_project(conn, project.id, name=name, color=color)
+        if update_primary:
+            if primary_path:
+                projects_db.add_folder(conn, project.id, primary_path, is_primary=True)
+            elif project.primary_path:
+                projects_db.remove_folder(conn, project.id, project.primary_path)
+        updated = projects_db.get_project(conn, project.id)
+        return _project_to_webui_dict(updated, profile) if updated else None
+
+
+def delete_project_in_db(project_key: str, *, profile_name: str | None = None) -> bool:
+    with _writable_projects(profile_name) as (projects_db, conn, _profile):
+        project = projects_db.get_project(conn, project_key)
+        return bool(project and projects_db.delete_project(conn, project.id))
+
+
+def bind_project_workspace(
+    project_key: str, workspace: str, *, profile_name: str | None = None
+) -> dict | None:
+    with _writable_projects(profile_name) as (projects_db, conn, profile):
+        project = projects_db.get_project(conn, project_key)
+        if project is None:
+            return None
+        if not project.primary_path:
+            projects_db.add_folder(conn, project.id, workspace, is_primary=True)
+            project = projects_db.get_project(conn, project.id)
+        return _project_to_webui_dict(project, profile) if project else None
+
+
+def project_for_workspace(
+    workspace: str, *, profile_name: str | None = None
+) -> dict | None:
+    """Resolve workspace membership with Agent's longest-prefix project rule."""
+    with _writable_projects(profile_name) as (projects_db, conn, profile):
+        project = projects_db.project_for_path(conn, workspace)
+        return _project_to_webui_dict(project, profile) if project else None
 
 
 def load_projects_from_db(*, profile_name: str | None = None) -> list[dict] | None:
