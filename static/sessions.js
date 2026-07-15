@@ -947,14 +947,22 @@ function _setNewSessionPending(pending){
 
 function _resolveProjectForNewSession(options){
   let pid;
+  let projectFilter=null;
   if(Object.prototype.hasOwnProperty.call(options,'project_id')){
     pid=options.project_id;
   }else if(typeof _activeProject!=='undefined'&&_activeProject&&_activeProject!==NO_PROJECT_FILTER){
-    pid=_activeProject;
+    projectFilter=typeof _activeProject==='object'?_activeProject:null;
+    pid=projectFilter?_activeProject.project_id:_activeProject;
   }
   if(!pid) return null;
   const _projects=typeof _allProjects!=='undefined'?_allProjects:[];
-  return _projects.find(p=>p.project_id===pid)||null;
+  return _projects.find(p=>
+    projectFilter&&typeof _projectFilterMatches==='function'
+      ? _projectFilterMatches(projectFilter,p)
+      : p.project_id===pid&&(
+          !projectFilter||String(p.profile||'default')===String(projectFilter.profile||'default')
+        )
+  )||null;
 }
 
 async function newSession(flash, options={}){
@@ -989,7 +997,7 @@ async function newSession(flash, options={}){
     if(Object.prototype.hasOwnProperty.call(options,'project_id')){
       reqBody.project_id=options.project_id;
     } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
-      reqBody.project_id=_activeProject.project_id;
+      reqBody.project_id=typeof _activeProject==='object'?_activeProject.project_id:_activeProject;
     }
     // Forward a pre-session toolset override only from the empty composer (#4490).
     if(!S.session && Array.isArray(S._pendingSessionToolsets)) reqBody.enabled_toolsets=S._pendingSessionToolsets;

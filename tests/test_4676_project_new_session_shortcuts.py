@@ -293,6 +293,32 @@ def test_new_session_uses_active_project_default_workspace_before_profile_defaul
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_new_session_uses_profile_qualified_active_project_default_workspace():
+    body = _run_new_session_case(
+        {},
+        active_project={"profile": "work", "project_id": "shared-project"},
+        all_projects=[
+            {
+                "profile": "default",
+                "project_id": "shared-project",
+                "name": "Default",
+                "default_workspace": "/workspace/default",
+            },
+            {
+                "profile": "work",
+                "project_id": "shared-project",
+                "name": "Work",
+                "default_workspace": "/workspace/work",
+            },
+        ],
+        profile_default_workspace="/workspace/profile",
+        session={"session_id": "session-1", "workspace": "/workspace/session"},
+    )
+    assert body["project_id"] == "shared-project"
+    assert body["workspace"] == "/workspace/work"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_new_session_profile_switch_workspace_overrides_project_default_workspace():
     body = _run_new_session_case(
         {},
