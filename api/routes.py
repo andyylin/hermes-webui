@@ -2844,6 +2844,200 @@ def _kanban_unknown_endpoint(handler, parsed, method: str) -> bool:
     ) or True
 
 
+_KATIE_ACADEMIC_GUARD_STREAMS = {}
+_KATIE_ACADEMIC_GUARD_STREAMS_LOCK = threading.Lock()
+_KATIE_ACADEMIC_GUARD_STREAM_TTL_SECONDS = 120.0
+_KATIE_ACADEMIC_GUARD_STREAM_MAX = 256
+
+
+def _katie_academic_guard_decision(session, message):
+    """Evaluate Katie chat text before model/provider resolution.
+
+    The import is intentionally lazy because the guard is a Katie-only
+    extension.  If the extension cannot be loaded for a Katie request, fail
+    closed with a fixed response rather than silently running unguarded.
+    """
+    profile = str(
+        getattr(session, "profile", None) or _get_active_profile_name() or ""
+    ).strip().casefold()
+    if profile != "katie":
+        return None
+    try:
+        from katie_academic_guard import evaluate, unavailable_decision
+
+        decision = evaluate(
+            message,
+            recent_messages=(getattr(session, "messages", None) or []),
+        )
+    except Exception:
+        logger.exception("Katie academic-integrity guard failed closed")
+        try:
+            from katie_academic_guard import unavailable_decision
+
+            decision = unavailable_decision()
+        except Exception:
+            # This literal fallback keeps the security invariant even when the
+            # extension file itself is unavailable during a bad deployment.
+            class _UnavailableDecision:
+                blocked = True
+                reason_code = "guard_unavailable"
+                response = (
+                    "I’m temporarily unable to start this chat safely. Please try "
+                    "again later, or ask a parent or teacher for help."
+                )
+
+            decision = _UnavailableDecision()
+    return decision if getattr(decision, "blocked", False) else None
+
+
+def _katie_guard_stream_active(stream_id: str | None) -> bool:
+    now = time.time()
+    with _KATIE_ACADEMIC_GUARD_STREAMS_LOCK:
+        expired = [
+            sid
+            for sid, item in _KATIE_ACADEMIC_GUARD_STREAMS.items()
+            if now >= float(item.get("expires_at") or 0)
+        ]
+        for sid in expired:
+            _KATIE_ACADEMIC_GUARD_STREAMS.pop(sid, None)
+        item = _KATIE_ACADEMIC_GUARD_STREAMS.get(str(stream_id or ""))
+        return bool(item and now < float(item.get("expires_at") or 0))
+
+
+def _serve_katie_guard_stream(handler, stream_id: str | None) -> bool:
+    """Serve one buffered, model-free academic-integrity response as SSE."""
+    now = time.time()
+    with _KATIE_ACADEMIC_GUARD_STREAMS_LOCK:
+        item = _KATIE_ACADEMIC_GUARD_STREAMS.pop(str(stream_id or ""), None)
+    if not item or now >= float(item.get("expires_at") or 0):
+        return False
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
+    end_sse_headers(handler)
+    try:
+        for event, data in item.get("events", []):
+            _sse(handler, event, data)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    return True
+
+
+def _start_katie_guarded_stream(session, *, message: str, attachments, decision):
+    """Persist a refusal and return a stream id without invoking the agent."""
+    session_id = str(getattr(session, "session_id", "") or "")
+    stream_id = f"katie-guard-{uuid.uuid4().hex}"
+    started_at = time.time()
+    response = str(getattr(decision, "response", "") or "").strip()
+    if not response:
+        response = (
+            "I’m temporarily unable to start this chat safely. Please try again "
+            "later, or ask a parent or teacher for help."
+        )
+    with _get_session_agent_lock(session_id):
+        if getattr(session, "active_stream_id", None):
+            return {
+                "_status": 409,
+                "error": "A response is already being generated for this session",
+            }
+        user_row = {
+            "role": "user",
+            "content": message,
+            "timestamp": started_at,
+            "source": "webui",
+        }
+        if attachments:
+            user_row["attachments"] = attachments
+        assistant_row = {
+            "role": "assistant",
+            "content": response,
+            "timestamp": time.time(),
+            "source": "katie-academic-integrity-guard",
+            "policy_guard": "academic_integrity",
+        }
+        session.messages = list(getattr(session, "messages", None) or [])
+        session.messages.extend((user_row, assistant_row))
+        context_messages = list(getattr(session, "context_messages", None) or [])
+        context_messages.extend((user_row.copy(), assistant_row.copy()))
+        session.context_messages = context_messages
+        session.active_stream_id = None
+        session.pending_user_message = None
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.pending_user_source = None
+        session.save()
+        try:
+            compact = session.compact(include_runtime=True, active_stream_ids=[])
+        except TypeError:
+            compact = session.compact()
+        raw_session = compact | {
+            "messages": list(session.messages),
+            "message_count": len(session.messages),
+            "active_stream_id": None,
+            "pending_user_message": None,
+            "pending_attachments": [],
+            "pending_started_at": None,
+            "pending_user_source": None,
+        }
+        response_session = redact_session_data(raw_session)
+    events = [
+        ("token", {"text": response}),
+        (
+            "done",
+            {
+                "session": response_session,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "estimated_cost": 0.0,
+                    "duration_seconds": 0.0,
+                },
+                "policy_guard": "academic_integrity",
+            },
+        ),
+        ("stream_end", {"session_id": session_id}),
+    ]
+    with _KATIE_ACADEMIC_GUARD_STREAMS_LOCK:
+        now = time.time()
+        expired = [
+            sid
+            for sid, item in _KATIE_ACADEMIC_GUARD_STREAMS.items()
+            if now >= float(item.get("expires_at") or 0)
+        ]
+        for sid in expired:
+            _KATIE_ACADEMIC_GUARD_STREAMS.pop(sid, None)
+        if len(_KATIE_ACADEMIC_GUARD_STREAMS) >= _KATIE_ACADEMIC_GUARD_STREAM_MAX:
+            oldest = min(
+                _KATIE_ACADEMIC_GUARD_STREAMS,
+                key=lambda sid: float(
+                    _KATIE_ACADEMIC_GUARD_STREAMS[sid].get("expires_at") or 0
+                ),
+            )
+            _KATIE_ACADEMIC_GUARD_STREAMS.pop(oldest, None)
+        _KATIE_ACADEMIC_GUARD_STREAMS[stream_id] = {
+            "events": events,
+            "expires_at": now + _KATIE_ACADEMIC_GUARD_STREAM_TTL_SECONDS,
+        }
+    _publish_session_list_changed(
+        "session_message",
+        profile=getattr(session, "profile", None),
+        session_id=session_id,
+    )
+    logger.info(
+        "[katie-policy] academic_integrity_guard blocked profile=katie reason=%s stream=%s",
+        getattr(decision, "reason_code", None) or "blocked",
+        stream_id,
+    )
+    return {
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "started_at": started_at,
+        "policy_guard": "academic_integrity",
+    }
+
+
 def _clear_stale_stream_state(session) -> bool:
     """Clear persisted streaming flags when the in-memory stream no longer exists.
 
@@ -12289,7 +12483,7 @@ def handle_get(handler, parsed) -> bool:
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         if not _stream_id_visible_to_request_profile(handler, stream_id):
             return True
-        active = stream_id in STREAMS
+        active = stream_id in STREAMS or _katie_guard_stream_active(stream_id)
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
         try:
             journal = find_run_summary(stream_id) if stream_id else None
@@ -15926,6 +16120,8 @@ def _handle_sse_stream(handler, parsed):
     stream_id = qs.get("stream_id", [""])[0]
     if not _stream_id_visible_to_request_profile(handler, stream_id):
         return True
+    if _serve_katie_guard_stream(handler, stream_id):
+        return True
     stream = STREAMS.get(stream_id)
     if stream is None:
         if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
@@ -17153,15 +17349,19 @@ def _handle_media(handler, parsed):
     except Exception:
         return bad(handler, "Invalid path", 400)
 
-    # Allowed roots: hermes home, /tmp, and active workspace.
-    # Intentionally NOT the entire home dir — that would expose ~/.ssh,
-    # ~/.aws, browser profiles, etc. to any authenticated user.
-    allowed_roots = [
+    # Normal WebUI media keeps its historical roots. Katie's isolated profile
+    # is stricter: only its active workspace and per-session attachment inbox
+    # are media roots. This prevents a crafted media URL from reaching a
+    # sibling profile's workspace even though the service runs on the same host.
+    _isolated_profile = _os.getenv("HERMES_WEBUI_ISOLATED_PROFILE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    allowed_roots = [] if _isolated_profile else [
         _HERMES_HOME.resolve(),
         Path("/tmp").resolve(),
         (_HOME / ".hermes").resolve(),
     ]
-    # Also allow the active workspace directory (where screenshots land)
+    # Also allow the active workspace directory (where screenshots land).
     try:
         from api.workspace import get_last_workspace
         ws = Path(get_last_workspace()).resolve()
@@ -17169,11 +17369,19 @@ def _handle_media(handler, parsed):
             allowed_roots.append(ws)
     except Exception:
         pass
+    if _isolated_profile:
+        try:
+            from api.upload import _attachment_root
+            attachment_root = Path(_attachment_root()).resolve()
+            if attachment_root.is_dir():
+                allowed_roots.append(attachment_root)
+        except Exception:
+            pass
 
     # Also allow additional roots from MEDIA_ALLOWED_ROOTS env var
     # (os.pathsep-separated list; ":" on POSIX, ";" on Windows).
     extra_roots = _os.environ.get("MEDIA_ALLOWED_ROOTS", "").strip()
-    if extra_roots:
+    if extra_roots and not _isolated_profile:
         for root in extra_roots.split(_os.pathsep):
             root = root.strip()
             if root:
@@ -17205,6 +17413,8 @@ def _handle_media(handler, parsed):
         target,
         _SESSION_MEDIA_TOKEN_TYPES,
     )
+    if _isolated_profile and not within_allowed:
+        session_media_allowed = False
 
     # ── #3234: hard-deny Hermes's own state + secret/config files ────────────
     # The allowlist above grants the whole Hermes home (and base ~/.hermes), so
@@ -20065,6 +20275,21 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
+        # Katie's deterministic academic-integrity policy runs before any
+        # workspace/model/provider resolution.  A blocked turn therefore
+        # cannot reach the agent, tools, clarification machinery, or provider
+        # credentials; it is served through the normal SSE contract below.
+        diag.stage("academic_integrity_guard") if diag else None
+        guard_decision = _katie_academic_guard_decision(s, msg)
+        if guard_decision is not None:
+            guarded_response = _start_katie_guarded_stream(
+                s,
+                message=msg,
+                attachments=attachments,
+                decision=guard_decision,
+            )
+            status = int(guarded_response.pop("_status", 200) or 200)
+            return j(handler, guarded_response, status=status)
         diag.stage("resolve_workspace") if diag else None
         try:
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
