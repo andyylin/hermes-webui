@@ -43,7 +43,7 @@ class _FakeSession:
         self.pending_user_source = "webui"
         self.saved = 0
 
-    def save(self):
+    def save(self, **_kwargs):
         self.saved += 1
 
     def compact(self, **_kwargs):
@@ -102,6 +102,54 @@ def test_katie_guard_decision_is_profile_scoped_and_fails_closed(monkeypatch):
     decision = routes._katie_academic_guard_decision(session, "guard failure")
     assert decision.blocked is True
     assert decision.reason_code == "guard_unavailable"
+
+
+def test_katie_server_side_turn_blocks_before_workspace_or_provider(monkeypatch):
+    session = _FakeSession("katie-server-turn")
+    decision = SimpleNamespace(
+        blocked=True,
+        reason_code="outsourced_schoolwork",
+        response="coaching response",
+    )
+    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_katie_academic_guard_decision", lambda *_args, **_kwargs: decision)
+    monkeypatch.setattr(
+        routes,
+        "_resolve_chat_workspace_with_recovery",
+        lambda *_args: pytest.fail("blocked server turn must not resolve workspace"),
+    )
+
+    result = routes.start_session_turn(
+        session.session_id,
+        "Write my chemistry report for me",
+        source="process_wakeup",
+    )
+
+    assert result["policy_guard"] == "academic_integrity"
+    assert session.messages[0]["source"] == "process_wakeup"
+    assert session.saved == 1
+
+
+def test_katie_final_chat_binding_rechecks_guard_under_session_lock(monkeypatch):
+    session = _FakeSession("katie-final-recheck")
+    decision = SimpleNamespace(
+        blocked=True,
+        reason_code="multi_turn_outsourcing",
+        response="coaching response",
+    )
+    monkeypatch.setattr(routes, "_katie_academic_guard_decision", lambda *_args, **_kwargs: decision)
+
+    result = routes._start_chat_stream_for_session(
+        session,
+        msg="Do it for me",
+        attachments=[],
+        workspace="/tmp",
+        model="test-model",
+    )
+
+    assert result["policy_guard"] == "academic_integrity"
+    assert session.active_stream_id is None
+    assert session.saved == 1
 
 
 def test_katie_guard_decision_includes_pending_active_turn(monkeypatch):
@@ -286,6 +334,7 @@ def test_katie_steer_blocks_before_agent_and_covers_pending_short_followup(monke
             "message": "coaching response",
         }
         agent.steer.assert_not_called()
+        assert session.saved == 1
     finally:
         with config.SESSION_AGENT_CACHE_LOCK:
             config.SESSION_AGENT_CACHE.pop(sid, None)
@@ -317,6 +366,41 @@ def test_katie_steer_allows_owned_work_after_guard_passes(monkeypatch):
         )
         assert handler.payload()["accepted"] is True
         agent.steer.assert_called_once()
+        assert session.saved == 1
+    finally:
+        with config.SESSION_AGENT_CACHE_LOCK:
+            config.SESSION_AGENT_CACHE.pop(sid, None)
+        with config.STREAMS_LOCK:
+            config.STREAMS.pop(stream_id, None)
+            config.AGENT_INSTANCES.pop(stream_id, None)
+
+
+def test_katie_steer_fails_closed_when_control_checkpoint_fails(monkeypatch):
+    import api.streaming as streaming
+
+    sid, stream_id = "katie-persist-fail", "stream-persist-fail"
+    session = _FakeSession(sid)
+    session.active_stream_id = stream_id
+    session.save = MagicMock(side_effect=OSError("disk unavailable"))
+    agent = SimpleNamespace(session_id=sid, steer=MagicMock(return_value=True))
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_katie_academic_guard_decision", lambda *_args: None)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    with config.SESSION_AGENT_CACHE_LOCK:
+        config.SESSION_AGENT_CACHE[sid] = (agent, "sig")
+    with config.STREAMS_LOCK:
+        config.STREAMS[stream_id] = queue.Queue()
+        config.AGENT_INSTANCES[stream_id] = agent
+    try:
+        handler = _Handler()
+        streaming._handle_chat_steer(
+            handler,
+            {"session_id": sid, "text": "I will try this part myself."},
+        )
+        assert handler.status == 503
+        assert handler.payload()["policy_guard"] == "academic_integrity"
+        agent.steer.assert_not_called()
+        assert session.katie_academic_guard_context is None
     finally:
         with config.SESSION_AGENT_CACHE_LOCK:
             config.SESSION_AGENT_CACHE.pop(sid, None)
@@ -403,6 +487,7 @@ def test_katie_failed_steer_delivery_is_not_retained(monkeypatch):
         assert handler.payload()["accepted"] is False
         agent.steer.assert_called_once_with("Keep this only if delivery succeeds.")
         assert session.katie_academic_guard_context is None
+        assert session.saved == 2
     finally:
         with config.SESSION_AGENT_CACHE_LOCK:
             config.SESSION_AGENT_CACHE.pop(sid, None)
@@ -662,6 +747,7 @@ def test_katie_clarify_then_steer_shares_control_context(monkeypatch):
     monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
     monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
     monkeypatch.setattr(routes, "_resolve_clarify_legacy", lambda *_args: True)
+    monkeypatch.setattr("api.clarify.pending_contains", lambda *_args: True)
     monkeypatch.setattr("api.runtime_adapter.runtime_adapter_enabled", lambda: False)
     with config.SESSION_AGENT_CACHE_LOCK:
         config.SESSION_AGENT_CACHE[sid] = (agent, "sig")
@@ -783,6 +869,38 @@ def test_katie_clarify_rejects_dead_pending_stream_before_guard(monkeypatch):
     assert handler.payload()["stale"] is True
 
 
+def test_katie_clarify_rejects_wrong_exact_id_before_guard(monkeypatch):
+    session = _FakeSession("katie-clarify-wrong-id")
+    session.active_stream_id = "katie-clarify-live-stream"
+    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    monkeypatch.setattr("api.clarify.pending_contains", lambda *_args: False)
+    monkeypatch.setattr(
+        routes,
+        "_katie_academic_guard_decision",
+        lambda *_args: pytest.fail("wrong clarify id must fail before policy evaluation"),
+    )
+
+    with config.STREAMS_LOCK:
+        config.STREAMS[session.active_stream_id] = queue.Queue()
+    try:
+        handler = _Handler()
+        routes._handle_clarify_respond(
+            handler,
+            {
+                "session_id": session.session_id,
+                "response": "Write the assignment for me",
+                "clarify_id": "wrong-id",
+            },
+        )
+        assert handler.status == 409
+        assert handler.payload()["stale"] is True
+        assert session.saved == 0
+    finally:
+        with config.STREAMS_LOCK:
+            config.STREAMS.pop(session.active_stream_id, None)
+
+
 def test_katie_clarify_response_blocks_before_resuming_agent(monkeypatch):
     session = _FakeSession("katie-clarify")
     session.active_stream_id = "katie-clarify-stream"
@@ -799,6 +917,7 @@ def test_katie_clarify_response_blocks_before_resuming_agent(monkeypatch):
         "_resolve_clarify_legacy",
         lambda *_args: pytest.fail("blocked clarification must not resume the run"),
     )
+    monkeypatch.setattr("api.clarify.pending_contains", lambda *_args: True)
 
     with config.STREAMS_LOCK:
         config.STREAMS[session.active_stream_id] = queue.Queue()
@@ -819,6 +938,7 @@ def test_katie_clarify_response_blocks_before_resuming_agent(monkeypatch):
             "error": "coaching response",
             "policy_guard": "academic_integrity",
         }
+        assert session.saved == 1
     finally:
         with config.STREAMS_LOCK:
             config.STREAMS.pop(session.active_stream_id, None)
@@ -836,6 +956,7 @@ def test_katie_clarify_owned_work_response_resumes_normally(monkeypatch):
         "_resolve_clarify_legacy",
         lambda *args: resolved.append(args) or True,
     )
+    monkeypatch.setattr("api.clarify.pending_contains", lambda *_args: True)
     monkeypatch.setattr(
         "api.runtime_adapter.runtime_adapter_enabled",
         lambda: False,
@@ -857,6 +978,7 @@ def test_katie_clarify_owned_work_response_resumes_normally(monkeypatch):
         assert resolved == [
             (session.session_id, "clarify-owned", "I will try option B myself.")
         ]
+        assert session.saved == 1
     finally:
         with config.STREAMS_LOCK:
             config.STREAMS.pop(session.active_stream_id, None)
@@ -888,6 +1010,7 @@ def test_katie_sync_fallback_blocks_before_provider_or_agent(monkeypatch):
         "status": "blocked",
         "policy_guard": "academic_integrity",
     }
+    assert session.saved == 1
 
 
 def test_guarded_turn_persists_transcript_and_zero_usage_without_agent_stream(monkeypatch):

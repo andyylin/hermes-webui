@@ -190,6 +190,15 @@ def has_pending(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def pending_contains(session_key: str, clarify_id: str) -> bool:
+    """Return whether an unresolved prompt with this exact stable id exists."""
+    with _lock:
+        return any(
+            entry.clarify_id == clarify_id
+            for entry in (_gateway_queues.get(session_key) or ())
+        )
+
+
 def pending_count(session_key: str) -> int:
     """Return the number of unresolved clarify prompts for a session."""
     with _lock:

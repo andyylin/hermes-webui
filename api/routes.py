@@ -30,7 +30,7 @@ import http.client
 import socket as _socket
 from collections import defaultdict
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, nullcontext
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -2977,6 +2977,18 @@ def _clear_katie_academic_control_refusal(session) -> None:
         session.katie_academic_guard_context = updated
 
 
+def _persist_katie_academic_control_context(session) -> None:
+    """Durably checkpoint Katie's guard-only control ledger without index churn."""
+    if session is None:
+        return
+    profile = str(
+        getattr(session, "profile", None) or _get_active_profile_name() or ""
+    ).strip().casefold()
+    if profile != "katie":
+        return
+    session.save(touch_updated_at=False, skip_index=True)
+
+
 def _katie_academic_guard_decision(session, message, *, attachments=None):
     """Evaluate Katie chat text before model/provider resolution.
 
@@ -3141,7 +3153,15 @@ def _serve_katie_guard_stream(handler, stream_id: str | None) -> bool:
     return True
 
 
-def _start_katie_guarded_stream(session, *, message: str, attachments, decision):
+def _start_katie_guarded_stream(
+    session,
+    *,
+    message: str,
+    attachments,
+    decision,
+    source: str = "webui",
+    lock_held: bool = False,
+):
     """Persist a refusal and return a stream id without invoking the agent."""
     session_id = str(getattr(session, "session_id", "") or "")
     stream_id = f"katie-guard-{uuid.uuid4().hex}"
@@ -3152,7 +3172,8 @@ def _start_katie_guarded_stream(session, *, message: str, attachments, decision)
             "I’m temporarily unable to start this chat safely. Please try again "
             "later, or ask a parent or teacher for help."
         )
-    with _get_session_agent_lock(session_id):
+    lock_context = nullcontext() if lock_held else _get_session_agent_lock(session_id)
+    with lock_context:
         if getattr(session, "active_stream_id", None):
             return {
                 "_status": 409,
@@ -3162,7 +3183,7 @@ def _start_katie_guarded_stream(session, *, message: str, attachments, decision)
             "role": "user",
             "content": message,
             "timestamp": started_at,
-            "source": "webui",
+            "source": source,
         }
         if attachments:
             user_row["attachments"] = attachments
@@ -19836,6 +19857,24 @@ def _start_chat_stream_for_session(
                         "_status": 409,
                     }
                 needs_stale_cleanup = False
+                # Re-evaluate inside the same per-session critical section that
+                # binds pending state and the stream id. The early route check
+                # avoids provider work for obvious blocks; this final check
+                # closes concurrent chat-start and server-wakeup TOCTOU gaps.
+                guard_decision = _katie_academic_guard_decision(
+                    s,
+                    msg,
+                    attachments=attachments,
+                )
+                if guard_decision is not None:
+                    return _start_katie_guarded_stream(
+                        s,
+                        message=msg,
+                        attachments=attachments,
+                        decision=guard_decision,
+                        source=source,
+                        lock_held=True,
+                    )
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
@@ -19849,6 +19888,11 @@ def _start_chat_stream_for_session(
                     stream_id=stream_id,
                     source=source,
                 )
+                # Only retire the one-shot refusal marker after the new user
+                # turn is safely bound and persisted. Keep this under the same
+                # per-session lock so a concurrent control cannot be erased.
+                _clear_katie_academic_control_refusal(s)
+                _persist_katie_academic_control_context(s)
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None
@@ -20114,6 +20158,16 @@ def start_session_turn(
         s = get_session(session_id)
     except KeyError:
         return {"error": "Session not found", "_status": 404}
+
+    guard_decision = _katie_academic_guard_decision(s, msg, attachments=[])
+    if guard_decision is not None:
+        return _start_katie_guarded_stream(
+            s,
+            message=msg,
+            attachments=[],
+            decision=guard_decision,
+            source=source,
+        )
 
     try:
         workspace = _resolve_chat_workspace_with_recovery(s, None)
@@ -20582,8 +20636,6 @@ def _handle_chat_start(handler, body, diag=None):
         if response.get("_status") == 501 and "error" in response:
             return j(handler, {"error": response["error"]}, status=501)
         status = int(response.pop("_status", 200) or 200)
-        if status < 400 and response.get("stream_id"):
-            _clear_katie_academic_control_refusal(s)
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:
@@ -20656,9 +20708,12 @@ def _handle_chat_sync(handler, body):
     msg = str(body.get("message", "")).strip()
     if not msg:
         return j(handler, {"error": "empty message"}, status=400)
-    guard_decision = _katie_academic_guard_decision(s, msg)
+    with _get_session_agent_lock(s.session_id):
+        guard_decision = _katie_academic_guard_decision(s, msg)
+        if guard_decision is not None:
+            _mark_katie_academic_control_refusal(s)
+            _persist_katie_academic_control_context(s)
     if guard_decision is not None:
-        _mark_katie_academic_control_refusal(s)
         logger.info(
             "[katie-policy] academic_integrity_guard blocked profile=katie "
             "control=chat_sync reason=%s",
@@ -20678,6 +20733,7 @@ def _handle_chat_sync(handler, body):
         return bad(handler, str(e))
     with _get_session_agent_lock(s.session_id):
         _clear_katie_academic_control_refusal(s)
+        _persist_katie_academic_control_context(s)
         s.workspace = workspace
         _sync_requested_provider = (
             body.get("model_provider") if "model_provider" in body else getattr(s, "model_provider", None)
@@ -22418,9 +22474,18 @@ def _handle_clarify_respond(handler, body):
                     "error": "Clarification prompt expired or not found. The agent may have already proceeded.",
                     "stale": True,
                 }, status=409)
+            from api.clarify import pending_contains
+
+            if not pending_contains(sid, clarify_id):
+                return j(handler, {
+                    "ok": False,
+                    "error": "Clarification prompt expired or not found. The agent may have already proceeded.",
+                    "stale": True,
+                }, status=409)
             guard_decision = _katie_academic_guard_decision(clarify_session, response)
             if guard_decision is not None:
                 _mark_katie_academic_control_refusal(clarify_session)
+                _persist_katie_academic_control_context(clarify_session)
                 logger.info(
                     "[katie-policy] academic_integrity_guard blocked profile=katie "
                     "control=clarify reason=%s",
@@ -22435,20 +22500,48 @@ def _handle_clarify_respond(handler, body):
                         "policy_guard": "academic_integrity",
                     },
                 )
-            # Bind the exact clarification id, active stream, and policy decision
-            # to one delivery window. The callback wake-up is local/non-network.
-            with STREAMS_LOCK:
-                stream_matches = (
-                    getattr(clarify_session, "active_stream_id", None) == active_stream_id
-                    and active_stream_id in STREAMS
+            # Persist the accepted text before the callback can wake the model.
+            # If exact-id delivery loses its race, roll the ledger back so text
+            # the model never saw cannot create future false positives.
+            previous_guard_context = copy.deepcopy(
+                getattr(clarify_session, "katie_academic_guard_context", None)
+            )
+            _record_katie_academic_control_message(
+                clarify_session,
+                response,
+                stream_id=active_stream_id,
+            )
+            try:
+                _persist_katie_academic_control_context(clarify_session)
+            except Exception:
+                clarify_session.katie_academic_guard_context = previous_guard_context
+                logger.exception(
+                    "Katie clarify guard context could not be persisted for session %s",
+                    sid,
                 )
-                ok = bool(resolve_response()) if stream_matches else False
-            if ok:
-                _record_katie_academic_control_message(
-                    clarify_session,
-                    response,
-                    stream_id=active_stream_id,
-                )
+                return j(handler, {
+                    "ok": False,
+                    "blocked": True,
+                    "error": "I’m temporarily unable to continue this chat safely. Please try again later.",
+                    "policy_guard": "academic_integrity",
+                }, status=503)
+            try:
+                # Bind the exact clarification id, active stream, and policy
+                # decision to one delivery window. The callback wake-up is
+                # local/non-network.
+                with STREAMS_LOCK:
+                    stream_matches = (
+                        getattr(clarify_session, "active_stream_id", None) == active_stream_id
+                        and active_stream_id in STREAMS
+                    )
+                    ok = bool(resolve_response()) if stream_matches else False
+            except Exception:
+                clarify_session.katie_academic_guard_context = previous_guard_context
+                _persist_katie_academic_control_context(clarify_session)
+                raise
+            if not ok:
+                clarify_session.katie_academic_guard_context = previous_guard_context
+                _persist_katie_academic_control_context(clarify_session)
     else:
         ok = bool(resolve_response())
 

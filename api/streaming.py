@@ -9804,6 +9804,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     from api.routes import (
         _katie_academic_guard_decision,
         _mark_katie_academic_control_refusal,
+        _persist_katie_academic_control_context,
         _record_katie_academic_control_message,
         _session_visible_to_active_profile,
     )
@@ -9837,6 +9838,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         guard_decision = _katie_academic_guard_decision(s, text)
         if guard_decision is not None:
             _mark_katie_academic_control_refusal(s)
+            _persist_katie_academic_control_context(s)
             logger.info(
                 "[katie-policy] academic_integrity_guard blocked profile=katie "
                 "control=steer reason=%s",
@@ -9850,9 +9852,39 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                 "message": str(getattr(guard_decision, "response", "") or ""),
             })
 
+        # Checkpoint accepted text before it can become model-visible. If the
+        # exact stream/agent delivery loses its race or rejects the steer, roll
+        # back both in-memory and persisted state so undelivered text does not
+        # create future false positives.
+        previous_guard_context = copy.deepcopy(
+            getattr(s, "katie_academic_guard_context", None)
+        )
+        _record_katie_academic_control_message(
+            s,
+            text,
+            stream_id=active_stream_id,
+        )
+        try:
+            _persist_katie_academic_control_context(s)
+        except Exception:
+            s.katie_academic_guard_context = previous_guard_context
+            logger.exception(
+                "Katie steer guard context could not be persisted for session %s",
+                sid,
+            )
+            return j(handler, {
+                "accepted": False,
+                "fallback": "academic_integrity",
+                "stream_id": active_stream_id,
+                "policy_guard": "academic_integrity",
+                "message": "I’m temporarily unable to continue this chat safely. Please try again later.",
+            }, status=503)
+
         # The stream registry can be cleaned independently after its session
         # state is finalized. Re-check both identities and inject while holding
         # STREAMS_LOCK so cleanup cannot win between validation and steer().
+        fallback = None
+        accepted = False
         with _cfg.STREAMS_LOCK:
             stream_matches = (
                 getattr(s, "active_stream_id", None) == active_stream_id
@@ -9860,22 +9892,37 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                 and _cfg.AGENT_INSTANCES.get(active_stream_id) is agent
             )
             if not stream_matches:
-                return j(handler, {"accepted": False, "fallback": "stream_dead",
-                                   "stream_id": None})
-            try:
-                accepted = bool(agent.steer(text))
-            except Exception as exc:
-                logger.debug("agent.steer() raised for session=%s: %s", sid, exc)
-                return j(handler, {"accepted": False, "fallback": "steer_error",
-                                   "stream_id": active_stream_id})
-        if accepted:
-            _record_katie_academic_control_message(
-                s,
-                text,
-                stream_id=active_stream_id,
-            )
+                fallback = "stream_dead"
+            else:
+                try:
+                    accepted = bool(agent.steer(text))
+                except Exception as exc:
+                    logger.debug("agent.steer() raised for session=%s: %s", sid, exc)
+                    fallback = "steer_error"
+        if not accepted:
+            s.katie_academic_guard_context = previous_guard_context
+            _persist_katie_academic_control_context(s)
+            if fallback == "stream_dead":
+                failure_payload = {
+                    "accepted": False,
+                    "fallback": "stream_dead",
+                    "stream_id": None,
+                }
+            elif fallback == "steer_error":
+                failure_payload = {
+                    "accepted": False,
+                    "fallback": "steer_error",
+                    "stream_id": active_stream_id,
+                }
+            else:
+                failure_payload = {
+                    "accepted": False,
+                    "fallback": None,
+                    "stream_id": active_stream_id,
+                }
+            return j(handler, failure_payload)
 
-    return j(handler, {"accepted": accepted, "fallback": None,
+    return j(handler, {"accepted": accepted, "fallback": fallback,
                        "stream_id": active_stream_id})
 
 
