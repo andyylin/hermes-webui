@@ -2989,6 +2989,34 @@ def _persist_katie_academic_control_context(session) -> None:
     session.save(touch_updated_at=False, skip_index=True)
 
 
+def _rollback_katie_academic_control_context(
+    session,
+    previous_context,
+    checkpointed_context,
+    *,
+    control: str,
+) -> bool:
+    """Durably remove one confirmed-undelivered control from the guard ledger.
+
+    A failed save has ambiguous on-disk state: the durable checkpoint may still
+    contain the control. Restore that conservative checkpoint in memory and let
+    the caller fail closed instead of raising or continuing with divergent state.
+    """
+    session.katie_academic_guard_context = copy.deepcopy(previous_context)
+    try:
+        _persist_katie_academic_control_context(session)
+    except Exception:
+        session.katie_academic_guard_context = copy.deepcopy(checkpointed_context)
+        logger.exception(
+            "Katie %s guard context rollback could not be persisted for session %s; "
+            "retaining conservative checkpoint",
+            control,
+            getattr(session, "session_id", None),
+        )
+        return False
+    return True
+
+
 def _katie_academic_guard_decision(session, message, *, attachments=None):
     """Evaluate Katie chat text before model/provider resolution.
 
@@ -22511,6 +22539,9 @@ def _handle_clarify_respond(handler, body):
                 response,
                 stream_id=active_stream_id,
             )
+            checkpointed_guard_context = copy.deepcopy(
+                getattr(clarify_session, "katie_academic_guard_context", None)
+            )
             try:
                 _persist_katie_academic_control_context(clarify_session)
             except Exception:
@@ -22536,12 +22567,33 @@ def _handle_clarify_respond(handler, body):
                     )
                     ok = bool(resolve_response()) if stream_matches else False
             except Exception:
-                clarify_session.katie_academic_guard_context = previous_guard_context
-                _persist_katie_academic_control_context(clarify_session)
-                raise
+                # The callback may have woken the parked run before raising. The
+                # already-durable checkpoint is therefore the only safe truth.
+                logger.exception(
+                    "Katie clarify delivery raised for session %s; retaining "
+                    "conservative guard checkpoint",
+                    sid,
+                )
+                return j(handler, {
+                    "ok": False,
+                    "blocked": True,
+                    "error": "I’m temporarily unable to continue this chat safely. Please try again later.",
+                    "policy_guard": "academic_integrity",
+                }, status=503)
             if not ok:
-                clarify_session.katie_academic_guard_context = previous_guard_context
-                _persist_katie_academic_control_context(clarify_session)
+                rollback_ok = _rollback_katie_academic_control_context(
+                    clarify_session,
+                    previous_guard_context,
+                    checkpointed_guard_context,
+                    control="clarify",
+                )
+                if not rollback_ok:
+                    return j(handler, {
+                        "ok": False,
+                        "blocked": True,
+                        "error": "I’m temporarily unable to continue this chat safely. Please try again later.",
+                        "policy_guard": "academic_integrity",
+                    }, status=503)
     else:
         ok = bool(resolve_response())
 

@@ -9802,10 +9802,12 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                            "stream_id": None})
 
     from api.routes import (
+        _get_active_profile_name,
         _katie_academic_guard_decision,
         _mark_katie_academic_control_refusal,
         _persist_katie_academic_control_context,
         _record_katie_academic_control_message,
+        _rollback_katie_academic_control_context,
         _session_visible_to_active_profile,
     )
 
@@ -9835,6 +9837,9 @@ def _handle_chat_steer(handler, body: dict) -> bool:
             return j(handler, {"accepted": False, "fallback": "stream_dead",
                                "stream_id": None})
 
+        is_katie = str(
+            getattr(s, "profile", None) or _get_active_profile_name() or ""
+        ).strip().casefold() == "katie"
         guard_decision = _katie_academic_guard_decision(s, text)
         if guard_decision is not None:
             _mark_katie_academic_control_refusal(s)
@@ -9864,6 +9869,9 @@ def _handle_chat_steer(handler, body: dict) -> bool:
             text,
             stream_id=active_stream_id,
         )
+        checkpointed_guard_context = copy.deepcopy(
+            getattr(s, "katie_academic_guard_context", None)
+        )
         try:
             _persist_katie_academic_control_context(s)
         except Exception:
@@ -9885,6 +9893,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         # STREAMS_LOCK so cleanup cannot win between validation and steer().
         fallback = None
         accepted = False
+        delivery_error = None
         with _cfg.STREAMS_LOCK:
             stream_matches = (
                 getattr(s, "active_stream_id", None) == active_stream_id
@@ -9899,9 +9908,33 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                 except Exception as exc:
                     logger.debug("agent.steer() raised for session=%s: %s", sid, exc)
                     fallback = "steer_error"
+                    delivery_error = exc
+        if delivery_error is not None and is_katie:
+            # steer() may have accepted the text before raising. Keep the
+            # successful pre-delivery checkpoint and fail closed rather than
+            # erasing potentially model-visible guard context.
+            return j(handler, {
+                "accepted": False,
+                "fallback": "academic_integrity",
+                "stream_id": active_stream_id,
+                "policy_guard": "academic_integrity",
+                "message": "I’m temporarily unable to continue this chat safely. Please try again later.",
+            }, status=503)
         if not accepted:
-            s.katie_academic_guard_context = previous_guard_context
-            _persist_katie_academic_control_context(s)
+            rollback_ok = _rollback_katie_academic_control_context(
+                s,
+                previous_guard_context,
+                checkpointed_guard_context,
+                control="steer",
+            )
+            if not rollback_ok:
+                return j(handler, {
+                    "accepted": False,
+                    "fallback": "academic_integrity",
+                    "stream_id": active_stream_id,
+                    "policy_guard": "academic_integrity",
+                    "message": "I’m temporarily unable to continue this chat safely. Please try again later.",
+                }, status=503)
             if fallback == "stream_dead":
                 failure_payload = {
                     "accepted": False,
