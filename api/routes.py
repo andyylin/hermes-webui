@@ -2848,6 +2848,8 @@ _KATIE_ACADEMIC_GUARD_STREAMS = {}
 _KATIE_ACADEMIC_GUARD_STREAMS_LOCK = threading.Lock()
 _KATIE_ACADEMIC_GUARD_STREAM_TTL_SECONDS = 120.0
 _KATIE_ACADEMIC_GUARD_STREAM_MAX = 256
+_KATIE_ACADEMIC_CONTROL_MAX_MESSAGES = 20
+_KATIE_ACADEMIC_CONTROL_MAX_CHARS = 50000
 
 
 def _katie_academic_guard_decision(session, message, *, attachments=None):
@@ -2891,10 +2893,20 @@ def _katie_academic_guard_decision(session, message, *, attachments=None):
             and active_stream_id
             and str(control_context.get("stream_id") or "").strip() == active_stream_id
         ):
-            for control_message in list(control_context.get("messages") or [])[-20:]:
-                control_text = str(control_message or "").strip()
-                if control_text:
-                    recent_messages.append({"role": "user", "content": control_text})
+            if control_context.get("overflow"):
+                return unavailable_decision()
+            control_messages = [
+                str(item or "").strip()
+                for item in list(control_context.get("messages") or [])
+                if str(item or "").strip()
+            ]
+            if control_messages:
+                # The classifier intentionally bounds history to six user rows.
+                # Aggregate this stream's controls into one newest row so benign
+                # filler cannot roll an earlier schoolwork signal out of view.
+                recent_messages.append(
+                    {"role": "user", "content": "\n".join(control_messages)}
+                )
         decision = evaluate(message, recent_messages=recent_messages)
     except Exception:
         logger.exception("Katie academic-integrity guard failed closed")
@@ -2940,19 +2952,31 @@ def _record_katie_academic_control_message(session, message, *, stream_id=None):
         return
     previous = getattr(session, "_katie_academic_control_context", None)
     messages = []
+    overflow = False
     if (
         isinstance(previous, dict)
         and str(previous.get("stream_id") or "").strip() == active_stream_id
     ):
+        overflow = bool(previous.get("overflow"))
         messages = [
             str(item or "").strip()
-            for item in list(previous.get("messages") or [])[-19:]
+            for item in list(previous.get("messages") or [])
             if str(item or "").strip()
         ]
-    messages.append(control_text[:10000])
+    bounded_text = control_text[:10000]
+    if (
+        overflow
+        or len(messages) >= _KATIE_ACADEMIC_CONTROL_MAX_MESSAGES
+        or sum(len(item) for item in messages) + len(bounded_text)
+        > _KATIE_ACADEMIC_CONTROL_MAX_CHARS
+    ):
+        overflow = True
+    else:
+        messages.append(bounded_text)
     session._katie_academic_control_context = {
         "stream_id": active_stream_id,
         "messages": messages,
+        "overflow": overflow,
     }
 
 

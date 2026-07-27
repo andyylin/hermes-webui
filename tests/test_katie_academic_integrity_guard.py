@@ -148,6 +148,63 @@ def test_katie_control_context_is_scoped_to_active_stream(monkeypatch):
     assert captured["recent_messages"] == [{"role": "user", "content": "stale"}]
 
 
+def test_katie_control_context_is_one_newest_aggregate_row(monkeypatch):
+    captured = {}
+    allowed = SimpleNamespace(blocked=False)
+
+    def evaluate(_message, recent_messages=None):
+        captured["recent_messages"] = list(recent_messages or [])
+        return allowed
+
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: allowed),
+    )
+    session = _FakeSession()
+    session.active_stream_id = "active-stream"
+    session.pending_user_message = "Tell me about dogs."
+    session._katie_academic_control_context = {
+        "stream_id": "active-stream",
+        "messages": [
+            "I have a school essay due tomorrow.",
+            *[f"Benign note {index}." for index in range(8)],
+        ],
+        "overflow": False,
+    }
+
+    assert routes._katie_academic_guard_decision(session, "Do it for me") is None
+    assert len(captured["recent_messages"]) == 2
+    aggregate = captured["recent_messages"][-1]
+    assert aggregate["role"] == "user"
+    assert "I have a school essay due tomorrow." in aggregate["content"]
+    assert "Benign note 7." in aggregate["content"]
+
+
+def test_katie_control_context_overflow_fails_closed(monkeypatch):
+    unavailable = SimpleNamespace(
+        blocked=True,
+        reason_code="guard_unavailable",
+        response="temporarily unavailable",
+    )
+    evaluate = MagicMock(return_value=SimpleNamespace(blocked=False))
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: unavailable),
+    )
+    session = _FakeSession()
+    session.active_stream_id = "active-stream"
+    session._katie_academic_control_context = {
+        "stream_id": "active-stream",
+        "messages": [f"note {index}" for index in range(20)],
+        "overflow": True,
+    }
+
+    assert routes._katie_academic_guard_decision(session, "one more") is unavailable
+    evaluate.assert_not_called()
+
+
 def test_katie_model_visible_attachments_fail_closed(monkeypatch):
     unavailable = SimpleNamespace(
         blocked=True,
@@ -296,6 +353,7 @@ def test_katie_split_steers_share_ephemeral_guard_context(monkeypatch):
         assert session._katie_academic_control_context == {
             "stream_id": stream_id,
             "messages": ["I have a school essay due tomorrow."],
+            "overflow": False,
         }
     finally:
         with config.SESSION_AGENT_CACHE_LOCK:
