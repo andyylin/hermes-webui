@@ -587,6 +587,9 @@ def redact_session_data(session_dict: dict) -> dict:
     from api.config import load_settings
     _enabled = bool(load_settings().get("api_redact_enabled", True))
     result = dict(session_dict)
+    # Internal child-policy state may duplicate accepted user controls. It is
+    # persisted for fail-closed guard continuity, never part of the session API.
+    result.pop('katie_academic_guard_context', None)
     if isinstance(result.get('title'), str):
         result['title'] = _redact_text(result['title'], _enabled=_enabled)
     if 'messages' in result:

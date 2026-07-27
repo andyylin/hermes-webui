@@ -9803,6 +9803,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
 
     from api.routes import (
         _katie_academic_guard_decision,
+        _mark_katie_academic_control_refusal,
         _record_katie_academic_control_message,
         _session_visible_to_active_profile,
     )
@@ -9835,6 +9836,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
 
         guard_decision = _katie_academic_guard_decision(s, text)
         if guard_decision is not None:
+            _mark_katie_academic_control_refusal(s)
             logger.info(
                 "[katie-policy] academic_integrity_guard blocked profile=katie "
                 "control=steer reason=%s",

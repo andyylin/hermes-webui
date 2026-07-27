@@ -945,6 +945,7 @@ class Session:
                  pending_started_at=None,
                  pending_user_source: str=None,
                  context_messages=None,
+                 katie_academic_guard_context=None,
                  compression_anchor_visible_idx=None,
                  compression_anchor_message_key=None,
                  compression_anchor_summary=None,
@@ -995,6 +996,11 @@ class Session:
         self.pending_started_at = pending_started_at
         self.pending_user_source = pending_user_source
         self.context_messages = context_messages if isinstance(context_messages, list) else []
+        self.katie_academic_guard_context = (
+            katie_academic_guard_context
+            if isinstance(katie_academic_guard_context, dict)
+            else None
+        )
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
         self.compression_anchor_message_key = compression_anchor_message_key
         self.compression_anchor_summary = compression_anchor_summary

@@ -36,7 +36,7 @@ class _FakeSession:
         self.messages = []
         self.context_messages = []
         self.active_stream_id: str | None = None
-        self._katie_academic_control_context: dict | None = None
+        self.katie_academic_guard_context: dict | None = None
         self.pending_user_message = "stale"
         self.pending_attachments = [{"name": "stale.png"}]
         self.pending_started_at = 1.0
@@ -125,7 +125,7 @@ def test_katie_guard_decision_includes_pending_active_turn(monkeypatch):
     }
 
 
-def test_katie_control_context_is_scoped_to_active_stream(monkeypatch):
+def test_katie_control_context_survives_stream_rotation(monkeypatch):
     captured = {}
     allowed = SimpleNamespace(blocked=False)
 
@@ -140,13 +140,22 @@ def test_katie_control_context_is_scoped_to_active_stream(monkeypatch):
     )
     session = _FakeSession()
     session.active_stream_id = "new-stream"
-    session._katie_academic_control_context = {
+    session.katie_academic_guard_context = {
+        "version": 1,
         "stream_id": "old-stream",
-        "messages": ["I have a school essay."],
+        "messages": [{
+            "text": "I have a school essay.",
+            "user_message_count": 1,
+        }],
+        "overflow": False,
+        "refusal_pending": False,
     }
 
     assert routes._katie_academic_guard_decision(session, "Do it for me") is None
-    assert captured["recent_messages"] == [{"role": "user", "content": "stale"}]
+    assert captured["recent_messages"] == [
+        {"role": "user", "content": "stale"},
+        {"role": "user", "content": "I have a school essay."},
+    ]
 
 
 def test_katie_control_context_is_one_newest_aggregate_row(monkeypatch):
@@ -165,13 +174,21 @@ def test_katie_control_context_is_one_newest_aggregate_row(monkeypatch):
     session = _FakeSession()
     session.active_stream_id = "active-stream"
     session.pending_user_message = "Tell me about dogs."
-    session._katie_academic_control_context = {
+    session.katie_academic_guard_context = {
+        "version": 1,
         "stream_id": "active-stream",
         "messages": [
-            "I have a school essay due tomorrow.",
-            *[f"Benign note {index}." for index in range(8)],
+            {
+                "text": "I have a school essay due tomorrow.",
+                "user_message_count": 1,
+            },
+            *[
+                {"text": f"Benign note {index}.", "user_message_count": 1}
+                for index in range(8)
+            ],
         ],
         "overflow": False,
+        "refusal_pending": False,
     }
 
     assert routes._katie_academic_guard_decision(session, "Do it for me") is None
@@ -196,10 +213,16 @@ def test_katie_control_context_overflow_fails_closed(monkeypatch):
     )
     session = _FakeSession()
     session.active_stream_id = "active-stream"
-    session._katie_academic_control_context = {
+    session.katie_academic_guard_context = {
+        "version": 1,
         "stream_id": "active-stream",
-        "messages": [f"note {index}" for index in range(20)],
+        "messages": [
+            {"text": f"note {index}", "user_message_count": 1}
+            for index in range(20)
+        ],
         "overflow": True,
+        "overflow_user_message_count": 1,
+        "refusal_pending": False,
     }
 
     assert routes._katie_academic_guard_decision(session, "one more") is unavailable
@@ -353,7 +376,42 @@ def test_katie_steer_rejects_stream_or_agent_rotation_after_guard(monkeypatch, r
                 config.AGENT_INSTANCES.pop(candidate, None)
 
 
-def test_katie_split_steers_share_ephemeral_guard_context(monkeypatch):
+def test_katie_failed_steer_delivery_is_not_retained(monkeypatch):
+    import api.streaming as streaming
+
+    sid, stream_id = "katie-steer-rejected", "stream-steer-rejected"
+    session = _FakeSession(sid)
+    session.active_stream_id = stream_id
+    session.pending_user_message = "Tell me about dogs."
+    agent = SimpleNamespace(session_id=sid, steer=MagicMock(return_value=False))
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    monkeypatch.setattr(routes, "_katie_academic_guard_decision", lambda *_args: None)
+    with config.SESSION_AGENT_CACHE_LOCK:
+        config.SESSION_AGENT_CACHE[sid] = (agent, "sig")
+    with config.STREAMS_LOCK:
+        config.STREAMS[stream_id] = queue.Queue()
+        config.AGENT_INSTANCES[stream_id] = agent
+
+    try:
+        handler = _Handler()
+        streaming._handle_chat_steer(
+            handler,
+            {"session_id": sid, "text": "Keep this only if delivery succeeds."},
+        )
+
+        assert handler.payload()["accepted"] is False
+        agent.steer.assert_called_once_with("Keep this only if delivery succeeds.")
+        assert session.katie_academic_guard_context is None
+    finally:
+        with config.SESSION_AGENT_CACHE_LOCK:
+            config.SESSION_AGENT_CACHE.pop(sid, None)
+        with config.STREAMS_LOCK:
+            config.STREAMS.pop(stream_id, None)
+            config.AGENT_INSTANCES.pop(stream_id, None)
+
+
+def test_katie_split_steers_share_persisted_guard_context(monkeypatch):
     import api.streaming as streaming
 
     blocked = SimpleNamespace(
@@ -403,6 +461,20 @@ def test_katie_split_steers_share_ephemeral_guard_context(monkeypatch):
             second,
             {"session_id": sid, "text": "Please do it"},
         )
+        assert session.katie_academic_guard_context == {
+            "version": 1,
+            "stream_id": stream_id,
+            "messages": [
+                {
+                    "text": "I have a school essay due tomorrow.",
+                    "user_message_count": 1,
+                },
+                {"text": "Please do it", "user_message_count": 1},
+            ],
+            "overflow": False,
+            "overflow_user_message_count": None,
+            "refusal_pending": False,
+        }
         third = _Handler()
         streaming._handle_chat_steer(
             third,
@@ -417,10 +489,20 @@ def test_katie_split_steers_share_ephemeral_guard_context(monkeypatch):
             (("I have a school essay due tomorrow.",), {}),
             (("Please do it",), {}),
         ]
-        assert session._katie_academic_control_context == {
+        assert session.katie_academic_guard_context == {
+            "version": 1,
             "stream_id": stream_id,
-            "messages": ["I have a school essay due tomorrow.", "Please do it"],
+            "messages": [
+                {
+                    "text": "I have a school essay due tomorrow.",
+                    "user_message_count": 1,
+                },
+                {"text": "Please do it", "user_message_count": 1},
+            ],
             "overflow": False,
+            "overflow_user_message_count": None,
+            "refusal_pending": True,
+            "refusal_user_message_count": 1,
         }
     finally:
         with config.SESSION_AGENT_CACHE_LOCK:
@@ -428,6 +510,124 @@ def test_katie_split_steers_share_ephemeral_guard_context(monkeypatch):
         with config.STREAMS_LOCK:
             config.STREAMS.pop(stream_id, None)
             config.AGENT_INSTANCES.pop(stream_id, None)
+
+
+def test_katie_delivered_steer_context_survives_completion_and_ages(monkeypatch):
+    import api.streaming as streaming
+
+    blocked = SimpleNamespace(
+        blocked=True,
+        reason_code="multi_turn_outsourcing",
+        response="policy response",
+    )
+    allowed = SimpleNamespace(blocked=False, reason_code=None, response="")
+
+    def evaluate(message, recent_messages=None):
+        prior = " ".join(
+            str(item.get("content") or "")
+            for item in (recent_messages or [])
+            if isinstance(item, dict)
+        ).casefold()
+        combined = f"{prior} {message}".casefold()
+        if "school essay" in combined and "do it for me" in combined:
+            return blocked
+        return allowed
+
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: blocked),
+    )
+    sid, stream_id = "katie-cross-stream", "stream-cross-stream"
+    session = _FakeSession(sid)
+    session.active_stream_id = stream_id
+    session.pending_user_message = "Tell me about dogs."
+    agent = SimpleNamespace(session_id=sid, steer=MagicMock(return_value=True))
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    with config.SESSION_AGENT_CACHE_LOCK:
+        config.SESSION_AGENT_CACHE[sid] = (agent, "sig")
+    with config.STREAMS_LOCK:
+        config.STREAMS[stream_id] = queue.Queue()
+        config.AGENT_INSTANCES[stream_id] = agent
+
+    try:
+        accepted = _Handler()
+        streaming._handle_chat_steer(
+            accepted,
+            {"session_id": sid, "text": "I have a school essay due tomorrow."},
+        )
+        assert accepted.payload()["accepted"] is True
+        agent.steer.assert_called_once_with("I have a school essay due tomorrow.")
+
+        # Model-visible steer context must outlive stream cleanup and ordinary
+        # benign turns, but should age out with the classifier's bounded window.
+        session.active_stream_id = None
+        session.pending_user_message = None
+        session.messages = [
+            {"role": "user", "content": "Tell me about dogs."},
+            {"role": "assistant", "content": "Dogs are mammals."},
+            *[
+                {"role": "user", "content": f"Benign filler {index}."}
+                for index in range(5)
+            ],
+        ]
+        assert routes._katie_academic_guard_decision(session, "Do it for me") is blocked
+
+        session.messages.extend([
+            {"role": "user", "content": "Benign filler 5."},
+            {"role": "user", "content": "Benign filler 6."},
+        ])
+        assert routes._katie_academic_guard_decision(session, "Do it for me") is None
+    finally:
+        with config.SESSION_AGENT_CACHE_LOCK:
+            config.SESSION_AGENT_CACHE.pop(sid, None)
+        with config.STREAMS_LOCK:
+            config.STREAMS.pop(stream_id, None)
+            config.AGENT_INSTANCES.pop(stream_id, None)
+
+
+def test_katie_guard_context_round_trips_with_session(tmp_path, monkeypatch):
+    from api import models
+
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    context = {
+        "version": 1,
+        "stream_id": "stream-persisted",
+        "messages": [{
+            "text": "I have a school essay due tomorrow.",
+            "user_message_count": 1,
+        }],
+        "overflow": False,
+        "refusal_pending": False,
+    }
+    session = models.Session(
+        session_id="katie-guard-persistence",
+        workspace=str(tmp_path),
+        profile="katie",
+        messages=[{"role": "user", "content": "Tell me about dogs."}],
+        katie_academic_guard_context=context,
+    )
+
+    session.save(skip_index=True)
+    loaded = models.Session.load(session.session_id)
+
+    assert loaded.katie_academic_guard_context == context
+
+
+def test_katie_guard_context_is_not_exposed_in_session_payload(monkeypatch):
+    from api import config as api_config
+    from api.helpers import redact_session_data
+
+    monkeypatch.setattr(api_config, "load_settings", lambda: {"api_redact_enabled": True})
+    payload = redact_session_data({
+        "session_id": "katie-internal-state",
+        "katie_academic_guard_context": {
+            "messages": [{"text": "private accepted control"}],
+        },
+    })
+
+    assert payload == {"session_id": "katie-internal-state"}
 
 
 def test_katie_clarify_then_steer_shares_control_context(monkeypatch):

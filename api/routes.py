@@ -2850,6 +2850,131 @@ _KATIE_ACADEMIC_GUARD_STREAM_TTL_SECONDS = 120.0
 _KATIE_ACADEMIC_GUARD_STREAM_MAX = 256
 _KATIE_ACADEMIC_CONTROL_MAX_MESSAGES = 20
 _KATIE_ACADEMIC_CONTROL_MAX_CHARS = 50000
+_KATIE_ACADEMIC_CONTROL_MAX_USER_TURNS = 6
+
+
+def _katie_academic_user_message_count(session) -> int:
+    messages = list(getattr(session, "messages", None) or [])
+    count = sum(
+        1
+        for row in messages
+        if isinstance(row, dict)
+        and str(row.get("role") or "").strip().casefold() == "user"
+    )
+    if str(getattr(session, "pending_user_message", None) or "").strip():
+        count += 1
+    return count
+
+
+def _katie_academic_control_state(session):
+    """Return fresh persisted control state, failing closed on corruption."""
+    current_user_count = _katie_academic_user_message_count(session)
+    context = getattr(session, "katie_academic_guard_context", None)
+    if context is None:
+        return [], False, False, False, current_user_count
+    if not isinstance(context, dict):
+        return [], True, False, True, current_user_count
+
+    messages = []
+    unsafe = False
+    for item in list(context.get("messages") or []):
+        if not isinstance(item, dict):
+            unsafe = True
+            continue
+        text = str(item.get("text") or "").strip()
+        item_user_count = item.get("user_message_count")
+        if (
+            not text
+            or isinstance(item_user_count, bool)
+            or not isinstance(item_user_count, int)
+            or item_user_count < 0
+            or item_user_count > current_user_count
+        ):
+            unsafe = True
+            continue
+        if current_user_count - item_user_count <= _KATIE_ACADEMIC_CONTROL_MAX_USER_TURNS:
+            messages.append({
+                "text": text,
+                "user_message_count": item_user_count,
+            })
+    if (
+        len(messages) > _KATIE_ACADEMIC_CONTROL_MAX_MESSAGES
+        or sum(len(item["text"]) for item in messages)
+        > _KATIE_ACADEMIC_CONTROL_MAX_CHARS
+    ):
+        unsafe = True
+
+    overflow = bool(context.get("overflow"))
+    if overflow:
+        overflow_user_count = context.get("overflow_user_message_count")
+        if (
+            isinstance(overflow_user_count, bool)
+            or not isinstance(overflow_user_count, int)
+            or overflow_user_count < 0
+            or overflow_user_count > current_user_count
+        ):
+            unsafe = True
+        elif current_user_count - overflow_user_count > _KATIE_ACADEMIC_CONTROL_MAX_USER_TURNS:
+            overflow = False
+
+    refusal_pending = bool(context.get("refusal_pending"))
+    if refusal_pending:
+        refusal_user_count = context.get("refusal_user_message_count")
+        if (
+            isinstance(refusal_user_count, bool)
+            or not isinstance(refusal_user_count, int)
+            or refusal_user_count < 0
+            or refusal_user_count > current_user_count
+        ):
+            unsafe = True
+        elif current_user_count - refusal_user_count > 1:
+            refusal_pending = False
+
+    return messages, overflow, refusal_pending, unsafe, current_user_count
+
+
+def _mark_katie_academic_control_refusal(session) -> None:
+    if session is None:
+        return
+    messages, overflow, _refusal, unsafe, current_user_count = (
+        _katie_academic_control_state(session)
+    )
+    previous = getattr(session, "katie_academic_guard_context", None)
+    session.katie_academic_guard_context = {
+        "version": 1,
+        "stream_id": (
+            str(previous.get("stream_id") or "").strip()
+            if isinstance(previous, dict)
+            else ""
+        ),
+        "messages": messages,
+        "overflow": bool(overflow or unsafe),
+        "overflow_user_message_count": (
+            current_user_count if overflow or unsafe else None
+        ),
+        "refusal_pending": True,
+        "refusal_user_message_count": current_user_count,
+    }
+
+
+def _clear_katie_academic_control_context(session) -> None:
+    if session is not None:
+        session.katie_academic_guard_context = None
+
+
+def _clear_katie_academic_control_refusal(session) -> None:
+    if session is None:
+        return
+    context = getattr(session, "katie_academic_guard_context", None)
+    if not isinstance(context, dict) or not context.get("refusal_pending"):
+        return
+    updated = dict(context)
+    updated["refusal_pending"] = False
+    updated.pop("refusal_user_message_count", None)
+    if not updated.get("messages") and not updated.get("overflow"):
+        session.katie_academic_guard_context = None
+    else:
+        session.katie_academic_guard_context = updated
 
 
 def _katie_academic_guard_decision(session, message, *, attachments=None):
@@ -2884,29 +3009,32 @@ def _katie_academic_guard_decision(session, message, *, attachments=None):
         ).strip()
         if pending_message:
             recent_messages.append({"role": "user", "content": pending_message})
-        control_context = getattr(session, "_katie_academic_control_context", None)
-        active_stream_id = str(
-            getattr(session, "active_stream_id", None) or ""
-        ).strip()
-        if (
-            isinstance(control_context, dict)
-            and active_stream_id
-            and str(control_context.get("stream_id") or "").strip() == active_stream_id
-        ):
-            if control_context.get("overflow"):
-                return unavailable_decision()
-            control_messages = [
-                str(item or "").strip()
-                for item in list(control_context.get("messages") or [])
-                if str(item or "").strip()
-            ]
-            if control_messages:
-                # The classifier intentionally bounds history to six user rows.
-                # Aggregate this stream's controls into one newest row so benign
-                # filler cannot roll an earlier schoolwork signal out of view.
-                recent_messages.append(
-                    {"role": "user", "content": "\n".join(control_messages)}
-                )
+        (
+            control_entries,
+            control_overflow,
+            refusal_pending,
+            control_unsafe,
+            _current_user_count,
+        ) = _katie_academic_control_state(session)
+        if control_overflow or control_unsafe:
+            return unavailable_decision()
+        if control_entries:
+            # Accepted controls remain guard-visible after stream completion or
+            # rotation. Their per-entry user-turn counters give them the same
+            # bounded lifetime as the classifier's ordinary six-row history.
+            recent_messages.append({
+                "role": "user",
+                "content": "\n".join(item["text"] for item in control_entries),
+            })
+        if refusal_pending:
+            # A blocked live control is rendered as a toast rather than a
+            # persisted assistant row. Recreate only the policy marker needed
+            # for the guard's immediate post-refusal escalation rule.
+            recent_messages.append({
+                "role": "assistant",
+                "content": "",
+                "policy_guard": "academic_integrity",
+            })
         decision = evaluate(message, recent_messages=recent_messages)
     except Exception:
         logger.exception("Katie academic-integrity guard failed closed")
@@ -2934,8 +3062,8 @@ def _record_katie_academic_control_message(session, message, *, stream_id=None):
 
     Callers hold the per-session agent lock across guard evaluation and this
     write, so concurrent steer/clarify requests cannot each evade the other's
-    context. The context is ephemeral and keyed to one active stream; stale
-    data is ignored automatically when the stream id changes.
+    context. Delivered controls persist in bounded guard-only session state so
+    stream completion, rotation, or process reload cannot erase their meaning.
     """
     if session is None:
         return
@@ -2950,33 +3078,31 @@ def _record_katie_academic_control_message(session, message, *, stream_id=None):
     control_text = str(message or "").strip()
     if not active_stream_id or not control_text:
         return
-    previous = getattr(session, "_katie_academic_control_context", None)
-    messages = []
-    overflow = False
-    if (
-        isinstance(previous, dict)
-        and str(previous.get("stream_id") or "").strip() == active_stream_id
-    ):
-        overflow = bool(previous.get("overflow"))
-        messages = [
-            str(item or "").strip()
-            for item in list(previous.get("messages") or [])
-            if str(item or "").strip()
-        ]
+    messages, overflow, _refusal_pending, unsafe, current_user_count = (
+        _katie_academic_control_state(session)
+    )
+    if unsafe:
+        overflow = True
     bounded_text = control_text[:10000]
     if (
         overflow
         or len(messages) >= _KATIE_ACADEMIC_CONTROL_MAX_MESSAGES
-        or sum(len(item) for item in messages) + len(bounded_text)
+        or sum(len(item["text"]) for item in messages) + len(bounded_text)
         > _KATIE_ACADEMIC_CONTROL_MAX_CHARS
     ):
         overflow = True
     else:
-        messages.append(bounded_text)
-    session._katie_academic_control_context = {
+        messages.append({
+            "text": bounded_text,
+            "user_message_count": current_user_count,
+        })
+    session.katie_academic_guard_context = {
+        "version": 1,
         "stream_id": active_stream_id,
         "messages": messages,
         "overflow": overflow,
+        "overflow_user_message_count": current_user_count if overflow else None,
+        "refusal_pending": False,
     }
 
 
@@ -3057,6 +3183,9 @@ def _start_katie_guarded_stream(session, *, message: str, attachments, decision)
         session.pending_attachments = []
         session.pending_started_at = None
         session.pending_user_source = None
+        # The persisted assistant policy marker now supplies post-refusal
+        # semantics; stale control-only context must not survive the reset.
+        _clear_katie_academic_control_context(session)
         session.save()
         try:
             compact = session.compact(include_runtime=True, active_stream_ids=[])
@@ -20453,6 +20582,8 @@ def _handle_chat_start(handler, body, diag=None):
         if response.get("_status") == 501 and "error" in response:
             return j(handler, {"error": response["error"]}, status=501)
         status = int(response.pop("_status", 200) or 200)
+        if status < 400 and response.get("stream_id"):
+            _clear_katie_academic_control_refusal(s)
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:
@@ -20527,6 +20658,7 @@ def _handle_chat_sync(handler, body):
         return j(handler, {"error": "empty message"}, status=400)
     guard_decision = _katie_academic_guard_decision(s, msg)
     if guard_decision is not None:
+        _mark_katie_academic_control_refusal(s)
         logger.info(
             "[katie-policy] academic_integrity_guard blocked profile=katie "
             "control=chat_sync reason=%s",
@@ -20545,6 +20677,7 @@ def _handle_chat_sync(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     with _get_session_agent_lock(s.session_id):
+        _clear_katie_academic_control_refusal(s)
         s.workspace = workspace
         _sync_requested_provider = (
             body.get("model_provider") if "model_provider" in body else getattr(s, "model_provider", None)
@@ -22287,6 +22420,7 @@ def _handle_clarify_respond(handler, body):
                 }, status=409)
             guard_decision = _katie_academic_guard_decision(clarify_session, response)
             if guard_decision is not None:
+                _mark_katie_academic_control_refusal(clarify_session)
                 logger.info(
                     "[katie-policy] academic_integrity_guard blocked profile=katie "
                     "control=clarify reason=%s",
