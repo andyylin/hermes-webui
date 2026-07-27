@@ -1447,6 +1447,13 @@ async function _trySteer(msg, explicitSteer){
   }
   if(typeof renderTray==='function')renderTray();
   const fallbackCode = result && result.fallback;
+  if(fallbackCode==='academic_integrity'&&result&&result.message){
+    // The backend returns the deterministic child-policy coaching response.
+    // Do not turn a policy refusal into a retry affordance that repeatedly
+    // resubmits the same blocked text to the active run.
+    showToast(result.message,5000);
+    return false;
+  }
   showToast(t(_steerFailureMessageKey(fallbackCode)), 3500);
   _showSteerRecovery(msg, explicitSteer, fallbackCode);
   return false;

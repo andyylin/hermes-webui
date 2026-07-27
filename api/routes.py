@@ -2865,10 +2865,17 @@ def _katie_academic_guard_decision(session, message):
     try:
         from katie_academic_guard import evaluate, unavailable_decision
 
-        decision = evaluate(
-            message,
-            recent_messages=(getattr(session, "messages", None) or []),
-        )
+        recent_messages = list(getattr(session, "messages", None) or [])
+        # During an active run the current user turn may exist only in the
+        # pending fields until stream writeback. Mid-turn controls such as
+        # steer and clarify must still see that academic context, otherwise a
+        # short follow-up ("do it for me") can bypass multi-turn detection.
+        pending_message = str(
+            getattr(session, "pending_user_message", None) or ""
+        ).strip()
+        if pending_message:
+            recent_messages.append({"role": "user", "content": pending_message})
+        decision = evaluate(message, recent_messages=recent_messages)
     except Exception:
         logger.exception("Katie academic-integrity guard failed closed")
         try:
@@ -20417,12 +20424,35 @@ def _normalize_chat_attachments(raw_attachments):
 
 def _handle_chat_sync(handler, body):
     """Fallback synchronous chat endpoint (POST /api/chat). Not used by frontend."""
-    if _session_is_subagent_view_only(str(body.get("session_id") or "")):
+    if not isinstance(body, dict):
+        return bad(handler, "JSON object body required")
+    sid = body.get("session_id")
+    if not isinstance(sid, str) or not sid.strip():
+        return bad(handler, "session_id is required")
+    sid = sid.strip()
+    if _session_is_subagent_view_only(sid):
         return bad(handler, "Subagent sessions are view-only and cannot be written from WebUI", 400)
-    s = get_session(body["session_id"])
+    s = get_session(sid)
+    if not _session_visible_to_active_profile(getattr(s, "profile", None), handler):
+        return bad(handler, "Session not found", 404)
     msg = str(body.get("message", "")).strip()
     if not msg:
         return j(handler, {"error": "empty message"}, status=400)
+    guard_decision = _katie_academic_guard_decision(s, msg)
+    if guard_decision is not None:
+        logger.info(
+            "[katie-policy] academic_integrity_guard blocked profile=katie "
+            "control=chat_sync reason=%s",
+            getattr(guard_decision, "reason_code", None) or "blocked",
+        )
+        return j(
+            handler,
+            {
+                "answer": str(getattr(guard_decision, "response", "") or ""),
+                "status": "blocked",
+                "policy_guard": "academic_integrity",
+            },
+        )
     try:
         workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
     except ValueError as e:
@@ -22103,9 +22133,12 @@ def _resolve_clarify_legacy(sid: str, clarify_id: str, response: str) -> bool:
 
 
 def _handle_clarify_respond(handler, body):
+    if not isinstance(body, dict):
+        return bad(handler, "JSON object body required")
     sid = body.get("session_id", "")
-    if not sid:
+    if not isinstance(sid, str) or not sid.strip():
         return bad(handler, "session_id is required")
+    sid = sid.strip()
     response = body.get("response")
     if response is None:
         response = body.get("answer")
@@ -22115,6 +22148,34 @@ def _handle_clarify_respond(handler, body):
     if not response:
         return bad(handler, "response is required")
     clarify_id = body.get("clarify_id", "")
+
+    # Clarification responses are user-authored text delivered directly into
+    # a parked run. Apply the same deterministic Katie policy before either
+    # the local callback or a runtime adapter can resume model/tool execution.
+    try:
+        clarify_session = get_session(sid)
+    except KeyError:
+        clarify_session = None
+    if clarify_session is not None and not _session_visible_to_active_profile(
+        getattr(clarify_session, "profile", None), handler
+    ):
+        return bad(handler, "Session not found", 404)
+    guard_decision = _katie_academic_guard_decision(clarify_session, response)
+    if guard_decision is not None:
+        logger.info(
+            "[katie-policy] academic_integrity_guard blocked profile=katie "
+            "control=clarify reason=%s",
+            getattr(guard_decision, "reason_code", None) or "blocked",
+        )
+        return j(
+            handler,
+            {
+                "ok": False,
+                "blocked": True,
+                "error": str(getattr(guard_decision, "response", "") or ""),
+                "policy_guard": "academic_integrity",
+            },
+        )
 
     from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 

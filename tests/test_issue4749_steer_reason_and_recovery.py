@@ -31,6 +31,7 @@ EXPECTED_I18N_KEYS = [
 ]
 
 BACKEND_CODES = {
+    "academic_integrity",
     "no_cached_agent",
     "agent_lacks_steer",
     "session_not_found",

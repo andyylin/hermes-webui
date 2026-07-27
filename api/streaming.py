@@ -9755,12 +9755,22 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     from api.helpers import j, bad
     from api import config as _cfg
 
-    sid = str((body or {}).get("session_id", "") or "").strip()
-    text = str((body or {}).get("text", "") or "").strip()
+    if not isinstance(body, dict):
+        return bad(handler, "JSON object body required")
+    raw_sid = body.get("session_id")
+    raw_text = body.get("text")
+    if not isinstance(raw_sid, str):
+        return bad(handler, "session_id required")
+    if not isinstance(raw_text, str):
+        return bad(handler, "text required")
+    sid = raw_sid.strip()
+    text = raw_text.strip()
     if not sid:
         return bad(handler, "session_id required")
     if not text:
         return bad(handler, "text required")
+    if len(text) > 10000:
+        return bad(handler, "text too long")
 
     evicted_cached_entry = None
     with _cfg.SESSION_AGENT_CACHE_LOCK:
@@ -9799,6 +9809,32 @@ def _handle_chat_steer(handler, body: dict) -> bool:
     except KeyError:
         return j(handler, {"accepted": False, "fallback": "session_not_found",
                            "stream_id": None})
+    from api.routes import (
+        _katie_academic_guard_decision,
+        _session_visible_to_active_profile,
+    )
+
+    if not _session_visible_to_active_profile(getattr(s, "profile", None), handler):
+        return j(handler, {"accepted": False, "fallback": "session_not_found",
+                           "stream_id": None})
+
+    # Steer text is injected directly into the active model loop at the next
+    # tool boundary. Guard it after ownership is proven but before any
+    # agent.steer(), runtime, model, or tool execution can observe the text.
+    guard_decision = _katie_academic_guard_decision(s, text)
+    if guard_decision is not None:
+        logger.info(
+            "[katie-policy] academic_integrity_guard blocked profile=katie "
+            "control=steer reason=%s",
+            getattr(guard_decision, "reason_code", None) or "blocked",
+        )
+        return j(handler, {
+            "accepted": False,
+            "fallback": "academic_integrity",
+            "stream_id": getattr(s, "active_stream_id", None) or None,
+            "policy_guard": "academic_integrity",
+            "message": str(getattr(guard_decision, "response", "") or ""),
+        })
     active_stream_id = getattr(s, "active_stream_id", None) or None
     if not active_stream_id:
         return j(handler, {"accepted": False, "fallback": "not_running",
