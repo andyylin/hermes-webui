@@ -38,14 +38,22 @@ def _restore_auth_sessions():
 
 @pytest.fixture
 def _clear_caches():
-    """Snapshot SESSION_AGENT_CACHE and STREAMS so tests don't bleed."""
-    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+    """Snapshot agent/stream registries so tests don't bleed."""
+    from api.config import (
+        AGENT_INSTANCES,
+        SESSION_AGENT_CACHE,
+        SESSION_AGENT_CACHE_LOCK,
+        STREAMS,
+        STREAMS_LOCK,
+    )
     with SESSION_AGENT_CACHE_LOCK:
         cache_snap = dict(SESSION_AGENT_CACHE)
         SESSION_AGENT_CACHE.clear()
     with STREAMS_LOCK:
         streams_snap = dict(STREAMS)
+        agents_snap = dict(AGENT_INSTANCES)
         STREAMS.clear()
+        AGENT_INSTANCES.clear()
     yield
     with SESSION_AGENT_CACHE_LOCK:
         SESSION_AGENT_CACHE.clear()
@@ -53,6 +61,8 @@ def _clear_caches():
     with STREAMS_LOCK:
         STREAMS.clear()
         STREAMS.update(streams_snap)
+        AGENT_INSTANCES.clear()
+        AGENT_INSTANCES.update(agents_snap)
 
 
 def _make_handler():
@@ -88,7 +98,13 @@ class TestHandleChatSteerHappyPath:
 
     def test_accepts_when_agent_cached_and_running(self, _clear_caches):
         from api.streaming import _handle_chat_steer
-        from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+        from api.config import (
+            AGENT_INSTANCES,
+            SESSION_AGENT_CACHE,
+            SESSION_AGENT_CACHE_LOCK,
+            STREAMS,
+            STREAMS_LOCK,
+        )
         sid, stream_id = "sid_happy", "stream_happy"
         agent = MagicMock()
         agent.steer = MagicMock(return_value=True)
@@ -97,6 +113,7 @@ class TestHandleChatSteerHappyPath:
         with STREAMS_LOCK:
             import queue as _q
             STREAMS[stream_id] = _q.Queue()
+            AGENT_INSTANCES[stream_id] = agent
 
         sess = MagicMock()
         sess.active_stream_id = stream_id
@@ -190,7 +207,13 @@ class TestHandleChatSteerFallbacks:
     def test_steer_raises(self, _clear_caches):
         """If agent.steer() raises, return steer_error rather than 500."""
         from api.streaming import _handle_chat_steer
-        from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+        from api.config import (
+            AGENT_INSTANCES,
+            SESSION_AGENT_CACHE,
+            SESSION_AGENT_CACHE_LOCK,
+            STREAMS,
+            STREAMS_LOCK,
+        )
         sid, stream_id = "sid_throws", "stream_throws"
         agent = MagicMock()
         agent.steer = MagicMock(side_effect=RuntimeError("boom"))
@@ -199,6 +222,7 @@ class TestHandleChatSteerFallbacks:
         with STREAMS_LOCK:
             import queue as _q
             STREAMS[stream_id] = _q.Queue()
+            AGENT_INSTANCES[stream_id] = agent
         sess = MagicMock()
         sess.active_stream_id = stream_id
         with patch("api.streaming.get_session", return_value=sess):

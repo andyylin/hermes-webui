@@ -22231,10 +22231,21 @@ def _handle_clarify_respond(handler, body):
         response = body.get("answer")
     if response is None:
         response = body.get("choice")
-    response = str(response or "").strip()
-    if not response:
+    if not isinstance(response, str) or not response.strip() or len(response) > 10000:
         return bad(handler, "response is required")
+    response = response.strip()
     clarify_id = body.get("clarify_id", "")
+    if not isinstance(clarify_id, str) or len(clarify_id) > 200:
+        return bad(handler, "clarify_id is invalid")
+    clarify_id = clarify_id.strip()
+
+    from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
+
+    def resolve_response():
+        if runtime_adapter_enabled():
+            adapter = LegacyJournalRuntimeAdapter(clarify_delegate=_resolve_clarify_legacy)
+            return adapter.respond_clarify(sid, clarify_id, response).accepted
+        return _resolve_clarify_legacy(sid, clarify_id, response)
 
     # Clarification responses are user-authored text delivered directly into
     # a parked run. Apply the same deterministic Katie policy before either
@@ -22247,36 +22258,65 @@ def _handle_clarify_respond(handler, body):
         getattr(clarify_session, "profile", None), handler
     ):
         return bad(handler, "Session not found", 404)
-    if clarify_session is not None:
+    is_katie = str(
+        getattr(clarify_session, "profile", None) or _get_active_profile_name() or ""
+    ).strip().casefold() == "katie"
+    if is_katie and clarify_session is None:
+        return bad(handler, "Session not found", 404)
+    if is_katie and not clarify_id:
+        return bad(handler, "clarify_id is required")
+
+    if is_katie:
         with _get_session_agent_lock(sid):
+            try:
+                clarify_session = get_session(sid)
+            except KeyError:
+                return bad(handler, "Session not found", 404)
+            if not _session_visible_to_active_profile(
+                getattr(clarify_session, "profile", None), handler
+            ):
+                return bad(handler, "Session not found", 404)
+            active_stream_id = getattr(clarify_session, "active_stream_id", None)
+            with STREAMS_LOCK:
+                stream_alive = bool(active_stream_id and active_stream_id in STREAMS)
+            if not stream_alive:
+                return j(handler, {
+                    "ok": False,
+                    "error": "Clarification prompt expired or not found. The agent may have already proceeded.",
+                    "stale": True,
+                }, status=409)
             guard_decision = _katie_academic_guard_decision(clarify_session, response)
-            if guard_decision is None:
-                _record_katie_academic_control_message(clarify_session, response)
+            if guard_decision is not None:
+                logger.info(
+                    "[katie-policy] academic_integrity_guard blocked profile=katie "
+                    "control=clarify reason=%s",
+                    getattr(guard_decision, "reason_code", None) or "blocked",
+                )
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "blocked": True,
+                        "error": str(getattr(guard_decision, "response", "") or ""),
+                        "policy_guard": "academic_integrity",
+                    },
+                )
+            # Bind the exact clarification id, active stream, and policy decision
+            # to one delivery window. The callback wake-up is local/non-network.
+            with STREAMS_LOCK:
+                stream_matches = (
+                    getattr(clarify_session, "active_stream_id", None) == active_stream_id
+                    and active_stream_id in STREAMS
+                )
+                ok = bool(resolve_response()) if stream_matches else False
+            if ok:
+                _record_katie_academic_control_message(
+                    clarify_session,
+                    response,
+                    stream_id=active_stream_id,
+                )
     else:
-        guard_decision = _katie_academic_guard_decision(None, response)
-    if guard_decision is not None:
-        logger.info(
-            "[katie-policy] academic_integrity_guard blocked profile=katie "
-            "control=clarify reason=%s",
-            getattr(guard_decision, "reason_code", None) or "blocked",
-        )
-        return j(
-            handler,
-            {
-                "ok": False,
-                "blocked": True,
-                "error": str(getattr(guard_decision, "response", "") or ""),
-                "policy_guard": "academic_integrity",
-            },
-        )
-
-    from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
-
-    if runtime_adapter_enabled():
-        adapter = LegacyJournalRuntimeAdapter(clarify_delegate=_resolve_clarify_legacy)
-        ok = adapter.respond_clarify(sid, clarify_id, response).accepted
-    else:
-        ok = _resolve_clarify_legacy(sid, clarify_id, response)
+        ok = bool(resolve_response())
 
     if not ok:
         # Both the runtime adapter and legacy paths set ok=False for

@@ -9801,67 +9801,77 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         return j(handler, {"accepted": False, "fallback": "agent_lacks_steer",
                            "stream_id": None})
 
-    # Verify the agent is currently running. Use the session's
-    # active_stream_id rather than calling load_session_locked() which
-    # would block on the streaming thread's lock.
-    try:
-        s = get_session(sid)
-    except KeyError:
-        return j(handler, {"accepted": False, "fallback": "session_not_found",
-                           "stream_id": None})
     from api.routes import (
         _katie_academic_guard_decision,
+        _record_katie_academic_control_message,
         _session_visible_to_active_profile,
     )
 
-    if not _session_visible_to_active_profile(getattr(s, "profile", None), handler):
-        return j(handler, {"accepted": False, "fallback": "session_not_found",
-                           "stream_id": None})
-
-    active_stream_id = getattr(s, "active_stream_id", None) or None
-    if not active_stream_id:
-        return j(handler, {"accepted": False, "fallback": "not_running",
-                           "stream_id": None})
-    with _cfg.STREAMS_LOCK:
-        stream_alive = active_stream_id in _cfg.STREAMS
-    if not stream_alive:
-        # Active stream id is stale — stream has ended; caller falls back
-        return j(handler, {"accepted": False, "fallback": "stream_dead",
-                           "stream_id": None})
-
     # Steer text is injected directly into the active model loop at the next
-    # tool boundary. Guard it after ownership and liveness are proven but before
-    # agent.steer(), runtime, model, or tool execution can observe the text.
+    # tool boundary. Serialize lookup, exact stream/agent identity validation,
+    # policy evaluation, recording, and delivery so a stream rotation cannot
+    # move guarded text into a different run.
     with _get_session_agent_lock(sid):
-        guard_decision = _katie_academic_guard_decision(s, text)
-        if guard_decision is None:
-            from api.routes import _record_katie_academic_control_message
+        try:
+            s = get_session(sid)
+        except KeyError:
+            return j(handler, {"accepted": False, "fallback": "session_not_found",
+                               "stream_id": None})
+        if not _session_visible_to_active_profile(getattr(s, "profile", None), handler):
+            return j(handler, {"accepted": False, "fallback": "session_not_found",
+                               "stream_id": None})
+        active_stream_id = getattr(s, "active_stream_id", None) or None
+        if not active_stream_id:
+            return j(handler, {"accepted": False, "fallback": "not_running",
+                               "stream_id": None})
+        with _cfg.STREAMS_LOCK:
+            stream_matches = (
+                active_stream_id in _cfg.STREAMS
+                and _cfg.AGENT_INSTANCES.get(active_stream_id) is agent
+            )
+        if not stream_matches:
+            return j(handler, {"accepted": False, "fallback": "stream_dead",
+                               "stream_id": None})
 
+        guard_decision = _katie_academic_guard_decision(s, text)
+        if guard_decision is not None:
+            logger.info(
+                "[katie-policy] academic_integrity_guard blocked profile=katie "
+                "control=steer reason=%s",
+                getattr(guard_decision, "reason_code", None) or "blocked",
+            )
+            return j(handler, {
+                "accepted": False,
+                "fallback": "academic_integrity",
+                "stream_id": active_stream_id,
+                "policy_guard": "academic_integrity",
+                "message": str(getattr(guard_decision, "response", "") or ""),
+            })
+
+        # The stream registry can be cleaned independently after its session
+        # state is finalized. Re-check both identities and inject while holding
+        # STREAMS_LOCK so cleanup cannot win between validation and steer().
+        with _cfg.STREAMS_LOCK:
+            stream_matches = (
+                getattr(s, "active_stream_id", None) == active_stream_id
+                and active_stream_id in _cfg.STREAMS
+                and _cfg.AGENT_INSTANCES.get(active_stream_id) is agent
+            )
+            if not stream_matches:
+                return j(handler, {"accepted": False, "fallback": "stream_dead",
+                                   "stream_id": None})
+            try:
+                accepted = bool(agent.steer(text))
+            except Exception as exc:
+                logger.debug("agent.steer() raised for session=%s: %s", sid, exc)
+                return j(handler, {"accepted": False, "fallback": "steer_error",
+                                   "stream_id": active_stream_id})
+        if accepted:
             _record_katie_academic_control_message(
                 s,
                 text,
                 stream_id=active_stream_id,
             )
-    if guard_decision is not None:
-        logger.info(
-            "[katie-policy] academic_integrity_guard blocked profile=katie "
-            "control=steer reason=%s",
-            getattr(guard_decision, "reason_code", None) or "blocked",
-        )
-        return j(handler, {
-            "accepted": False,
-            "fallback": "academic_integrity",
-            "stream_id": active_stream_id,
-            "policy_guard": "academic_integrity",
-            "message": str(getattr(guard_decision, "response", "") or ""),
-        })
-
-    try:
-        accepted = bool(agent.steer(text))
-    except Exception as exc:
-        logger.debug("agent.steer() raised for session=%s: %s", sid, exc)
-        return j(handler, {"accepted": False, "fallback": "steer_error",
-                           "stream_id": active_stream_id})
 
     return j(handler, {"accepted": accepted, "fallback": None,
                        "stream_id": active_stream_id})
