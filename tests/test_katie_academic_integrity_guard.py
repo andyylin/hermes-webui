@@ -124,6 +124,54 @@ def test_katie_guard_decision_includes_pending_active_turn(monkeypatch):
     }
 
 
+def test_katie_control_context_is_scoped_to_active_stream(monkeypatch):
+    captured = {}
+    allowed = SimpleNamespace(blocked=False)
+
+    def evaluate(_message, recent_messages=None):
+        captured["recent_messages"] = list(recent_messages or [])
+        return allowed
+
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: allowed),
+    )
+    session = _FakeSession()
+    session.active_stream_id = "new-stream"
+    session._katie_academic_control_context = {
+        "stream_id": "old-stream",
+        "messages": ["I have a school essay."],
+    }
+
+    assert routes._katie_academic_guard_decision(session, "Do it for me") is None
+    assert captured["recent_messages"] == [{"role": "user", "content": "stale"}]
+
+
+def test_katie_model_visible_attachments_fail_closed(monkeypatch):
+    unavailable = SimpleNamespace(
+        blocked=True,
+        reason_code="guard_unavailable",
+        response="temporarily unavailable",
+    )
+    evaluate = MagicMock()
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: unavailable),
+    )
+    session = _FakeSession()
+
+    decision = routes._katie_academic_guard_decision(
+        session,
+        "Please describe this image.",
+        attachments=[{"name": "homework.png", "path": "/safe/homework.png"}],
+    )
+
+    assert decision is unavailable
+    evaluate.assert_not_called()
+
+
 def test_katie_steer_blocks_before_agent_and_covers_pending_short_followup(monkeypatch):
     import api.streaming as streaming
 
@@ -185,6 +233,131 @@ def test_katie_steer_allows_owned_work_after_guard_passes(monkeypatch):
         )
         assert handler.payload()["accepted"] is True
         agent.steer.assert_called_once()
+    finally:
+        with config.SESSION_AGENT_CACHE_LOCK:
+            config.SESSION_AGENT_CACHE.pop(sid, None)
+        with config.STREAMS_LOCK:
+            config.STREAMS.pop(stream_id, None)
+
+
+def test_katie_split_steers_share_ephemeral_guard_context(monkeypatch):
+    import api.streaming as streaming
+
+    blocked = SimpleNamespace(
+        blocked=True,
+        reason_code="multi_turn_outsourcing",
+        response="policy response",
+    )
+    allowed = SimpleNamespace(blocked=False, reason_code=None, response="")
+
+    def evaluate(message, recent_messages=None):
+        prior = " ".join(
+            str(item.get("content") or "")
+            for item in (recent_messages or [])
+            if isinstance(item, dict)
+        ).casefold()
+        if message == "Do it for me" and "school essay" in prior:
+            return blocked
+        return allowed
+
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: blocked),
+    )
+    sid, stream_id = "katie-split-steer", "stream-split-steer"
+    session = _FakeSession(sid)
+    session.active_stream_id = stream_id
+    session.pending_user_message = "Tell me about dogs."
+    agent = SimpleNamespace(session_id=sid, steer=MagicMock(return_value=True))
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    with config.SESSION_AGENT_CACHE_LOCK:
+        config.SESSION_AGENT_CACHE[sid] = (agent, "sig")
+    with config.STREAMS_LOCK:
+        config.STREAMS[stream_id] = queue.Queue()
+
+    try:
+        first = _Handler()
+        streaming._handle_chat_steer(
+            first,
+            {"session_id": sid, "text": "I have a school essay due tomorrow."},
+        )
+        second = _Handler()
+        streaming._handle_chat_steer(
+            second,
+            {"session_id": sid, "text": "Do it for me"},
+        )
+
+        assert first.payload()["accepted"] is True
+        assert second.payload()["accepted"] is False
+        assert second.payload()["fallback"] == "academic_integrity"
+        agent.steer.assert_called_once_with("I have a school essay due tomorrow.")
+        assert session._katie_academic_control_context == {
+            "stream_id": stream_id,
+            "messages": ["I have a school essay due tomorrow."],
+        }
+    finally:
+        with config.SESSION_AGENT_CACHE_LOCK:
+            config.SESSION_AGENT_CACHE.pop(sid, None)
+        with config.STREAMS_LOCK:
+            config.STREAMS.pop(stream_id, None)
+
+
+def test_katie_clarify_then_steer_shares_control_context(monkeypatch):
+    import api.streaming as streaming
+
+    blocked = SimpleNamespace(
+        blocked=True,
+        reason_code="multi_turn_outsourcing",
+        response="policy response",
+    )
+    allowed = SimpleNamespace(blocked=False, reason_code=None, response="")
+
+    def evaluate(message, recent_messages=None):
+        prior = " ".join(
+            str(item.get("content") or "")
+            for item in (recent_messages or [])
+            if isinstance(item, dict)
+        ).casefold()
+        return blocked if message == "Do it for me" and "essay" in prior else allowed
+
+    monkeypatch.setitem(
+        sys.modules,
+        "katie_academic_guard",
+        SimpleNamespace(evaluate=evaluate, unavailable_decision=lambda: blocked),
+    )
+    sid, stream_id = "katie-clarify-split", "stream-clarify-split"
+    session = _FakeSession(sid)
+    session.active_stream_id = stream_id
+    session.pending_user_message = "Tell me about dogs."
+    agent = SimpleNamespace(session_id=sid, steer=MagicMock(return_value=True))
+    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_args: True)
+    monkeypatch.setattr(routes, "_resolve_clarify_legacy", lambda *_args: True)
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_enabled", lambda: False)
+    with config.SESSION_AGENT_CACHE_LOCK:
+        config.SESSION_AGENT_CACHE[sid] = (agent, "sig")
+    with config.STREAMS_LOCK:
+        config.STREAMS[stream_id] = queue.Queue()
+
+    try:
+        clarify = _Handler()
+        routes._handle_clarify_respond(
+            clarify,
+            {"session_id": sid, "response": "It is for my school essay."},
+        )
+        steer = _Handler()
+        streaming._handle_chat_steer(
+            steer,
+            {"session_id": sid, "text": "Do it for me"},
+        )
+
+        assert clarify.payload()["ok"] is True
+        assert steer.payload()["accepted"] is False
+        assert steer.payload()["fallback"] == "academic_integrity"
+        agent.steer.assert_not_called()
     finally:
         with config.SESSION_AGENT_CACHE_LOCK:
             config.SESSION_AGENT_CACHE.pop(sid, None)

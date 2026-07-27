@@ -9818,23 +9818,6 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         return j(handler, {"accepted": False, "fallback": "session_not_found",
                            "stream_id": None})
 
-    # Steer text is injected directly into the active model loop at the next
-    # tool boundary. Guard it after ownership is proven but before any
-    # agent.steer(), runtime, model, or tool execution can observe the text.
-    guard_decision = _katie_academic_guard_decision(s, text)
-    if guard_decision is not None:
-        logger.info(
-            "[katie-policy] academic_integrity_guard blocked profile=katie "
-            "control=steer reason=%s",
-            getattr(guard_decision, "reason_code", None) or "blocked",
-        )
-        return j(handler, {
-            "accepted": False,
-            "fallback": "academic_integrity",
-            "stream_id": getattr(s, "active_stream_id", None) or None,
-            "policy_guard": "academic_integrity",
-            "message": str(getattr(guard_decision, "response", "") or ""),
-        })
     active_stream_id = getattr(s, "active_stream_id", None) or None
     if not active_stream_id:
         return j(handler, {"accepted": False, "fallback": "not_running",
@@ -9845,6 +9828,33 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         # Active stream id is stale — stream has ended; caller falls back
         return j(handler, {"accepted": False, "fallback": "stream_dead",
                            "stream_id": None})
+
+    # Steer text is injected directly into the active model loop at the next
+    # tool boundary. Guard it after ownership and liveness are proven but before
+    # agent.steer(), runtime, model, or tool execution can observe the text.
+    with _get_session_agent_lock(sid):
+        guard_decision = _katie_academic_guard_decision(s, text)
+        if guard_decision is None:
+            from api.routes import _record_katie_academic_control_message
+
+            _record_katie_academic_control_message(
+                s,
+                text,
+                stream_id=active_stream_id,
+            )
+    if guard_decision is not None:
+        logger.info(
+            "[katie-policy] academic_integrity_guard blocked profile=katie "
+            "control=steer reason=%s",
+            getattr(guard_decision, "reason_code", None) or "blocked",
+        )
+        return j(handler, {
+            "accepted": False,
+            "fallback": "academic_integrity",
+            "stream_id": active_stream_id,
+            "policy_guard": "academic_integrity",
+            "message": str(getattr(guard_decision, "response", "") or ""),
+        })
 
     try:
         accepted = bool(agent.steer(text))

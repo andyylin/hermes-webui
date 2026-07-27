@@ -2850,7 +2850,7 @@ _KATIE_ACADEMIC_GUARD_STREAM_TTL_SECONDS = 120.0
 _KATIE_ACADEMIC_GUARD_STREAM_MAX = 256
 
 
-def _katie_academic_guard_decision(session, message):
+def _katie_academic_guard_decision(session, message, *, attachments=None):
     """Evaluate Katie chat text before model/provider resolution.
 
     The import is intentionally lazy because the guard is a Katie-only
@@ -2865,6 +2865,13 @@ def _katie_academic_guard_decision(session, message):
     try:
         from katie_academic_guard import evaluate, unavailable_decision
 
+        if attachments:
+            # The deterministic guard cannot safely inspect arbitrary image or
+            # document contents. Katie therefore fails closed rather than
+            # letting a benign caption smuggle unreviewed academic instructions
+            # into a multimodal/provider request.
+            return unavailable_decision()
+
         recent_messages = list(getattr(session, "messages", None) or [])
         # During an active run the current user turn may exist only in the
         # pending fields until stream writeback. Mid-turn controls such as
@@ -2875,6 +2882,19 @@ def _katie_academic_guard_decision(session, message):
         ).strip()
         if pending_message:
             recent_messages.append({"role": "user", "content": pending_message})
+        control_context = getattr(session, "_katie_academic_control_context", None)
+        active_stream_id = str(
+            getattr(session, "active_stream_id", None) or ""
+        ).strip()
+        if (
+            isinstance(control_context, dict)
+            and active_stream_id
+            and str(control_context.get("stream_id") or "").strip() == active_stream_id
+        ):
+            for control_message in list(control_context.get("messages") or [])[-20:]:
+                control_text = str(control_message or "").strip()
+                if control_text:
+                    recent_messages.append({"role": "user", "content": control_text})
         decision = evaluate(message, recent_messages=recent_messages)
     except Exception:
         logger.exception("Katie academic-integrity guard failed closed")
@@ -2895,6 +2915,45 @@ def _katie_academic_guard_decision(session, message):
 
             decision = _UnavailableDecision()
     return decision if getattr(decision, "blocked", False) else None
+
+
+def _record_katie_academic_control_message(session, message, *, stream_id=None):
+    """Remember allowed model-visible controls for split-request detection.
+
+    Callers hold the per-session agent lock across guard evaluation and this
+    write, so concurrent steer/clarify requests cannot each evade the other's
+    context. The context is ephemeral and keyed to one active stream; stale
+    data is ignored automatically when the stream id changes.
+    """
+    if session is None:
+        return
+    profile = str(
+        getattr(session, "profile", None) or _get_active_profile_name() or ""
+    ).strip().casefold()
+    if profile != "katie":
+        return
+    active_stream_id = str(
+        stream_id or getattr(session, "active_stream_id", None) or ""
+    ).strip()
+    control_text = str(message or "").strip()
+    if not active_stream_id or not control_text:
+        return
+    previous = getattr(session, "_katie_academic_control_context", None)
+    messages = []
+    if (
+        isinstance(previous, dict)
+        and str(previous.get("stream_id") or "").strip() == active_stream_id
+    ):
+        messages = [
+            str(item or "").strip()
+            for item in list(previous.get("messages") or [])[-19:]
+            if str(item or "").strip()
+        ]
+    messages.append(control_text[:10000])
+    session._katie_academic_control_context = {
+        "stream_id": active_stream_id,
+        "messages": messages,
+    }
 
 
 def _katie_guard_stream_active(stream_id: str | None) -> bool:
@@ -20287,7 +20346,11 @@ def _handle_chat_start(handler, body, diag=None):
         # cannot reach the agent, tools, clarification machinery, or provider
         # credentials; it is served through the normal SSE contract below.
         diag.stage("academic_integrity_guard") if diag else None
-        guard_decision = _katie_academic_guard_decision(s, msg)
+        guard_decision = _katie_academic_guard_decision(
+            s,
+            msg,
+            attachments=attachments,
+        )
         if guard_decision is not None:
             guarded_response = _start_katie_guarded_stream(
                 s,
@@ -22160,7 +22223,13 @@ def _handle_clarify_respond(handler, body):
         getattr(clarify_session, "profile", None), handler
     ):
         return bad(handler, "Session not found", 404)
-    guard_decision = _katie_academic_guard_decision(clarify_session, response)
+    if clarify_session is not None:
+        with _get_session_agent_lock(sid):
+            guard_decision = _katie_academic_guard_decision(clarify_session, response)
+            if guard_decision is None:
+                _record_katie_academic_control_message(clarify_session, response)
+    else:
+        guard_decision = _katie_academic_guard_decision(None, response)
     if guard_decision is not None:
         logger.info(
             "[katie-policy] academic_integrity_guard blocked profile=katie "
