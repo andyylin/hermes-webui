@@ -73,7 +73,8 @@ def test_open_session_menu_consumes_next_row_activation():
     menu_click_idx = SESSIONS_JS.find("menuBtn.onclick=(e)=>{", menu_btn_idx)
     assert menu_btn_idx > 0 and menu_click_idx > menu_btn_idx
     assert "const _isSessionActionTarget=(target)=>{" in SESSIONS_JS
-    assert "return !!(actions&&target&&actions.contains(target));" in SESSIONS_JS
+    assert "(actions&&target&&actions.contains(target))" in SESSIONS_JS
+    assert "target.closest('.session-swipe-affordance')" in SESSIONS_JS
     assert "if(_isSessionActionTarget(e.target)) return;" in SESSIONS_JS
     assert "if(_isSessionActionTarget(target)){_gestureState='idle';return false;}" in SESSIONS_JS
     assert "if(_longPressMenuOpened){_gestureState='idle';return true;}" in SESSIONS_JS
@@ -84,6 +85,32 @@ def test_open_session_menu_consumes_next_row_activation():
     assert finish_idx > 0 and load_idx > finish_idx
     assert dismiss_idx > finish_idx and dismiss_idx < load_idx
     assert "if(_finishSessionGesture(e.clientX,e.clientY,e.target,e.pointerType)) e.stopPropagation();" in SESSIONS_JS[pointerup_idx:]
+
+
+def test_session_swipe_delete_reveals_persistent_tappable_action():
+    make_affordance = _sessions_block(
+        "function _makeSessionSwipeAffordance(side, icon, label){",
+        "const SESSION_VIRTUAL_ROW_HEIGHT",
+    )
+    assert "document.createElement('button')" in make_affordance
+    assert "affordance.type='button'" in make_affordance
+    assert "affordance.tabIndex=-1" in make_affordance
+    assert "const _revealSessionSwipeAction=(side)=>{" in SESSIONS_JS
+    assert "swipe-revealed-left" in SESSIONS_JS
+    assert "deleteSwipeAction.onclick=" in SESSIONS_JS
+    assert "deleteSession(s.session_id" in SESSIONS_JS
+    swipe_block = _sessions_block(
+        "const _handleSessionSwipe=(signedDx,signedDy)=>{",
+        "const _commitSessionSwipe=()=>{",
+    )
+    delete_branch = swipe_block[swipe_block.find("}else if(_canSwipeDeleteSession())") :]
+    assert "_revealSessionSwipeAction('left')" in delete_branch
+    assert "deleteSession(s.session_id" not in delete_branch
+    assert ".session-item.swipe-revealed-left .session-swipe-affordance-left" in STYLE_CSS
+    assert "pointer-events:auto" in STYLE_CSS[
+        STYLE_CSS.find(".session-item.swipe-revealed-left .session-swipe-affordance-left") :
+        STYLE_CSS.find(".session-swipe-action-stack")
+    ]
 
 
 def test_session_swipes_route_archive_restore_and_delete():
@@ -116,7 +143,8 @@ def test_session_swipes_route_archive_restore_and_delete():
     assert "_completeSessionSwipePaint(signedDx);" not in archived_visible_branch
     assert "_archiveSession(s,true,()=>_waitForSessionMotion(committedSwipeDuration))" in archived_visible_branch
     assert archive_branch.find("_completeSessionSwipePaint(signedDx);") < archive_branch.find("_archiveSession(s,true,()=>_waitForSessionMotion(committedSwipeReflowDelay))")
-    assert delete_branch.find("deleteSession(s.session_id,async()=>{") < delete_branch.find("_completeSessionSwipePaint(signedDx);")
+    assert "_revealSessionSwipeAction('left')" in delete_branch
+    assert "deleteSession(s.session_id" not in delete_branch
     assert "showToast('Imported sessions cannot be deleted here.',3000);" in SESSIONS_JS
     assert "let _gestureState='idle';" in SESSIONS_JS
     assert SESSIONS_JS.count("if(e.pointerType==='touch') return;") >= 3
@@ -152,7 +180,7 @@ def test_session_swipe_paint_uses_transform_only_exit():
     assert "el.style.height=rect.height+'px'" in complete
     assert "requestAnimationFrame(()=>el.classList.add('swipe-removing'))" in complete
     assert "requestAnimationFrame(()=>requestAnimationFrame(_clearSessionSwipePaint))" in SESSIONS_JS
-    assert "el.classList.remove('swiping-right','swiping-left','swipe-committed','swipe-removing')" in clear
+    assert "el.classList.remove('swiping-right','swiping-left','swipe-revealed-left','swipe-committed','swipe-removing')" in clear
     assert "el.style.removeProperty('--session-swipe-badge-size');" in clear
     assert "el.style.removeProperty('--session-swipe-icon-size');" in clear
     assert "el.style.removeProperty('--session-swipe-label-scale');" in clear

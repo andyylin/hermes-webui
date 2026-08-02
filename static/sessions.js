@@ -3297,9 +3297,12 @@ function _sessionPrefersReducedMotion(){
 }
 
 function _makeSessionSwipeAffordance(side, icon, label){
-  const affordance=document.createElement('div');
+  const affordance=document.createElement('button');
+  affordance.type='button';
+  affordance.tabIndex=-1;
   affordance.className='session-swipe-affordance session-swipe-affordance-'+side;
   affordance.setAttribute('aria-hidden','true');
+  affordance.setAttribute('aria-label',label);
   const stack=document.createElement('span');
   stack.className='session-swipe-action-stack';
   const badge=document.createElement('span');
@@ -7458,11 +7461,12 @@ function renderSessionListFromCache(){
       _openSessionActionMenu(s, actions||el);
     };
 
+    let archiveSwipeAction=null;
+    let deleteSwipeAction=null;
     if(!readOnly){
-      el.append(
-        _makeSessionSwipeAffordance('right',s.archived?'undo':'archive',s.archived?'Restore':t('session_batch_archive')),
-        _makeSessionSwipeAffordance('left','trash-2',t('session_batch_delete')),
-      );
+      archiveSwipeAction=_makeSessionSwipeAffordance('right',s.archived?'undo':'archive',s.archived?'Restore':t('session_batch_archive'));
+      deleteSwipeAction=_makeSessionSwipeAffordance('left','trash-2',t('session_batch_delete'));
+      el.append(archiveSwipeAction,deleteSwipeAction);
     }
 
     // Use release events + manual double-tap detection instead of onclick/ondblclick.
@@ -7476,7 +7480,7 @@ function renderSessionListFromCache(){
     let _tapTimer=null;
     let _pointerDownX=0;
     let _pointerDownY=0;
-    let _gestureState='idle'; // idle | pressing | dragging | committed
+    let _gestureState='idle'; // idle | pressing | dragging | revealed | committed
     let _clearDragTimer=null;
     let _longPressTimer=null;
     let _longPressMenuOpened=false;
@@ -7498,7 +7502,8 @@ function renderSessionListFromCache(){
       _swipeTracking=false;
       _longPressMenuOpened=false;
       if(_clearDragTimer){clearTimeout(_clearDragTimer);_clearDragTimer=null;}
-      el.classList.remove('dragging','swipe-committed','swipe-removing');
+      if(el.classList.contains('swipe-revealed-left')) _clearSessionSwipePaint();
+      el.classList.remove('dragging','swipe-committed','swipe-removing','swipe-revealed-left');
       el.style.removeProperty('height');
       el.style.removeProperty('min-height');
     };
@@ -7518,7 +7523,10 @@ function renderSessionListFromCache(){
       return _gesturePointerType!=='mouse'&&!readOnly&&!_renamingSid&&!_sessionSelectMode;
     };
     const _isSessionActionTarget=(target)=>{
-      return !!(actions&&target&&actions.contains(target));
+      return !!(
+        (actions&&target&&actions.contains(target))||
+        (target&&target.closest&&target.closest('.session-swipe-affordance'))
+      );
     };
     const _trackHorizontalSwipe=(dx,dy)=>{
       if(dx>8&&dx>dy*1.1) _swipeTracking=true;
@@ -7584,12 +7592,56 @@ function renderSessionListFromCache(){
       el.style.removeProperty('--session-swipe-progress');
       el.style.removeProperty('height');
       el.style.removeProperty('min-height');
-      el.classList.remove('swiping-right','swiping-left','swipe-committed','swipe-removing');
+      el.classList.remove('swiping-right','swiping-left','swipe-revealed-left','swipe-committed','swipe-removing');
+      if(deleteSwipeAction){
+        deleteSwipeAction.tabIndex=-1;
+        deleteSwipeAction.setAttribute('aria-hidden','true');
+        deleteSwipeAction.disabled=false;
+      }
     };
     const _settleSessionSwipePaint=()=>{
-      el.classList.remove('dragging');
+      el.classList.remove('dragging','swipe-revealed-left');
       requestAnimationFrame(()=>requestAnimationFrame(_clearSessionSwipePaint));
     };
+    const _dismissSessionSwipeAction=()=>{
+      _gestureState='idle';
+      _settleSessionSwipePaint();
+    };
+    el._dismissSessionSwipeAction=_dismissSessionSwipeAction;
+    const _revealSessionSwipeAction=(side)=>{
+      if(side!=='left'||!deleteSwipeAction) return false;
+      document.querySelectorAll('.session-item.swipe-revealed-left').forEach((row)=>{
+        if(row!==el&&typeof row._dismissSessionSwipeAction==='function') row._dismissSessionSwipeAction();
+      });
+      _gestureState='revealed';
+      el.classList.remove('dragging');
+      _paintSessionSwipe(-131);
+      el.classList.add('swipe-revealed-left');
+      deleteSwipeAction.tabIndex=0;
+      deleteSwipeAction.setAttribute('aria-hidden','false');
+      return true;
+    };
+    const _activateSwipeDelete=()=>{
+      if(!deleteSwipeAction||deleteSwipeAction.disabled) return;
+      _gestureState='committed';
+      deleteSwipeAction.disabled=true;
+      deleteSession(s.session_id,async()=>{
+        _completeSessionSwipePaint(-SESSION_DELETE_SWIPE_THRESHOLD_PX);
+        await _waitForSessionMotion(committedSwipeReflowDelay);
+      }).then((deleted)=>{
+        if(!deleted){
+          _gestureState='idle';
+          _settleSessionSwipePaint();
+        }
+      });
+    };
+    if(deleteSwipeAction){
+      deleteSwipeAction.onclick=(event)=>{
+        event.preventDefault();
+        event.stopPropagation();
+        _activateSwipeDelete();
+      };
+    }
     const _completeSessionSwipePaint=(signedDx)=>{
       el.classList.remove('dragging');
       el.classList.add('swipe-committed');
@@ -7628,13 +7680,7 @@ function renderSessionListFromCache(){
           });
         }
       }else if(_canSwipeDeleteSession()){
-        el.classList.remove('dragging');
-        deleteSession(s.session_id,async()=>{
-          _completeSessionSwipePaint(signedDx);
-          await _waitForSessionMotion(committedSwipeReflowDelay);
-        }).then((deleted)=>{
-          if(!deleted) _settleSessionSwipePaint();
-        });
+        _revealSessionSwipeAction('left');
       }else if(typeof showToast==='function'){
         showToast('Imported sessions cannot be deleted here.',3000);
         _gestureState='dragging';
@@ -7667,7 +7713,7 @@ function renderSessionListFromCache(){
       _pointerY=clientY;
       _commitSessionSwipe();
       if(_longPressMenuOpened){_gestureState='idle';return true;}
-      if(_gestureState==='committed') return true;
+      if(_gestureState==='revealed'||_gestureState==='committed') return true;
       if(_sessionActionMenu&&!_sessionActionMenu.contains(target)){
         closeSessionActionMenu();
         return true;
