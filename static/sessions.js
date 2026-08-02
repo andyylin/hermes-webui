@@ -4424,9 +4424,17 @@ function _applySessionListPayload(sessData, projData){
   if (typeof sessData.server_tz === 'string') {
     _serverTz = sessData.server_tz;
   }
+  const rawServerSessions=sessData.sessions||[];
+  // Keep successful-delete tombstones until an independent server payload
+  // confirms the session is absent. A coalesced pre-delete response may still
+  // contain the old row; clearing its tombstone on request completion would
+  // briefly resurrect that conversation in the sidebar.
+  for(const sid of Array.from(_optimisticallyRemovedSessionIds)){
+    if(!rawServerSessions.some(s=>s&&s.session_id===sid)) _optimisticallyRemovedSessionIds.delete(sid);
+  }
   const serverSessions=_optimisticallyRemovedSessionIds.size
-    ? (sessData.sessions||[]).filter(s=>s&&!_optimisticallyRemovedSessionIds.has(s.session_id))
-    : (sessData.sessions||[]);
+    ? rawServerSessions.filter(s=>s&&!_optimisticallyRemovedSessionIds.has(s.session_id))
+    : rawServerSessions;
   _sidebarReferenceSessions = Array.isArray(sessData.sidebar_reference_sessions)
     ? sessData.sidebar_reference_sessions
     : [];
@@ -7980,7 +7988,7 @@ async function deleteSession(sid, beforeDelete=null){
     }
   }
   showToast(_sessionResponseRetainsWorktree(response,session)?t('session_deleted_worktree'):t('session_deleted'));
-  if(optimisticRendered) void renderSessionList().finally(()=>_optimisticallyRemovedSessionIds.delete(sid));
+  if(optimisticRendered) void renderSessionList();
   else await renderSessionList();
   return true;
 }

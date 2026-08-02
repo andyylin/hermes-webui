@@ -266,8 +266,11 @@ def test_session_removal_reflows_surviving_rows_smoothly():
     reconcile_idx = archive_body.find("void renderSessionList();")
     assert 0 <= toast_idx < hold_idx < cache_render_idx < reconcile_idx
     assert "if(renderHold) await renderHold;" in SESSIONS_JS
+    assert "const rawServerSessions=sessData.sessions||[];" in SESSIONS_JS
+    assert "for(const sid of Array.from(_optimisticallyRemovedSessionIds))" in SESSIONS_JS
+    assert "if(!rawServerSessions.some(s=>s&&s.session_id===sid)) _optimisticallyRemovedSessionIds.delete(sid);" in SESSIONS_JS
     assert "const serverSessions=_optimisticallyRemovedSessionIds.size" in SESSIONS_JS
-    assert "? (sessData.sessions||[]).filter(s=>s&&!_optimisticallyRemovedSessionIds.has(s.session_id))" in SESSIONS_JS
+    assert "? rawServerSessions.filter(s=>s&&!_optimisticallyRemovedSessionIds.has(s.session_id))" in SESSIONS_JS
     assert ".session-item.session-reflowing{transition:background .15s,color .15s,transform .36s cubic-bezier(.2,.8,.2,1),box-shadow .15s ease;will-change:transform;}" in STYLE_CSS
     assert "if(_showArchived&&!_sessionPrefersReducedMotion()) _sessionSwipeReturnOffsets.set(session.session_id,'0px');" in SESSIONS_JS
     assert "const swipeReturnOffset=_sessionSwipeReturnOffsets.get(s.session_id);" in SESSIONS_JS
@@ -283,7 +286,7 @@ def test_session_removal_reflows_surviving_rows_smoothly():
     optimistic_remove = delete_body.find("_optimisticallyRemoveSessionFromList(sid);", optimistic_set)
     response_await = delete_body.find("const deleteResult=await deleteRequest;")
     rollback = delete_body.find("_optimisticallyRemovedSessionIds.delete(sid);")
-    final_render = delete_body.find("void renderSessionList().finally(()=>_optimisticallyRemovedSessionIds.delete(sid));")
+    final_render = delete_body.find("if(optimisticRendered) void renderSessionList();")
     cached_remove = _sessions_block("function _optimisticallyRemoveSessionFromList(sid){", "function _sessionIdFromLocation")
     assert "_allSessions=_allSessions.filter(s=>!s||s.session_id!==sid);" in cached_remove
     assert "renderSessionListFromCache();" in cached_remove
