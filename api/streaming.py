@@ -678,6 +678,7 @@ def _webui_ephemeral_system_prompt(
     config_data: Optional[dict] = None,
 ) -> str:
     """Build WebUI-only runtime instructions that are not persisted to history."""
+    cfg = config_data if isinstance(config_data, dict) else get_config()
     parts = []
     if personality_prompt:
         parts.append(str(personality_prompt).strip())
@@ -685,9 +686,13 @@ def _webui_ephemeral_system_prompt(
     if surface_prompt:
         parts.append(surface_prompt)
     parts.append(_WEBUI_PROGRESS_PROMPT)
-    delivery_prompt = _webui_delivery_context_prompt(config_data)
+    delivery_prompt = _webui_delivery_context_prompt(cfg)
     if delivery_prompt:
         parts.append(delivery_prompt)
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    profile_system_prompt = agent_cfg.get("system_prompt") if isinstance(agent_cfg, dict) else None
+    if isinstance(profile_system_prompt, str) and profile_system_prompt.strip():
+        parts.append(profile_system_prompt.strip())
     return "\n\n".join(part for part in parts if part)
 
 

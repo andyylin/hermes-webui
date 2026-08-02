@@ -340,3 +340,17 @@ def test_prefill_status_redactor_handles_secret_shaped_text():
 
     assert "redaction-test-placeholder" not in redacted
     assert "[REDACTED]" in redacted
+
+
+def test_webui_ephemeral_prompt_includes_profile_agent_system_prompt():
+    from api.streaming import _webui_ephemeral_system_prompt
+
+    profile_prompt = "You are Jojo. Do not complete school reports for the student."
+    prompt = _webui_ephemeral_system_prompt(
+        None,
+        surface_context={"source": "webui", "profile": "katie"},
+        config_data={"agent": {"system_prompt": profile_prompt}},
+    )
+
+    assert profile_prompt in prompt
+    assert prompt.rstrip().endswith(profile_prompt)
