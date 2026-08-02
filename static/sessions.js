@@ -7471,10 +7471,14 @@ function renderSessionListFromCache(){
 
     let archiveSwipeAction=null;
     let deleteSwipeAction=null;
+    const swipeDeleteAllowed=!_isMessagingSession(s)&&!_isCliSession(s);
     if(!readOnly){
       archiveSwipeAction=_makeSessionSwipeAffordance('right',s.archived?'undo':'archive',s.archived?'Restore':t('session_batch_archive'));
-      deleteSwipeAction=_makeSessionSwipeAffordance('left','trash-2',t('session_batch_delete'));
-      el.append(archiveSwipeAction,deleteSwipeAction);
+      el.append(archiveSwipeAction);
+      if(swipeDeleteAllowed){
+        deleteSwipeAction=_makeSessionSwipeAffordance('left','trash-2',t('session_batch_delete'));
+        el.append(deleteSwipeAction);
+      }
     }
 
     // Use release events + manual double-tap detection instead of onclick/ondblclick.
@@ -7560,7 +7564,7 @@ function renderSessionListFromCache(){
       return _swipeTracking;
     };
     const _canSwipeDeleteSession=()=>{
-      return _isSessionSwipeTarget()&&!_isMessagingSession(s)&&!_isCliSession(s);
+      return _isSessionSwipeTarget()&&!!deleteSwipeAction;
     };
     const _paintSessionSwipe=(signedDx)=>{
       const rawOffset=signedDx*.55;

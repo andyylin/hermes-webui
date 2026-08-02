@@ -113,6 +113,17 @@ def test_session_swipe_delete_reveals_persistent_tappable_action():
     ]
 
 
+def test_non_deletable_imported_sessions_do_not_render_swipe_delete_action():
+    render_start = SESSIONS_JS.find("let archiveSwipeAction=null;")
+    render_end = SESSIONS_JS.find("// Use release events", render_start)
+    render_block = SESSIONS_JS[render_start:render_end]
+    assert "const swipeDeleteAllowed=!_isMessagingSession(s)&&!_isCliSession(s);" in render_block
+    assert "if(swipeDeleteAllowed){" in render_block
+    assert "deleteSwipeAction=_makeSessionSwipeAffordance('left'" in render_block
+    assert render_block.find("if(swipeDeleteAllowed){") < render_block.find("deleteSwipeAction=_makeSessionSwipeAffordance('left'")
+    assert "return _isSessionSwipeTarget()&&!!deleteSwipeAction;" in SESSIONS_JS
+
+
 def test_session_swipes_route_archive_restore_and_delete():
     assert "_gesturePointerType!=='mouse'" in SESSIONS_JS
     assert "_swipeTracking=true" in SESSIONS_JS
