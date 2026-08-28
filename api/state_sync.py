@@ -134,7 +134,9 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
 
 def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=0,
                        estimated_cost=None, model=None, title: Optional[str] = None,
-                       message_count: Optional[int] = None, profile: Optional[str] = None) -> None:
+                       message_count: Optional[int] = None, profile: Optional[str] = None,
+                       cache_read_tokens: int = 0, cache_write_tokens: int = 0,
+                       api_call_count: Optional[int] = None) -> None:
     """Update token usage and title for a WebUI session in state.db.
     Called after each turn completes. Uses absolute=True to set totals
     (the WebUI Session already accumulates across turns).
@@ -153,11 +155,18 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
     try:
         # Ensure session exists first (idempotent)
         db.ensure_session(session_id=session_id, source='webui', model=model)
-        # Set absolute token counts
+        # Set absolute token counts. WebUI's sidecar already accumulates
+        # input/output/cache totals across turns, so mirror the same absolute
+        # values into state.db. Omitting cache counters makes insights/reporting
+        # show false 0% hit rates even when the live stream and sidecar saw warm
+        # prefix reads.
         db.update_token_counts(
             session_id=session_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            api_call_count=api_call_count,
             estimated_cost_usd=estimated_cost,
             model=model,
             absolute=True,
@@ -181,6 +190,51 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
                 logger.debug("Failed to sync message count to state.db")
     except Exception:
         logger.debug("Failed to sync session usage to state.db")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
+
+
+def sync_session_title(session_id: str, title: str, profile: Optional[str] = None) -> None:
+    """Sync an auto-generated title to state.db (not gated by sync_to_insights).
+
+    Background title generation writes the title to the WebUI sidecar JSON but
+    not to hermes-agent's state.db, so ``hermes sessions list`` shows blank
+    titles for WebUI sessions.  This function bridges that gap and is called
+    from the background title update/refresh paths after a title is persisted.
+
+    Uses ``set_auto_title_if_empty`` so it will only populate a NULL title and
+    never overwrite a manual rename made via CLI/Gateway/TUI.  This means
+    title refreshes (where state.db already holds the initial auto-title) are
+    effectively no-ops at the state.db layer -- acceptable because the primary
+    goal is ensuring ``hermes sessions list`` is not blank.
+
+    On a title collision (two sessions with the same auto-title), the title is
+    de-duplicated via ``get_next_title_in_lineage`` (e.g. "My Session" ->
+    "My Session #2") and retried, so the second session is never left blank.
+    """
+    if not title:
+        return
+    db = _get_state_db(profile=profile)
+    if not db:
+        return
+    try:
+        # Ensure the session row exists (idempotent) so the UPDATE has a target.
+        db.ensure_session(session_id=session_id, source='webui')
+        try:
+            db.set_auto_title_if_empty(session_id, title)
+        except ValueError:
+            # state.db enforces uniqueness on sessions.title, so a byte-identical
+            # auto-title generated for two sessions raises ValueError here. Derive
+            # a de-duplicated variant (e.g. "My Session" -> "My Session #2") and
+            # retry instead of leaving the second row blank (#6964).
+            alt = db.get_next_title_in_lineage(title)
+            if alt and alt != title:
+                db.set_auto_title_if_empty(session_id, alt)
+    except Exception:
+        logger.debug("Failed to sync session title to state.db for %s", session_id)
     finally:
         try:
             db.close()

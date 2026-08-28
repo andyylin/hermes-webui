@@ -237,8 +237,10 @@ def test_profile_field_on_project_dict_default_create(monkeypatch):
     # The create handler must stamp the profile from a (validated) body value or
     # the active profile. #3331 follow-up: the raw body value is now validated
     # via _PROFILE_ID_RE before stamping, so the expression reads `_requested_profile`.
-    assert '"profile": _requested_profile or get_active_profile_name() or \'default\'' in create_block, (
-        "Project create must stamp the active profile or accept a validated profile from body (#1614/#3331)"
+    assert "_project_profile = _requested_profile or get_active_profile_name() or 'default'" in create_block
+    assert '"profile": _project_profile' in create_block
+    assert "profile_name=_project_profile" in create_block, (
+        "Project create must stamp the active profile in both legacy and canonical stores (#1614/#3331)"
     )
     # And the validation guard must be present (reject unknown/invalid profile ids).
     assert '_PROFILE_ID_RE.fullmatch(_requested_profile)' in create_block, (

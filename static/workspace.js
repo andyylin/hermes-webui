@@ -46,7 +46,21 @@ async function api(path,opts={}){
           // re-authenticate. This is especially important for iOS PWA (standalone mode)
           // and for subpath mounts like /hermes/, where /login escapes to the site root.
           if(res.status===401){
-            if(redirect401) window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+            // #5578: if we're ALREADY on the login page, appending
+            // window.location.pathname+search (which contains ?next=…) into a
+            // fresh next= wraps the login URL into itself and re-encodes it —
+            // exponential URL growth on each expired-auth bounce until the tab
+            // breaks. On the login page, just reload login WITHOUT a next (the
+            // page preserves its own inner next); elsewhere, capture the path.
+            if(redirect401){
+              // Already on the login page? Reload login WITHOUT a next.
+              const _p=(window.location.pathname||'').replace(/\/+$/,'');
+              if(/(?:^|\/)login$/.test(_p)){
+                window.location.href='login';
+              }else{
+                window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+              }
+            }
             // Callers can opt out of navigation and handle the unauthenticated state themselves.
             return;
           }
@@ -228,6 +242,23 @@ function _workspacePathIsReadOnly(path){
 }
 
 function _workspaceRouteForPath(path, kind, opts={}){
+  // Resolve the app-relative "/api/…" route against document.baseURI so the
+  // URLs that are consumed OUTSIDE api() — previewImg.src, the media/pdf/html
+  // frame src, the download anchor, window.open — keep working under a subpath
+  // mount like /hermes/. A bare "/api/…" string resolves to the server root
+  // there and 404s. (api() strips the leading slash and re-resolves against
+  // baseURI itself, so routes passed through it are unaffected by already
+  // being absolute.)
+  const route=_workspaceRouteForPathRel(path, kind, opts);
+  if(!route) return route;
+  // Non-browser test harnesses have no document/location: keep the app-relative form.
+  const base=(typeof document!=='undefined'&&document.baseURI)||(typeof location!=='undefined'&&location.href)||'';
+  if(!base||!/^https?:\/\//i.test(base)) return route;
+  const rel=route.startsWith('/') ? route.slice(1) : route;
+  return new URL(rel, base).href;
+}
+
+function _workspaceRouteForPathRel(path, kind, opts={}){
   if(!S.session) return '';
   const normalizedPath = _normalizeWorkspaceRelPath(path);
   const grant = _workspaceEscapeGrantForPath(normalizedPath);
@@ -555,12 +586,39 @@ function renderSessionArtifacts(){
     if(normWs && p.startsWith(normWs)) return p.slice(normWs.length);
     return p;
   };
-  root.innerHTML = items.map(item => `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-path">${esc(displayPath(item.path))}</div><div class="workspace-artifact-meta">${esc(item.source || 'session')}</div></button>`).join('');
+  const splitArtifactDisplayPath = (path) => {
+    const slash = path.lastIndexOf('/');
+    if(slash < 0) return {name: path, head: '', tail: ''};
+    const directory = path.slice(0, slash + 1);
+    const parentSlash = directory.lastIndexOf('/', directory.length - 2);
+    return {
+      name: path.slice(slash + 1),
+      head: directory.slice(0, parentSlash + 1),
+      tail: directory.slice(parentSlash + 1),
+    };
+  };
+  root.innerHTML = items.map(item => {
+    const path = displayPath(item.path);
+    const parts = splitArtifactDisplayPath(path);
+    const directory = (parts.head || parts.tail)
+      ? `<div class="workspace-artifact-directory"><span class="workspace-artifact-directory-head">${esc(parts.head)}</span><span class="workspace-artifact-directory-tail">${esc(parts.tail)}</span></div>`
+      : '';
+    const source = item.source ? esc(item.source) : esc(t('workspace_artifact_source_session') || 'session');
+    const sourceAttrs = item.source ? '' : ' data-i18n="workspace_artifact_source_session"';
+    return `<button type="button" class="workspace-artifact-item" title="${esc(path)}" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-filename">${esc(parts.name)}</div>${directory}<div class="workspace-artifact-meta"${sourceAttrs}>${source}</div></button>`;
+  }).join('');
+}
+
+function projectSessionArtifactsForOwner(sessionId){
+  if(!sessionId||!S.session||S.session.session_id!==sessionId) return false;
+  if(typeof _isSessionCurrentPane!=='function'||!_isSessionCurrentPane(sessionId)) return false;
+  renderSessionArtifacts();
+  return true;
 }
 
 async function _workspacePathExists(path){
   if(!S.session||!path) return false;
-  const parts=String(path).split('/').filter(Boolean);
+  const parts=String(path).replace(/\\/g,'/').split('/').filter(Boolean);
   const name=parts.pop();
   if(!name) return false;
   const dir=parts.length?parts.join('/'):'.';
@@ -571,9 +629,12 @@ async function _workspacePathExists(path){
 async function openArtifactPath(path){
   if(!path) return;
   switchWorkspacePanelTab('files');
-  let rel = path.replace(/^~\//,'').replace(/^\.\/+/,'');
+  // Normalize backslash separators to '/' first — Windows absolute paths
+  // (e.g. "D:\workspace\dir\file") otherwise break prefix-strip and the
+  // /api/list existence check (which splits on '/').
+  let rel = String(path).replace(/\\/g,'/').replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
   // Strip workspace prefix so /api/list receives a workspace-relative path.
-  const ws = S.session && S.session.workspace;
+  const ws = (S.session && S.session.workspace || '').replace(/\\/g,'/');
   if(ws){
     const normWs = ws.replace(/\/+$/,'') + '/';
     if(rel.startsWith(normWs)) rel = rel.slice(normWs.length);
@@ -678,6 +739,7 @@ async function loadDir(path, opts={}){
                              // rejected here instead of painting the wrong profile's files.
   try{
     if(!path||path==='.'||refreshExpanded){
+      if(typeof _syncWorkspaceBirthtimeSupportScope==='function') _syncWorkspaceBirthtimeSupportScope((S.session&&S.session.workspace)||'');
       S._dirCache={};
       _restoreExpandedDirs();  // restore per-workspace expanded state after root and refresh resets
     }
@@ -687,6 +749,14 @@ async function loadDir(path, opts={}){
       `/api/list?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path||'.')}`
     );
     if(!S.session||S.session.session_id!==sessionId||treeGen!==_wsTreeGen)return;
+    if(data.workspace_recovered&&data.workspace){
+      S.session.workspace=String(data.workspace);
+      S._dirCache={};
+      _restoreExpandedDirs();
+      if(typeof syncWorkspaceDisplays==='function')syncWorkspaceDisplays();
+      if(typeof syncTerminalButton==='function')syncTerminalButton();
+      showToast(t('workspace_recovered_notice',S.session.workspace),5000,'warning');
+    }
     S.entries=data.entries||[];renderBreadcrumb();renderFileTree();
     // #2673 — refresh Artifacts tab when its source data (the file tree) updates.
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
@@ -1216,6 +1286,39 @@ function openInBrowser(){
 }
 // openInBrowser keeps the helper-based raw path, which expands to an explicit &inline=1 URL.
 
+async function copyPreviewRelativePath(){
+  if(!_previewCurrentPath) return;
+  const btn=$('btnCopyPreviewRelPath');
+  if(btn&&btn.disabled) return;
+  if(btn) btn.disabled=true;
+  try{
+    const rel=_normalizeWorkspaceRelPath(_previewCurrentPath)||_previewCurrentPath;
+    if(typeof _copyTextWithFallback==='function'){
+      await _copyTextWithFallback(rel,t('path_copied'),t('path_copy_failed'));
+      return;
+    }
+    try{
+      await navigator.clipboard.writeText(rel);
+      showToast(t('path_copied'));
+    }catch(clipErr){
+      const ta=document.createElement('textarea');
+      ta.value=rel;
+      ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      let copied=false;
+      try{copied=document.execCommand('copy');}catch(_){}
+      ta.remove();
+      if(copied) showToast(t('path_copied'));
+      else showToast(t('path_copy_failed')+(clipErr&&clipErr.message?clipErr.message:String(clipErr)));
+    }
+  }catch(err){
+    showToast(t('path_copy_failed')+(err.message||err));
+  }finally{
+    if(btn) btn.disabled=false;
+  }
+}
+
 // ── Workspace upload ──────────────────────────────────────────────────
 function triggerWorkspaceUpload() {
   if(_workspacePathIsReadOnly(S.currentDir || '.')){
@@ -1322,16 +1425,22 @@ async function _collectFilesFromEntry(entry, relPrefix) {
 async function _collectOsDropUploads(dataTransfer) {
   const out = [];
   const items = dataTransfer.items ? [...dataTransfer.items] : [];
-  if (items.length && typeof items[0].webkitGetAsEntry === 'function') {
+  const files = dataTransfer.files ? [...dataTransfer.files] : [];
+  if (items.length) {
+    const entries = [];
     for (const item of items) {
       if (item.kind !== 'file') continue;
-      const entry = item.webkitGetAsEntry();
+      const getAsEntry = item.getAsEntry || item.webkitGetAsEntry;
+      const entry = typeof getAsEntry === 'function' ? getAsEntry.call(item) : null;
       if (!entry) continue;
+      entries.push(entry);
+    }
+    for (const entry of entries) {
       out.push(...await _collectFilesFromEntry(entry, ''));
     }
     if (out.length) return out;
   }
-  for (const file of dataTransfer.files) {
+  for (const file of files) {
     out.push({ file, relDir: '' });
   }
   return out;

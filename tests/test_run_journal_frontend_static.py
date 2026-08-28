@@ -4,9 +4,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MESSAGES_SRC = (ROOT / "static" / "messages.js").read_text()
-SESSIONS_SRC = (ROOT / "static" / "sessions.js").read_text()
-UI_SRC = (ROOT / "static" / "ui.js").read_text()
+MESSAGES_SRC = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
+SESSIONS_SRC = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+UI_SRC = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
 
 
 def _function_body(src: str, signature: str) -> str:
@@ -22,6 +22,20 @@ def _function_body(src: str, signature: str) -> str:
             if depth == 0:
                 return src[start : idx + 1]
     raise AssertionError(f"could not extract function body for {signature!r}")
+
+
+def _optional_function_body(src: str, signature: str) -> str:
+    """Extract a helper if present, else return "".
+
+    Used for helpers whose ABSENCE is itself the regression under test: the
+    probe must still run so the behavioral assertion reports the duplicate,
+    rather than dying with a substring-not-found extraction error that says
+    nothing about observable behavior.
+    """
+    try:
+        return _function_body(src, signature)
+    except (ValueError, AssertionError):
+        return ""
 
 
 def _run_session_identity_probe() -> dict:
@@ -80,6 +94,9 @@ def _run_current_turn_scope_probe() -> dict:
     helpers = "\n".join(
         [
             _function_body(UI_SRC, "function _stripWorkspaceDisplayPrefix"),
+            _function_body(UI_SRC, "function msgContent"),
+            _function_body(UI_SRC, "function _isContextCompactionText"),
+            _function_body(UI_SRC, "function _isContextCompactionMessage"),
             _function_body(SESSIONS_SRC, "function _messageComparableText"),
             _function_body(SESSIONS_SRC, "function _stripAttachedFilesMarker"),
             _function_body(SESSIONS_SRC, "function _stripForcedSkillEnvelope"),
@@ -128,6 +145,35 @@ const inflightWithCurrent = _mergeInflightTailMessages(
   [{{role:'user', content:{json.dumps(prompt)}, _ts:3}}, liveAssistant]
 );
 
+const compaction = {{
+  role:'user',
+  content:'[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.',
+  _ts:3.5,
+}};
+const compactionBase = [historical, historicalAnswer, optimisticCurrent, compaction];
+const compactionCandidate = {{role:'user', content:{json.dumps(prompt)}, _ts:3}};
+const compactionCurrentTail = _currentTailUserMessage(compactionBase);
+const compactionTailDuplicate = _hasCurrentTailUserDuplicate(compactionBase, compactionCandidate);
+const compactionMerged = _mergeInflightTailMessages(
+  compactionBase,
+  [compactionCandidate, liveAssistant]
+);
+const insertedAfterCompaction = _mergePendingSessionMessage(pendingSession, compactionMerged);
+const compactionPromptCount = compactionMerged.filter(
+  m=>m&&m.role==='user'&&m._ts===3&&_normalizeUserTranscriptText(m.content)==={json.dumps(prompt)}
+).length;
+const compactionMarkerRetained = compactionMerged.some(m=>_isContextCompactionMessage(m));
+const compactionLiveAssistantRetained = compactionMerged.some(
+  m=>m&&m.role==='assistant'&&m._live&&m.content==='working'
+);
+const completedBoundaryDedupe = _hasCurrentTailUserDuplicate(
+  [historical, historicalAnswer, compaction],
+  {{role:'user', content:{json.dumps(prompt)}, _ts:3}}
+);
+const distinctCompletedTurnPromptCount = inflightAfterHistory.filter(
+  m=>m&&m.role==='user'&&_normalizeUserTranscriptText(m.content)==={json.dumps(prompt)}
+).length;
+
 process.stdout.write(JSON.stringify({{
   insertedAfterHistory,
   pendingAfterHistoryRoles: pendingAfterHistory.map(m=>m.role),
@@ -137,6 +183,14 @@ process.stdout.write(JSON.stringify({{
   pendingWithCurrentRoles: pendingWithCurrent.map(m=>m.role),
   inflightAfterHistoryRoles: inflightAfterHistory.map(m=>m.role),
   inflightWithCurrentRoles: inflightWithCurrent.map(m=>m.role),
+  insertedAfterCompaction,
+  compactionCurrentTailContent: compactionCurrentTail&&compactionCurrentTail.content,
+  compactionTailDuplicate,
+  compactionPromptCount,
+  compactionMarkerRetained,
+  compactionLiveAssistantRetained,
+  completedBoundaryDedupe,
+  distinctCompletedTurnPromptCount,
 }}));
 """
     proc = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -157,10 +211,16 @@ def _run_pending_session_message_probe() -> dict:
             _function_body(SESSIONS_SRC, "function _normalizeUserTranscriptText"),
             _function_body(SESSIONS_SRC, "function _sameTranscriptMessage"),
             _function_body(UI_SRC, "function _pendingCurrentTailUserMessage"),
+            _optional_function_body(UI_SRC, "function _messageTimestampSeconds"),
+            _optional_function_body(UI_SRC, "function _activeTurnTokenMatches"),
+            _optional_function_body(UI_SRC, "function _pendingActiveTurnUserMessage"),
+            _function_body(UI_SRC, "function _isContextCompactionText"),
+            _function_body(UI_SRC, "function _isContextCompactionMessage"),
             _function_body(UI_SRC, "function getPendingSessionMessage"),
         ]
     )
     script = f"""
+const _PENDING_ACTIVE_TURN_TS_EPSILON=1e-6;
 {helpers}
 const prompt = {json.dumps(prompt)};
 const historical = {{role:'user', content:prompt, _ts:1}};
@@ -168,8 +228,24 @@ const historicalWorkspace = {{role:'user', content:{json.dumps(historical_worksp
 const historicalAnswer = {{role:'assistant', content:'done', _ts:2}};
 const currentTail = {{role:'user', content:prompt, _ts:3}};
 const currentWorkspaceTail = {{role:'user', content:{json.dumps(current_workspace_prompt)}, _ts:3}};
+const currentTailForCompaction = {{role:'user', content:prompt, _ts:3}};
 const liveAssistant = {{role:'assistant', content:'working', _live:true, _ts:4}};
 const attachments = [{{name:'note.txt', path:'note.txt', mime:'text/plain'}}];
+const compactionMarker = {{
+  role:'user',
+  content:'[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.',
+  _ts:3.5,
+}};
+const repeatedPromptTurnOne = {{role:'user', content:prompt, _ts:1}};
+const repeatedPromptAnswerOne = {{role:'assistant', content:'done', _ts:2}};
+const repeatedPromptTurnTwo = {{role:'user', content:prompt, _ts:3}};
+const repeatedPromptAnswerTwo = {{role:'assistant', content:'done', _ts:4}};
+const repeatedCompletedBase = [
+  repeatedPromptTurnOne,
+  repeatedPromptAnswerOne,
+  repeatedPromptTurnTwo,
+  repeatedPromptAnswerTwo,
+];
 
 const fromHistoricalSameText = getPendingSessionMessage(
   {{pending_user_message:prompt, pending_started_at:3}},
@@ -196,6 +272,91 @@ const differentTailResult = getPendingSessionMessage(
   {{pending_user_message:prompt, pending_started_at:4}},
   [historical, historicalAnswer, {{role:'user', content:'different prompt', _ts:3}}]
 );
+const compactionTailResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:4, pending_attachments:attachments}},
+  [historical, historicalAnswer, currentTailForCompaction, compactionMarker]
+);
+const repeatedCompletedResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:5}},
+  repeatedCompletedBase
+);
+const repeatedCompletedMessages = repeatedCompletedResult
+  ? [...repeatedCompletedBase, repeatedCompletedResult]
+  : repeatedCompletedBase;
+const repeatedCompletedPromptCount = repeatedCompletedMessages.filter(
+  m=>m&&m.role==='user'&&_normalizeUserTranscriptText(m.content)===prompt
+).length;
+const compactionCurrentTail = _pendingCurrentTailUserMessage([historical, historicalAnswer, currentTailForCompaction, compactionMarker]);
+
+// Mid-run reload: the server already reconciled the active turn's user row into
+// the transcript AND this turn's assistant/tool output follows it, while
+// pending_user_message is still set. The strict tail scan cannot see the user
+// row (it stops at the completed assistant), so without the pending_started_at
+// fallback the prompt is materialized a second time -> duplicate user bubble.
+const midRunStartedAt = 500;
+const midRunTranscript = [
+  {{role:'user', content:'earlier question', timestamp:100}},
+  {{role:'assistant', content:'earlier answer', timestamp:200}},
+  {{role:'user', content:prompt, timestamp:midRunStartedAt}},
+  {{role:'assistant', content:'', timestamp:midRunStartedAt+15}},
+  {{role:'tool', content:'{{"ok":true}}', timestamp:midRunStartedAt+16}},
+  {{role:'assistant', content:'partial answer', timestamp:midRunStartedAt+60}},
+];
+const midRunResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:midRunStartedAt}},
+  midRunTranscript
+);
+const midRunWorkspaceTranscript = [
+  {{role:'user', content:'earlier question', timestamp:100}},
+  {{role:'assistant', content:'earlier answer', timestamp:200}},
+  {{role:'user', content:{json.dumps(current_workspace_prompt)}, timestamp:midRunStartedAt}},
+  {{role:'assistant', content:'partial answer', timestamp:midRunStartedAt+30}},
+];
+const midRunWorkspaceResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:midRunStartedAt}},
+  midRunWorkspaceTranscript
+);
+// A same-text row from an OLDER turn must never be adopted: only the row whose
+// timestamp matches pending_started_at identifies the active turn.
+const staleSameTextTranscript = [
+  {{role:'user', content:prompt, timestamp:midRunStartedAt-600}},
+  {{role:'assistant', content:'old answer', timestamp:midRunStartedAt-500}},
+];
+const staleSameTextResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:midRunStartedAt}},
+  staleSameTextTranscript
+);
+// Legacy/absent pending_started_at disables the fallback rather than guessing.
+const noStartedAtResult = getPendingSessionMessage(
+  {{pending_user_message:prompt}},
+  midRunTranscript
+);
+
+// Regression (review round 2): two completed identical-text turns whose
+// started_at differ by ~1s. The old 1.5s tolerance adopted the EARLIER row as
+// the "active turn", hiding the second (still-pending) turn and copying its
+// attachments onto the old row. With the precision-only epsilon the second turn
+// is materialized and the first row stays untouched.
+const rapidRepeatTurnOne = {{role:'user', content:prompt, timestamp:100}};
+const rapidRepeatAnswerOne = {{role:'assistant', content:'done', timestamp:101}};
+const rapidRepeatSecondAttachments = [{{name:'second.txt', path:'second.txt', mime:'text/plain'}}];
+const rapidRepeatResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:101, pending_attachments:rapidRepeatSecondAttachments}},
+  [rapidRepeatTurnOne, rapidRepeatAnswerOne]
+);
+// Exact token identity: the eager-checkpoint row carries _active_turn_token
+// built from the same stream_id + started_at as the session — adopted even
+// though its timestamp (499.9) is NOT within the epsilon of pending_started_at.
+const tokenIdentityTranscript = [
+  {{role:'user', content:'earlier question', timestamp:100}},
+  {{role:'assistant', content:'earlier answer', timestamp:200}},
+  {{role:'user', content:prompt, timestamp:499.9, _active_turn_token:'stream-abc:500'}},
+  {{role:'assistant', content:'partial', timestamp:560}},
+];
+const tokenIdentityResult = getPendingSessionMessage(
+  {{pending_user_message:prompt, pending_started_at:midRunStartedAt, active_stream_id:'stream-abc'}},
+  tokenIdentityTranscript
+);
 
 process.stdout.write(JSON.stringify({{
   historicalSameTextSurvives: !!fromHistoricalSameText && fromHistoricalSameText.content===prompt && fromHistoricalSameText._pending===true,
@@ -205,6 +366,19 @@ process.stdout.write(JSON.stringify({{
   workspaceCurrentTailDedupe: workspaceCurrentResult===null,
   liveAfterCurrentTailDedupe: liveAfterCurrentResult===null,
   differentCurrentTailSurvives: !!differentTailResult && differentTailResult.content===prompt && differentTailResult._pending===true,
+  compactionBoundaryDedupe: compactionTailResult===null,
+  compactionBoundaryCurrentTail: compactionCurrentTail&&compactionCurrentTail.role==='user'&&compactionCurrentTail.content===prompt,
+  compactionCurrentTailAttachmentsCopied: Array.isArray(currentTailForCompaction.attachments) && currentTailForCompaction.attachments[0].name==='note.txt',
+  repeatedCompletedPromptsRemainValid: repeatedCompletedPromptCount===3,
+  midRunReloadDedupe: midRunResult===null,
+  midRunWorkspaceReloadDedupe: midRunWorkspaceResult===null,
+  staleSameTextStillMaterializes: !!staleSameTextResult && staleSameTextResult._pending===true,
+  legacyNoStartedAtStillMaterializes: !!noStartedAtResult && noStartedAtResult._pending===true,
+  rapidRepeatSecondTurnReturned: !!rapidRepeatResult && rapidRepeatResult._pending===true && rapidRepeatResult.content===prompt && Array.isArray(rapidRepeatResult.attachments) && rapidRepeatResult.attachments[0].name==='second.txt',
+  rapidRepeatFirstRowKeptClean: !Array.isArray(rapidRepeatTurnOne.attachments),
+  tokenIdentityDedupe: tokenIdentityResult===null,
+  isContextCompactionText: _isContextCompactionText(compactionMarker.content),
+  isContextCompactionMessage: _isContextCompactionMessage(compactionMarker),
 }}));
 """
     proc = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -385,6 +559,15 @@ def test_user_turn_dedupe_is_scoped_to_current_turn_by_behavior():
     assert result["inflightAfterHistoryRoles"] == ["user", "assistant", "user", "assistant"]
     assert result["inflightWithCurrentRoles"] == ["user", "assistant", "user", "assistant"]
 
+    assert result["insertedAfterCompaction"] is False
+    assert result["compactionCurrentTailContent"] == "[Workspace::v1: /tmp/current]\nrepeat me"
+    assert result["compactionTailDuplicate"] is True
+    assert result["compactionPromptCount"] == 1
+    assert result["compactionMarkerRetained"] is True
+    assert result["compactionLiveAssistantRetained"] is True
+    assert result["completedBoundaryDedupe"] is False
+    assert result["distinctCompletedTurnPromptCount"] == 2
+
 
 def test_get_pending_session_message_keeps_deferred_repeat_prompt_by_behavior():
     """Deferred active reload must not hide a current repeat prompt.
@@ -404,6 +587,22 @@ def test_get_pending_session_message_keeps_deferred_repeat_prompt_by_behavior():
     assert result["workspaceCurrentTailDedupe"] is True
     assert result["liveAfterCurrentTailDedupe"] is True
     assert result["differentCurrentTailSurvives"] is True
+    assert result["compactionBoundaryDedupe"] is True
+    assert result["compactionBoundaryCurrentTail"] is True
+    assert result["compactionCurrentTailAttachmentsCopied"] is True
+    assert result["repeatedCompletedPromptsRemainValid"] is True
+    # #6649 follow-up: mid-run reload must not duplicate the active turn's user row
+    assert result["midRunReloadDedupe"] is True
+    assert result["midRunWorkspaceReloadDedupe"] is True
+    assert result["staleSameTextStillMaterializes"] is True
+    assert result["legacyNoStartedAtStillMaterializes"] is True
+    # #6670 review round 2: ~1s-apart identical turns must not be collapsed by
+    # the active-turn fallback (no over-dedup, no attachment mis-attachment).
+    assert result["rapidRepeatSecondTurnReturned"] is True
+    assert result["rapidRepeatFirstRowKeptClean"] is True
+    assert result["tokenIdentityDedupe"] is True
+    assert result["isContextCompactionText"] is True
+    assert result["isContextCompactionMessage"] is True
 
 
 def test_live_tool_matching_uses_the_same_aliases_as_live_card_dedup():

@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 import shutil
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 from typing import Iterable
 
@@ -101,7 +103,7 @@ def _read_state_db(state_db_path: Path | None) -> dict[str, dict]:
     if state_db_path is None or not state_db_path.exists():
         return {}
     try:
-        with sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
             if "sessions" not in tables:
@@ -387,9 +389,27 @@ def audit_session_discoverability(
 
 
 def _atomic_write_json(path: Path, payload) -> None:
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    # Temp name includes the thread id, not just the pid: WebUI runs a
+    # ThreadingHTTPServer, so two request threads reconciling the same _index.json
+    # would otherwise collide on one `<name>.tmp.<pid>` path and truncate each
+    # other's temp before its os.replace. fsync before the rename so a power loss
+    # can't leave a zero-length/garbage file where the durable JSON should be; a
+    # finally drops the temp if anything fails. Mode matches the prior write_text
+    # (umask default) since the plain open() respects the umask.
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _backup_file(path: Path, backup_dir: Path, backed_up: dict[Path, str]) -> str | None:
@@ -482,7 +502,7 @@ def _materialize_sidecar_from_state_db(session_dir: Path, state_db_path: Path | 
     payload = _state_db_row_to_sidecar(row)
     _backup_file(state_db_path, backup_dir, backed_up)
     session_dir.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
+    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         os.link(str(tmp), str(target))

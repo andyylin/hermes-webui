@@ -7,8 +7,8 @@
 >
 > Keep this document updated as architecture changes are made.
 
-> Current shipped build: `v0.51.192` (May 31, 2026).
-> Automated coverage: ~7,150 tests via `pytest tests/ --collect-only -q`. CI runs on
+> Current shipped build: `v0.51.792` (July 1, 2026).
+> Automated coverage: ~11,500 tests via `pytest tests/ --collect-only -q`. CI runs on
 > Python 3.11, 3.12, and 3.13 (3 parallel shards each) against every PR, plus a ruff
 > lint gate, a headless browser smoke test, and a Docker smoke test.
 >
@@ -50,7 +50,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
     bootstrap.py           One-shot launcher: optional agent install, deps, health wait, browser open.
     start.sh               Thin wrapper around bootstrap.py for shell-based startup.
     ctl.sh                 Daemon lifecycle wrapper (start/stop/restart/status/logs) for homelab installs.
-    pyproject.toml         Tooling config (ruff lint gate). NOT a packaged distribution.
+    pyproject.toml         Standard build metadata plus the Ruff lint gate; source-checkout launch surface still centers on bootstrap.py / start.sh / ctl.sh.
     Dockerfile             python:3.12-slim container image
     docker-compose.yml     Compose config with named volume and optional auth
     .dockerignore          Excludes .git, tests/, .env* from Docker builds
@@ -59,6 +59,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       auth.py              Optional password authentication, signed cookies, passkeys/WebAuthn
       config.py            Discovery, globals, model detection, reloadable config
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers
+      goals.py             Persistent-goal commands and profile-scoped native GoalManager bridge
       models.py            Session model + CRUD, per-session profile tracking, CLI/state.db bridge
       profiles.py          Profile state management, hermes_cli wrapper
       onboarding.py        First-run onboarding status, real provider config writes, OAuth linking, readiness detection
@@ -86,7 +87,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       sw.js                Service worker: offline shell cache, version-pinned assets
     tests/
       conftest.py          Isolated test server/state fixtures
-      ~700 test files      ~7,150 tests collected via pytest (run `pytest --collect-only -q` for exact)
+      ~1,150 test files    ~11,500 tests collected via pytest (run `pytest --collect-only -q` for exact)
       test_regressions.py  Permanent regression gate
     CONTRIBUTING.md        Contributor workflow and PR expectations.
     ROADMAP.md             Feature and product roadmap document.
@@ -235,6 +236,24 @@ Session is a plain Python class (not a dataclass, not SQLAlchemy):
 title_from(): takes messages list, finds first user message, returns first 64 chars.
 Called after run_conversation() completes to set the session title retroactively.
 
+#### Imported `state.db` sidebar projection
+
+`api.models.get_cli_sessions()` projects conversations from the active Hermes
+profile's `state.db` into sidebar-shaped rows. The default projection keeps
+interactive sources (CLI, TUI, ACP, messaging, and similar user-facing sessions)
+in a bounded 20-row candidate window. Background sources use independent recovery
+passes so a high-volume worker source cannot consume that interactive window:
+
+- Cron: up to `CRON_PROJECT_CHIP_LIMIT` rows.
+- Webhook: up to `WEBHOOK_PROJECT_CHIP_LIMIT` rows.
+- Kanban: up to `KANBAN_PROJECT_CHIP_LIMIT` rows.
+
+Source-specific views still use their dedicated bounds, and the later sidebar
+visibility stage decides whether recovered background rows are shown. In
+`all_profiles=True` mode the per-profile source bounds are disabled before rows
+are merged; cross-profile scoping, visibility, deduplication, and final route
+limits remain downstream responsibilities.
+
 ### 4.3 SSE Streaming Engine
 
 This is the most architecturally interesting part. Two endpoints cooperate:
@@ -375,6 +394,29 @@ read_file_content(workspace, rel):
     - Enforces MAX_FILE_BYTES = 200KB size limit
     - Reads as UTF-8 with errors='replace' (binary files show replacement chars)
     - Returns {path, content, size, lines}
+
+### 4.8 Persistent Goal Profile Boundary
+
+`api/goals.py` exposes the WebUI `/goal` command payloads and post-turn evaluation hook.
+Hermes Agent's native `GoalManager` is the authoritative owner of goal evaluation,
+continuation decisions, wait barriers, failure counters, contracts, subgoals, and
+`state.db` persistence.
+
+For a profile-scoped WebUI session, the bridge delegates only when the Agent exposes
+both the context-local `set_hermes_home_override()` API and call-time default
+`SessionDB` path resolution. The bridge probes the resolved default path under the
+selected context before constructing the native manager, then binds that profile's
+Hermes home before every native call. The override is reset in a `finally` block after
+every operation, so concurrent sessions using the same session ID under different
+profiles cannot cross-read or cross-write goal state. Goal snapshot rollback uses the
+same scoped native persistence path.
+
+Older Hermes Agent versions that lack either capability continue through
+`_LegacyProfileGoalManager`, which pins persistence to the selected profile's explicit
+`state.db` path. This includes intermediate versions whose context API is present but
+whose default `SessionDB()` path remains frozen at module import. Keep this fallback
+compatibility-only: new goal semantics belong in Hermes Agent's native manager rather
+than a second WebUI implementation.
 
 ---
 
@@ -718,7 +760,7 @@ Current structure:
         ui.js, workspace.js, sessions.js, messages.js, panels.js, commands.js, boot.js
       tests/
         conftest.py           Isolated test server/state fixtures
-        488 test files        5303 tests collected
+        ~1,150 test files     ~11,500 tests collected
         test_regressions.py   Permanent regression gate
 
 Route extraction to api/routes.py completed in Sprint 11. server.py remains a
@@ -818,7 +860,7 @@ Optional password gate for non-SSH-tunnel deployments.
 
 ### Phase I: Test Infrastructure -- COMPLETE
 
-5303 tests across 488 test files + regression gates. The pytest fixture derives
+~11,500 tests across ~1,150 test files + regression gates. The pytest fixture derives
 an isolated port and state directory from the repo path unless
 `HERMES_WEBUI_TEST_PORT` / `HERMES_WEBUI_TEST_STATE_DIR` pin them explicitly.
 Production data never touched.
@@ -1307,6 +1349,8 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
     /api/sessions              List of all session compact() dicts, sorted by updated_at
     /api/list                  ?session_id=X&path=. -> directory listing for session workspace
     /api/file                  ?session_id=X&path=rel -> file content (text, 200KB limit)
+    /share/<token>             Public read-only HTML shell for a sanitized shared transcript snapshot
+    /api/share/<token>         Public JSON payload for a sanitized shared transcript snapshot
     /api/chat/stream           ?stream_id=X -> SSE stream. Long-lived. Emits token/tool/
                                approval/done/error events.
     /api/chat/stream/status    ?stream_id=X -> {"active": true/false, "stream_id": X}
@@ -1327,6 +1371,8 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
                                -> {"stream_id", "session_id"}. Starts agent daemon thread.
     /api/chat                  (fallback, sync) {"session_id", "message", "model"?, "workspace"?}
                                -> blocks until agent finishes. Returns full result.
+    /api/share/create          {"session_id"} -> creates or refreshes a public read-only snapshot link
+    /api/share/revoke          {"session_id"} -> revokes the current public snapshot link
     /api/approval/respond      {"session_id", "choice": once|session|always|deny}
                                -> {"ok": true, "choice": choice}
 

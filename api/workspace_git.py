@@ -20,9 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-logger = logging.getLogger(__name__)
-
+from api.subprocess_utils import windows_hide_flags
 from api.workspace import rmtree_anchored, safe_resolve_ws, unlink_anchored
+
+logger = logging.getLogger(__name__)
 
 
 GIT_TIMEOUT = 5
@@ -248,6 +249,7 @@ def _run_git(
             text=True,
             timeout=timeout,
             env=run_env,
+            creationflags=windows_hide_flags(),
         )
     except subprocess.TimeoutExpired as exc:
         raise GitWorkspaceError("Git command timed out", "timeout") from exc
@@ -290,6 +292,7 @@ def _config_names_for_scope(
         capture_output=True,
         timeout=GIT_TIMEOUT,
         env=env,
+        creationflags=windows_hide_flags(),
     )
     if result.returncode not in {0, 1}:
         if ignore_unsupported:

@@ -4,14 +4,22 @@ Verifies that the auxiliary models card is present in the settings HTML,
 that the JS loading/saving logic is wired up, and that all locales have the
 required i18n keys.
 """
+import json
+import shutil
+import subprocess
+
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).parent.parent
-PANELS_JS = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+PANELS_JS_PATH = ROOT / "static" / "panels.js"
+PANELS_JS = PANELS_JS_PATH.read_text(encoding="utf-8")
 INDEX_HTML = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
 I18N_JS = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
 STREAMING_PY = (ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
+NODE = shutil.which("node")
 
 
 class TestAuxiliaryModelsHTML:
@@ -63,18 +71,102 @@ class TestAuxiliaryModelsJS:
             "Missing _applyAuxModels() in panels.js"
         )
 
-    def test_aux_task_slots_defined(self):
-        """_AUX_TASK_SLOTS must list the 12 canonical task slots."""
-        assert "_AUX_TASK_SLOTS" in PANELS_JS, (
-            "Missing _AUX_TASK_SLOTS constant in panels.js"
+    def test_auxiliary_task_metadata_is_normalized(self):
+        """Frontend should keep auxiliary task rows backed by normalized metadata."""
+        assert "let _auxTasks=[]" in PANELS_JS, "Missing _auxTasks cache in panels.js"
+        assert "function _normalizeAuxiliaryTasks" in PANELS_JS, (
+            "Missing _normalizeAuxiliaryTasks() in panels.js"
         )
-        # Verify all 12 tasks are present
-        for key in ("vision", "compression", "web_extract", "session_search",
-                     "approval", "mcp", "title_generation", "skills_hub", "curator",
-                     "kanban_decomposer", "profile_describer", "triage_specifier"):
-            assert f"key:'{key}'" in PANELS_JS, (
-                f"Missing auxiliary task slot '{key}' in _AUX_TASK_SLOTS"
-            )
+        assert "function _auxTaskLabelFromMeta" in PANELS_JS, (
+            "Missing _auxTaskLabelFromMeta() in panels.js"
+        )
+        assert "_auxTasks=_normalizeAuxiliaryTasks((auxData&&auxData.tasks)||[])" in PANELS_JS, (
+            "Auxiliary load flow must normalize API task payload"
+        )
+        assert "for(const task of _auxTasks)" in PANELS_JS, (
+            "Auxiliary rows should be rendered from normalized API payload"
+        )
+
+    @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+    def test_normalize_auxiliary_tasks_keeps_first_wins_and_unknown_metadata(self):
+        """Normalization should keep first occurrence and preserve unknown metadata."""
+        script = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+
+function extract(name){
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = src.search(re);
+  if(start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{', start);
+  let depth = 0;
+  while(i < src.length){
+    const ch = src[i];
+    if(ch === '{') depth += 1;
+    else if(ch === '}') {
+      depth -= 1;
+      if(depth === 0){
+        break;
+      }
+    }
+    i += 1;
+  }
+  if(depth !== 0) throw new Error(name + ' parse failed');
+  return src.slice(start, i + 1);
+}
+
+global.t = (key) => {
+  const dict = {
+    settings_aux_task_vision: 'Vision',
+    settings_aux_task_vision_desc: 'image/screenshot analysis',
+  };
+  return Object.prototype.hasOwnProperty.call(dict, key) ? dict[key] : key;
+};
+
+eval(extract('_auxTaskLabelFromMeta'));
+eval(extract('_normalizeAuxiliaryTasks'));
+
+const normalized = _normalizeAuxiliaryTasks([
+  {task: 'vision', provider: 'openai', model: 'gpt-5.5', label: 'Backend Vision', description: 'backend desc'},
+  {task: 'future_task', provider: 'openai', model: 'future-1', label: 'Future Task', description: 'future tool'},
+  {task: 'vision', provider: 'openai', model: 'gpt-5.6'},
+  null,
+  {},
+]);
+
+const vision = normalized.find((entry) => entry.task === 'vision');
+const futureTask = normalized.find((entry) => entry.task === 'future_task');
+
+console.log(JSON.stringify({
+  tasks: normalized.map((entry) => entry.task),
+  visionLabel: vision ? vision.label : null,
+  visionDescription: vision ? vision.description : null,
+  futureLabel: futureTask ? futureTask.label : null,
+  futureDescription: futureTask ? futureTask.description : null,
+}));
+"""
+
+        proc = subprocess.run(
+            [NODE, "-e", script, str(PANELS_JS_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert proc.returncode == 0, f"node probe failed:\n{proc.stderr}"
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert result["tasks"] == ["vision", "future_task"], (
+            "normalize should keep duplicate removal and payload order"
+        )
+        assert result["visionLabel"] == "Vision"
+        assert result["visionDescription"] == "image/screenshot analysis"
+        assert result["futureLabel"] == "Future Task"
+        assert result["futureDescription"] == "future tool"
+
+    def test_no_hardcoded_aux_task_slot_array(self):
+        """Auxiliary rows must not come from a hardcoded task-slot list."""
+        assert "_AUX_TASK_SLOTS" not in PANELS_JS
+        assert "const _AUX_TASK_SLOTS" not in PANELS_JS
+        assert "session_search" not in PANELS_JS
 
     def test_advanced_options_button_and_modal_wiring(self):
         """Each auxiliary row and the main model should expose gear-driven advanced config editing."""
@@ -104,6 +196,17 @@ class TestAuxiliaryModelsJS:
         ):
             assert marker in PANELS_JS
 
+    def test_normalize_auxiliary_tasks_deduplicates_and_rejects_malformed(self):
+        """Frontend normalization should keep only first occurrence and valid payload entries."""
+        assert "if(!rawTask||typeof rawTask!=='object') continue;" in PANELS_JS
+        assert "if(!task||seen.has(task)) continue;" in PANELS_JS
+
+    def test_auxiliary_load_uses_api_payload_order(self):
+        """Row rendering should iterate exactly the normalized API payload order."""
+        idx = PANELS_JS.find("_auxTasks=_normalizeAuxiliaryTasks((auxData&&auxData.tasks)||[])")
+        assert idx >= 0
+        assert "for(const task of _auxTasks)" in PANELS_JS[idx:idx + 380]
+
     def test_main_advanced_modal_hides_unsupported_timing_fields_but_keeps_request_body(self):
         """Main-model modal should not advertise timing knobs that the chat agent cannot apply."""
         open_idx = PANELS_JS.find("function _openAuxAdvancedOptions")
@@ -122,16 +225,19 @@ class TestAuxiliaryModelsJS:
         assert helper_idx >= 0
         helper_body = PANELS_JS[helper_idx:helper_idx + 1300]
         assert "_mainModelSupportsServiceTier" in PANELS_JS
-        assert "rawModel.includes('/')" in helper_body
-        assert "rawModel.slice(0,slash)!=='openai'" in helper_body
-        assert "bareModel.includes('codex')" in helper_body
-        assert "bareModel.startsWith('gpt-')" in helper_body
-        assert "bareModel.startsWith('o4')" in helper_body
+        assert "selectedOpt.dataset.fast" in helper_body
+        assert "return cfg&&cfg.supports_fast_tier===true" in helper_body
+        assert "return fastSupport==='1'||fastSupport==='true'" in helper_body
+        assert "provider!=='openai'&&provider!=='openai-api'&&provider!=='openai-codex')" in helper_body
+        assert "provider==='openai-codex') return false" not in helper_body
         assert "auxAdvancedServiceTier" in modal_body
         assert "isMain&&_mainModelSupportsServiceTier(cfg)" in modal_body
         assert "settings_main_advanced_service_tier" in modal_body
         assert "settings_main_advanced_service_tier_default" in modal_body
         assert "settings_main_advanced_service_tier_priority" in modal_body
+        assert "m.supports_fast_tier" in PANELS_JS
+        assert "opt.dataset.fast='1'" in PANELS_JS
+        assert "opt.dataset.fast='0'" in PANELS_JS
 
     def test_main_advanced_save_omits_unsupported_timing_keys(self):
         """Saving main-model options must not send blank timing keys that backend treats as clears."""
@@ -299,8 +405,6 @@ class TestAuxiliaryModelsI18n:
         "settings_aux_task_compression_desc",
         "settings_aux_task_web_extract",
         "settings_aux_task_web_extract_desc",
-        "settings_aux_task_session_search",
-        "settings_aux_task_session_search_desc",
         "settings_aux_task_approval",
         "settings_aux_task_approval_desc",
         "settings_aux_task_mcp",
@@ -327,12 +431,17 @@ class TestAuxiliaryModelsI18n:
             )
 
     def test_all_locales_have_auxiliary_keys(self):
-        """Count of each key should equal the number of locales (12 with Turkish)."""
+        """Count of each key should equal the number of supported locales."""
         for key in self.REQUIRED_KEYS:
             count = I18N_JS.count(f"{key}:")
-            assert count == 14, (
-                f"i18n key '{key}' found {count} times — expected 14 (one per locale)"
+            assert count == 15, (
+                f"i18n key '{key}' found {count} times — expected 15 (one per locale)"
             )
+
+    def test_session_search_aux_task_i18n_keys_removed(self):
+        """session_search auxiliary labels were retired from the canonical set."""
+        assert "settings_aux_task_session_search" not in I18N_JS
+        assert "settings_aux_task_session_search_desc" not in I18N_JS
 
 
 class TestAuxiliaryModelsBackend:
@@ -443,6 +552,96 @@ class TestAuxiliaryModelsBackend:
         assert vision["extra_body"] == {"reasoning_effort": "none"}
         assert vision["api_key_set"] is True
         assert "api_key" not in vision
+
+    def test_get_auxiliary_models_omits_session_search_and_includes_metadata(self, monkeypatch):
+        """Backend payload should omit unknown keys and keep canonical metadata."""
+        from api import config
+
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+        monkeypatch.setattr(config, "cfg", {
+            "model": {"provider": "openai", "default": "gpt-5.5"},
+            "auxiliary": {
+                "vision": {"provider": "openai", "model": "gpt-5.5"},
+                "future_task": {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "label": "Future Task",
+                    "description": "future tool",
+                },
+                "monitor": {"provider": "openai", "model": "gpt-5.5"},
+                "tts_audio_tags": {"provider": "openai", "model": "gpt-5.5"},
+            },
+        })
+
+        data = config.get_auxiliary_models()
+        task_keys = [t["task"] for t in data["tasks"]]
+        assert task_keys == [
+            "vision",
+            "web_extract",
+            "compression",
+            "approval",
+            "mcp",
+            "title_generation",
+            "skills_hub",
+            "curator",
+            "kanban_decomposer",
+            "profile_describer",
+            "triage_specifier",
+        ]
+        assert "session_search" not in task_keys
+        assert "future_task" not in task_keys
+        assert "monitor" not in task_keys
+        assert "tts_audio_tags" not in task_keys
+        vision = next(t for t in data["tasks"] if t["task"] == "vision")
+        assert vision["label"] == "Vision"
+        assert vision["description"] == "image/screenshot analysis"
+
+    def test_set_auxiliary_model_rejects_existing_unknown_task(self, monkeypatch, tmp_path):
+        """Existing unknown keys must be rejected by the auxiliary setter."""
+        from api import config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "auxiliary:\n  future_task:\n    provider: openai\n    model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+
+        with pytest.raises(ValueError, match="Unknown auxiliary task slot") as excinfo:
+            config.set_auxiliary_model("future_task", "openai", "gpt-5.6")
+        assert "future_task" in str(excinfo.value)
+
+    def test_reset_removes_retired_slot_but_preserves_other_unknown_mappings(
+        self, monkeypatch, tmp_path
+    ):
+        """Reset cleans known retired slots without treating config as task schema."""
+        from api import config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: openai\n"
+            "    model: gpt-5.5\n"
+            "  session_search:\n"
+            "    provider: openai\n"
+            "    model: gpt-5.5\n"
+            "  monitor:\n"
+            "    provider: openai\n"
+            "    model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+
+        config.set_auxiliary_model("__reset__", "auto", "")
+
+        saved = config._load_yaml_config_file(config_path)["auxiliary"]
+        assert "session_search" not in saved
+        assert saved["monitor"] == {"provider": "openai", "model": "gpt-5.5"}
+        assert saved["vision"]["provider"] == "auto"
+        assert saved["vision"]["model"] == ""
 
     def test_backend_surfaces_main_advanced_fields_without_api_key_value(self, monkeypatch):
         """Main model advanced fields should be visible, but API keys remain write-only."""
@@ -738,3 +937,193 @@ class TestAuxiliaryModelsBackend:
 
         assert result["status"] == 400
         assert "Unknown auxiliary task slot" in result["error"]
+
+    def test_aux_slot_base_url_uses_selected_provider_not_active_endpoint(
+        self, monkeypatch, tmp_path
+    ):
+        """Overlapping-id sibling fix: persisting an auxiliary slot for a named
+        custom provider must record THAT provider's own base_url, not the active
+        main provider's endpoint.
+
+        Repro: main provider is custom:dogapi (base_url dogapi), and both dogapi
+        and packyapi list 'shared-model'. Selecting custom:packyapi for the vision
+        slot previously persisted {provider: custom:packyapi, base_url: dogapi's}
+        because the base_url was resolved with a bare resolve_model_provider(model)
+        that ignores the selected provider. It must persist packyapi's base_url.
+        """
+        from api import config
+
+        shared_cfg = {
+            "model": {
+                "default": "shared-model",
+                "provider": "custom",
+                "base_url": "https://www.dogapi.cc/v1",
+            },
+            "custom_providers": [
+                {"name": "dogapi", "base_url": "https://www.dogapi.cc/v1",
+                 "models": ["shared-model"]},
+                {"name": "packyapi", "base_url": "https://www.packyapi.ai/v1",
+                 "models": ["shared-model"]},
+            ],
+        }
+
+        config_path = tmp_path / "config.yaml"
+        import yaml
+        config_path.write_text(yaml.safe_dump(shared_cfg), encoding="utf-8")
+        monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+        # base_url resolution reads the in-memory cfg / get_config snapshot.
+        monkeypatch.setattr(config, "cfg", dict(shared_cfg))
+        monkeypatch.setattr(config, "get_config", lambda: dict(shared_cfg))
+
+        config.set_auxiliary_model("vision", "custom:packyapi", "shared-model")
+
+        saved = config._load_yaml_config_file(config_path)["auxiliary"]["vision"]
+        assert saved["provider"] == "custom:packyapi"
+        assert saved["base_url"] == "https://www.packyapi.ai/v1", (
+            f"aux slot must persist the SELECTED provider's base_url, got "
+            f"{saved.get('base_url')!r}"
+        )
+
+    def test_aux_slot_custom_provider_base_url_no_deadlock(self, monkeypatch, tmp_path):
+        """Regression: saving a named custom auxiliary model must not self-deadlock.
+
+        set_auxiliary_model() holds the non-reentrant _cfg_lock while resolving
+        the selected custom provider's base_url. The pre-fix code called
+        resolve_custom_provider_connection() -> get_config() ->
+        reload_config_if_stale(), which re-acquires _cfg_lock and hangs forever
+        whenever the config cache is stale or the profile path changed. This test
+        uses the REAL get_config (only reload_config, which runs AFTER the lock is
+        released, is stubbed) and forces get_config()'s reload branch, then runs
+        the call on a watchdog thread that fails the test if it hangs.
+        """
+        import threading
+
+        import yaml
+
+        from api import config
+
+        shared_cfg = {
+            "model": {
+                "default": "shared-model",
+                "provider": "custom",
+                "base_url": "https://www.dogapi.cc/v1",
+            },
+            "custom_providers": [
+                {"name": "dogapi", "base_url": "https://www.dogapi.cc/v1",
+                 "models": ["shared-model"]},
+                {"name": "packyapi", "base_url": "https://www.packyapi.ai/v1",
+                 "models": ["shared-model"]},
+            ],
+        }
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(shared_cfg), encoding="utf-8")
+        monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+        # reload_config runs AFTER _cfg_lock is released; stub it so the test
+        # doesn't mutate global module state. get_config stays REAL — that is the
+        # path the pre-fix code re-entered while holding the lock.
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+        # Force the reload branch inside the real get_config the pre-fix code
+        # called: a mismatched cached path makes path_changed True.
+        monkeypatch.setattr(config, "_cfg_path", None, raising=False)
+
+        result_box: dict = {}
+        error_box: dict = {}
+
+        def _run():
+            try:
+                result_box["r"] = config.set_auxiliary_model(
+                    "vision", "custom:packyapi", "shared-model"
+                )
+            except Exception as exc:  # pragma: no cover - surfaced via join
+                error_box["e"] = exc
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), (
+            "set_auxiliary_model deadlocked while resolving a custom provider "
+            "base_url under _cfg_lock"
+        )
+        if "e" in error_box:
+            raise error_box["e"]
+
+        saved = config._load_yaml_config_file(config_path)["auxiliary"]["vision"]
+        assert saved["provider"] == "custom:packyapi"
+        assert saved["base_url"] == "https://www.packyapi.ai/v1", (
+            f"aux slot must persist the SELECTED provider's base_url, got "
+            f"{saved.get('base_url')!r}"
+        )
+
+    def test_aux_slot_custom_provider_slug_collision_fails_closed(self, monkeypatch, tmp_path):
+        """Saving a named custom auxiliary model whose slug collides with another
+        config entry must fail closed, not silently persist the wrong endpoint.
+
+        The inline base_url resolution added for the deadlock fix shares the same
+        all-entry uniqueness helper, so a custom:foo-bar save with colliding
+        'Foo Bar' + 'foo-bar' entries raises AmbiguousCustomProviderError and
+        writes nothing (the slot stays 'auto'). Operates on the in-scope
+        config_data, so it remains lock-safe.
+        """
+        import yaml
+
+        from api import config
+
+        shared_cfg = {
+            "auxiliary": {"vision": {"provider": "auto", "model": ""}},
+            "custom_providers": [
+                {"name": "Foo Bar", "base_url": "https://a.example/v1"},
+                {"name": "foo-bar", "base_url": "https://b.example/v1",
+                 "models": ["shared-model"]},
+            ],
+        }
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(shared_cfg), encoding="utf-8")
+        monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+
+        with pytest.raises(config.AmbiguousCustomProviderError):
+            config.set_auxiliary_model("vision", "custom:foo-bar", "shared-model")
+
+        # The ambiguous save must not have persisted: the slot stays 'auto'.
+        saved = config._load_yaml_config_file(config_path)["auxiliary"]["vision"]
+        assert saved.get("provider") == "auto", (
+            f"ambiguous aux save must not persist, got {saved!r}"
+        )
+
+    def test_aux_slot_parenthesized_name_collision_fails_closed(self, monkeypatch, tmp_path):
+        """Finding #1 on the aux persistence path: a parenthesized-name collision
+        that a looser slug key MISSED ('Foo (Bar)' vs 'foo-bar', both producing
+        custom:foo-bar) must also fail closed on save.
+
+        This is the case the earlier collision key got wrong: it normalized
+        'Foo (Bar)' to 'foo-(bar)' and never saw the collision, so the aux save
+        could persist endpoint A while the credential lookup later returned B.
+        """
+        import yaml
+
+        from api import config
+
+        shared_cfg = {
+            "auxiliary": {"vision": {"provider": "auto", "model": ""}},
+            "custom_providers": [
+                {"name": "Foo (Bar)", "base_url": "https://a.example/v1"},
+                {"name": "foo-bar", "base_url": "https://b.example/v1",
+                 "models": ["shared-model"]},
+            ],
+        }
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(shared_cfg), encoding="utf-8")
+        monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(config, "reload_config", lambda: None)
+
+        with pytest.raises(config.AmbiguousCustomProviderError):
+            config.set_auxiliary_model("vision", "custom:foo-bar", "shared-model")
+
+        saved = config._load_yaml_config_file(config_path)["auxiliary"]["vision"]
+        assert saved.get("provider") == "auto", (
+            f"ambiguous aux save must not persist, got {saved!r}"
+        )

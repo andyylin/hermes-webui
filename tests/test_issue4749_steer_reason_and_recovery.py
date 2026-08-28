@@ -40,6 +40,10 @@ BACKEND_CODES = {
     "steer_error",
 }
 
+HANDLED_NON_RECOVERY_CODES = {
+    "gateway_steer_queued",
+}
+
 FRONTEND_NETWORK_CODE = "network_error"
 
 
@@ -74,6 +78,7 @@ def test_reason_map_contract():
         }};
 
         function _steerFailureMessageKey(fallback) {
+            if (fallback === 'gateway_steer_queued') return 'steer_fail_no_cached_agent';
             const key = 'steer_fail_' + (fallback || 'unknown');
             return (typeof LOCALES !== 'undefined' && LOCALES.en && LOCALES.en[key])
                 ? key : 'steer_fail_unknown';
@@ -109,6 +114,11 @@ def test_reason_map_contract():
             console.error('FAIL undefined: got=' + u);
             ok = false;
         }
+        const gatewayQueued = _steerFailureMessageKey('gateway_steer_queued');
+        if (gatewayQueued !== 'steer_fail_no_cached_agent') {
+            console.error('FAIL gateway_steer_queued: got=' + gatewayQueued);
+            ok = false;
+        }
         process.exit(ok ? 0 : 1);
     """)
     result = subprocess.run([node, "-e", script], capture_output=True, text=True)
@@ -130,10 +140,10 @@ def test_backend_parity():
         if c  # non-empty after filtering
     )
     assert found_codes, "No fallback codes found in _handle_chat_steer"
-    assert found_codes == BACKEND_CODES, (
+    assert found_codes == BACKEND_CODES | HANDLED_NON_RECOVERY_CODES, (
         f"Backend fallback codes mismatch.\n"
         f"  Found:    {sorted(found_codes)}\n"
-        f"  Expected: {sorted(BACKEND_CODES)}"
+        f"  Expected: {sorted(BACKEND_CODES | HANDLED_NON_RECOVERY_CODES)}"
     )
     # Also confirm frontend adds network_error
     commands_text = COMMANDS_JS.read_text(encoding="utf-8")

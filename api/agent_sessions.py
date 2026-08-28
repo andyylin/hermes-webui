@@ -7,6 +7,38 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
+    """Open the live agent ``state.db`` read-only for a pure-read projection.
+
+    Same rationale as the session-listing path (#5455): a write-capable handle
+    on the multi-GB, WAL ``state.db`` while the agent streams into it adds
+    needless checkpoint/lock surface. The read-only ``file:...?mode=ro`` URI
+    avoids that. Falls back to a writable connection (and warns) if the
+    read-only open fails, so callers never lose data on exotic filesystems.
+
+    The caller must ensure ``db_path`` exists — this raises ``FileNotFoundError``
+    for a missing path rather than letting the writable fallback below create an
+    empty, writable ``state.db`` there (a ghost DB in the agent's HOME). The
+    fallback is only for an *existing* DB whose read-only open fails on an exotic
+    filesystem, so a real read never loses data.
+
+    Callers own the returned connection (wrap it in ``contextlib.closing``).
+    """
+    log = log or logger
+    if not db_path.exists():
+        raise FileNotFoundError(f"agent state.db not found: {db_path}")
+    read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        return sqlite3.connect(read_only_uri, uri=True)
+    except sqlite3.Error as exc:
+        log.warning(
+            "agent state.db read-only open failed for %s; falling back to writable connection: %s",
+            db_path,
+            exc,
+        )
+        return sqlite3.connect(str(db_path))
+
+
 MESSAGING_SOURCES = {
     'discord',
     'email',
@@ -15,17 +47,20 @@ MESSAGING_SOURCES = {
     'slack',
     'telegram',
     'weixin',
+    'matrix',
 }
 
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
 CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 
 SOURCE_LABELS = {
+    'acp': 'ACP',
     'api_server': 'API',
     'cli': 'CLI',
     'cron': 'Cron',
     'discord': 'Discord',
     'email': 'Email',
+    'kanban': 'Kanban',
     'wecom': 'WeCom',
     'wecom_callback': 'WeCom Callback',
     'slack': 'Slack',
@@ -35,6 +70,7 @@ SOURCE_LABELS = {
     'webhook': 'Webhook',
     'webui': 'WebUI',
     'weixin': 'Weixin',
+    'matrix': 'Matrix',
 }
 
 
@@ -49,7 +85,12 @@ def normalize_agent_session_source(raw_source: str | None) -> dict:
 
     if raw == 'webui':
         session_source = 'webui'
-    elif raw in {'cli', 'tui'}:
+    elif raw in {'acp', 'cli', 'tui'}:
+        # 'acp' (Agent Client Protocol adapter — Zed, external device bridges)
+        # is a local interactive agent client like the CLI/TUI: its sessions
+        # live only in state.db, so classifying it 'other' would leave them
+        # invisible in both sidebar buckets (webui skips the state.db
+        # projection; cli keeps only CLI-classified rows).
         session_source = 'cli'
     elif raw in MESSAGING_SOURCES:
         session_source = 'messaging'
@@ -57,6 +98,8 @@ def normalize_agent_session_source(raw_source: str | None) -> dict:
         session_source = 'cron'
     elif raw == 'webhook':
         session_source = 'webhook'
+    elif raw == 'kanban':
+        session_source = 'kanban'
     elif raw == 'tool':
         session_source = 'tool'
     elif raw == 'api_server':
@@ -180,18 +223,29 @@ def is_cli_session_row(row: dict) -> bool:
     # runner, never a writable WebUI/CLI session (#5307). Classify it non-CLI so
     # sidebar rows and every is_cli_session_row() consumer keep it out of the
     # CLI/writable treatment.
-    non_cli_sources = MESSAGING_SOURCES | {"cron", "webhook", "tool", "api", "api_server", "subagent"}
+    non_cli_sources = MESSAGING_SOURCES | {"cron", "webhook", "kanban", "tool", "api", "api_server", "subagent"}
     if {source, source_tag, raw_source, source_name, source_label} & non_cli_sources:
         return False
     if source == "messaging":
         return False
     if source == "cli":
         return True
+    # External-agent imports (Claude Code, Codex, etc.) are read-only sessions
+    # that Hermes discovers on disk and lists alongside CLI/TUI sessions. The
+    # client renderer (static/sessions.js: _isCliSession) files them in the CLI
+    # bucket via the is_cli_session fallthrough, so the server session-count
+    # classifier MUST agree — otherwise the server counts them under
+    # webui_session_count while the client renders them under CLI, and the WebUI
+    # filter shows a non-zero count with an empty list (#5831). These carry a
+    # real title, so they'd otherwise fall through to the conservative
+    # default-title gate below and be misclassified as non-CLI.
+    if source in {"external_agent", "external-agent"}:
+        return True
     if (
-        source_tag in {"cli", "tui"}
-        or raw_source in {"cli", "tui"}
-        or source_name in {"cli", "tui"}
-        or source_label in {"cli", "tui"}
+        source_tag in {"acp", "cli", "tui"}
+        or raw_source in {"acp", "cli", "tui"}
+        or source_name in {"acp", "cli", "tui"}
+        or source_label in {"acp", "cli", "tui"}
     ):
         return True
 
@@ -214,17 +268,33 @@ def is_cli_session_row_visible(row: dict) -> bool:
     if not is_cli_session_row(row):
         return True
 
-    message_count = _as_positive_int(row.get("actual_message_count") or row.get("message_count"))
+    actual_message_count = _as_positive_int(row.get("actual_message_count"))
+    message_count = actual_message_count or _as_positive_int(row.get("message_count"))
     if message_count <= 0:
         return False
 
-    if "tui" in {
+    if (
+        actual_message_count > 0
+        and _count_user_turns(row) > 0
+        and row.get("ended_at") is None
+        and not row.get("end_reason")
+    ):
+        return True
+
+    interactive_sources = {
         _normalize_source_name(row.get("source")),
         _normalize_source_name(row.get("source_tag")),
         _normalize_source_name(row.get("raw_source")),
         _normalize_source_name(row.get("source_label")),
-    }:
+    }
+    if "tui" in interactive_sources:
         return True
+    if "acp" in interactive_sources:
+        # Like TUI rows, user-driven ACP sessions stay visible even when
+        # ended/untitled. Unlike TUI, an ACP connection can record only
+        # assistant/tool/system rows (e.g. a replayed or aborted turn), so
+        # require at least one user turn before surfacing the row.
+        return _count_user_turns(row) > 0
 
     if _has_cli_lineage(row):
         return True
@@ -447,13 +517,41 @@ def read_importable_agent_session_rows(
     ``exclude_sources=None``. ``include_sources`` is an additional narrowing
     filter; callers that want an include-only query should explicitly pass
     ``exclude_sources=None`` so the default exclusions do not also apply.
+
+    ``limit`` bounds the *recency slice*, not the returned row count. Subagent
+    rows only render as children when their parent row is in the same payload,
+    so subagent ancestors of selected rows are re-added afterwards and the
+    result can exceed ``limit`` by the number of such anchors. Callers must
+    therefore iterate the result rather than assume ``len(rows) <= limit``.
+
+    That recovery is deliberately bounded by the oversampled candidate set
+    (``limit * 8`` newest sessions): it re-uses rows the projection already
+    fetched and never issues an extra query, so an ancestor older than the
+    oversample stays unresolved and its children render top-level, exactly as
+    they did before. Widening that window is a ``candidate_limit`` change, not
+    a change to this walk.
     """
     db_path = Path(db_path)
     if not db_path.exists():
         return []
 
     log = log or logger
-    with closing(sqlite3.connect(str(db_path))) as conn:
+    # Open read-only for this projection/listing path: it is a pure read, and
+    # holding a write-capable handle on the live (multi-GB, WAL) state.db while
+    # the agent streams into it adds needless checkpoint/lock surface (#5455).
+    # The defensive index self-heal below still runs, but through a separate
+    # short-lived writable connection on the rare missing-index path only.
+    read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        conn = sqlite3.connect(read_only_uri, uri=True)
+    except sqlite3.Error as exc:
+        log.warning(
+            "agent session listing read-only open failed for %s; falling back to writable connection: %s",
+            db_path,
+            exc,
+        )
+        conn = sqlite3.connect(str(db_path))
+    with closing(conn):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -511,16 +609,21 @@ def read_importable_agent_session_rows(
                 messages_index_present = any(str(row[1]) == "idx_messages_session" for row in cur.fetchall())
             except sqlite3.Error:
                 messages_index_present = False
-            try:
-                if not messages_index_present:
-                    cur.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_messages_session "
-                        "ON messages(session_id, timestamp)"
-                    )
-                    conn.commit()
+            if not messages_index_present:
+                # Self-heal via a separate writable connection so the common
+                # (index-present) path keeps its read-only handle. On a truly
+                # read-only/locked db this fails and we degrade to the
+                # pre-aggregated cron-only path below, exactly as before.
+                try:
+                    with closing(sqlite3.connect(str(db_path))) as _heal:
+                        _heal.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                            "ON messages(session_id, timestamp)"
+                        )
+                        _heal.commit()
                     messages_index_present = True
-            except sqlite3.Error:
-                pass  # read-only db / locked / older schema — degrade gracefully
+                except sqlite3.Error:
+                    pass  # read-only db / locked / older schema — degrade gracefully
 
         if use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"
@@ -676,7 +779,43 @@ def read_importable_agent_session_rows(
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
             return projected
-        return projected[:max(0, int(limit))]
+        selected = projected[:max(0, int(limit))]
+
+        # The recency slice is per-row, but subagent rows are only renderable as
+        # children: the sidebar nests a child under its parent solely when that
+        # parent row is present in the same payload. A frozen orchestrator stops
+        # writing while its leaves keep streaming, so the leaves win the recency
+        # race and the parent falls outside the window — leaving the leaves to be
+        # promoted to top-level sidebar rows. Re-add subagent parents that the
+        # oversampled candidate set already projected (no extra query); webui
+        # ancestors are left out because that sidebar bucket already has them.
+        #
+        # Bounded by construction: ``by_id`` only holds the ``limit * 8``
+        # newest candidates, so an ancestor older than that oversample is not
+        # recovered and its children stay top-level — the pre-existing
+        # behaviour, narrowed rather than fixed. Resolving those would need an
+        # unbounded per-row ancestor query on the hot sidebar path; widen
+        # ``candidate_limit`` instead if the window proves too tight.
+        # NOTE: this can return more than ``limit`` rows (see docstring).
+        have = {row.get('id') for row in selected}
+        by_id = {row.get('id'): row for row in projected if row.get('id')}
+        pending = list(selected)
+        while pending:
+            row = pending.pop()
+            if str(row.get('raw_source') or row.get('source') or '').strip().lower() != 'subagent':
+                continue
+            parent_id = row.get('parent_session_id')
+            if not parent_id or parent_id in have:
+                continue
+            parent = by_id.get(parent_id)
+            if parent is None:
+                continue
+            if str(parent.get('raw_source') or parent.get('source') or '').strip().lower() != 'subagent':
+                continue
+            selected.append(parent)
+            have.add(parent_id)
+            pending.append(parent)
+        return selected
 
 
 
@@ -727,7 +866,7 @@ def read_session_lineage_report(db_path: Path, session_id: str | None, max_hops:
         return _empty_lineage_report(sid)
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -866,7 +1005,7 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
         return {}
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -1090,6 +1229,9 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
                 parent_root = _continuation_root_id(rows, parent_id)
                 if parent_root:
                     entry['_parent_lineage_root_id'] = parent_root
+                    if parent_root not in lineage_tip_cache:
+                        lineage_tip_cache[parent_root] = freshest_continuation_tip(parent_root)
+                    entry['_parent_lineage_tip_id'] = lineage_tip_cache[parent_root][0]
                 continue
 
         root_id, segment_count = continuation_root_and_depth(sid)

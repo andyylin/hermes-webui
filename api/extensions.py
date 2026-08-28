@@ -6,11 +6,13 @@ It is disabled by default and never executes or fetches third-party URLs.
 """
 
 import html
+import http.client
 import json
 import math
 import logging
 import os
 import re
+import socket
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,7 +21,11 @@ import hashlib
 import io
 import time
 import zipfile
-from urllib.request import HTTPRedirectHandler, build_opener, urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    build_opener,
+)
 
 from api.helpers import _security_headers, j
 
@@ -108,9 +114,80 @@ class _AllowlistRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _connect_ipv4_first(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    """Connect to *address*, preferring IPv4 to avoid dead-route stalls.
+
+    Some networks advertise IPv6 routes (router advertisements, tunnel brokers)
+    that do not actually reach the public internet.  ``socket.create_connection``
+    follows the OS address ordering, which typically tries IPv6 first; each dead
+    address stalls for the full TCP timeout (~75–130 s) before falling back to
+    IPv4.  This makes gallery installs and registry fetches appear to hang until
+    the browser or curl timeout kills them.
+
+    We iterate families in IPv4→IPv6 order so the common case (IPv4 works, IPv6
+    is a broken route) completes instantly.  IPv6 is still tried as a fallback so
+    IPv6-only networks are unaffected.
+
+    Signature matches ``socket.create_connection`` including the
+    ``_GLOBAL_DEFAULT_TIMEOUT`` sentinel so callers that rely on the stdlib
+    default-timeout behaviour are not broken.
+    """
+    host, port = address
+    if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+        timeout = socket.getdefaulttimeout()
+    last_error: OSError | None = None
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+        except socket.gaierror:
+            continue
+        for _fam, socktype, proto, _canon, sockaddr in infos:
+            sock = None
+            try:
+                sock = socket.socket(_fam, socktype, proto)
+                if timeout is not None:
+                    sock.settimeout(timeout)
+                if source_address is not None:
+                    sock.bind(source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as exc:
+                last_error = exc
+                if sock is not None:
+                    sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"Could not connect to {host}:{port}")
+
+
+class _IPv4FirstHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that resolves IPv4 addresses before IPv6.
+
+    Overrides the class-level ``_create_connection`` that
+    ``HTTPConnection.connect()`` calls — the stdlib extension point designed for
+    exactly this kind of per-class customisation (added in Python 3.9,
+    bpo-37830).  No global state is mutated, so the change is thread-safe under
+    ``ThreadingHTTPServer``.
+    """
+
+    _create_connection = staticmethod(_connect_ipv4_first)
+
+
+class _IPv4FirstHTTPSHandler(HTTPSHandler):
+    """HTTPS handler that builds IPv4-first connections for gallery downloads."""
+
+    def https_open(self, req):
+        return self.do_open(_IPv4FirstHTTPSConnection, req)
+
+
+def _build_gallery_opener():
+    """Opener with IPv4-first downloads and redirect-host allowlist."""
+    return build_opener(_IPv4FirstHTTPSHandler, _AllowlistRedirectHandler)
+
+
 def _safe_download(url: str, max_bytes: int, timeout: int = 30) -> bytes:
     """Download from an allowlisted host, rejecting cross-host redirects."""
-    opener = build_opener(_AllowlistRedirectHandler)
+    opener = _build_gallery_opener()
     resp = opener.open(url, timeout=timeout)
     try:
         return resp.read(max_bytes + 1)
@@ -821,6 +898,21 @@ def _sidecar_from_manifest_entry(
             return None
     else:
         health_path = _DEFAULT_SIDECAR_HEALTH_PATH
+    # proxy_auth negotiation (token-v1). Absent = explicit legacy (unauthenticated
+    # proxy→sidecar, unchanged behavior for any pre-existing declaration). token-v1
+    # = core mints+injects a per-extension token and the sidecar validates it.
+    # Any unknown value fails closed (reject the sidecar) so a typo can never
+    # silently downgrade to unauthenticated.
+    raw_proxy_auth = raw.get("proxy_auth")
+    if raw_proxy_auth is None:
+        proxy_auth = "legacy"
+    elif raw_proxy_auth in ("legacy", "token-v1"):
+        proxy_auth = str(raw_proxy_auth)
+    else:
+        _add_diagnostic_warning(
+            diagnostics, "sidecar_proxy_auth_unsupported", _SIDECAR_WARNING_SOURCE
+        )
+        return None
     sidecar_id = _manifest_entry_text(entry, "id")
     name = _manifest_entry_text(entry, "name")
     return {
@@ -830,6 +922,7 @@ def _sidecar_from_manifest_entry(
         "origin": origin,
         "health_path": health_path,
         "health_url": f"{origin}{health_path}",
+        "proxy_auth": proxy_auth,
     }
 
 
@@ -1082,16 +1175,37 @@ def _sidecar_proxy_public_status(
     approved_origin: Optional[str],
     *,
     available: bool,
+    proxy_auth: str = "legacy",
 ) -> Dict[str, Any]:
     consented = bool(available and approved_origin == origin)
     origin_changed = bool(available and approved_origin and approved_origin != origin)
-    return {
+    payload: Dict[str, Any] = {
         "available": available,
         "consented": consented,
         "consent_required": bool(available and not consented),
         "path": _extension_sidecar_proxy_path(extension_id),
         "origin_changed": origin_changed,
     }
+    # proxy_auth / posture are token-v1-only fields. Legacy sidecars keep the
+    # original payload shape byte-for-byte (the public status contract tests pin
+    # it), so a token-v1 negotiation field never leaks onto a legacy record.
+    # (Frank #6331 blocker 2 — fields were previously emitted on every record and
+    # broke the legacy exact-shape contract on shard 4.)
+    if proxy_auth == "token-v1":
+        # token-v1 posture (§9.1). "protected" = WebUI auth ON (the only posture
+        # in which token-v1 proxying is permitted; auth-off is now fail-closed at
+        # both consent and resolution, so "local_unprotected" signals the panel
+        # to tell the operator to enable authentication before the proxy will work).
+        posture = None
+        if available:
+            try:
+                from api.auth import is_auth_enabled
+                posture = "protected" if is_auth_enabled() else "local_unprotected"
+            except Exception:
+                posture = None
+        payload["proxy_auth"] = proxy_auth
+        payload["posture"] = posture
+    return payload
 
 
 def _extension_sidecar_records(
@@ -1139,11 +1253,21 @@ def _extension_sidecar_records(
             sidecar["origin"],
             item.get("approved_origin"),
             available=available,
+            proxy_auth=sidecar.get("proxy_auth", "legacy"),
         )
         item["duplicate_id"] = id_counts.get(ext_id, 0) > 1
         item["proxy"] = proxy
         if len(records) < _MAX_URL_LIST:
-            records.append({**sidecar, "proxy": proxy})
+            # Build the PUBLIC sidecar record explicitly. The internal `sidecar`
+            # dict carries a top-level `proxy_auth` for the consent/resolution
+            # logic, but the public status contract only exposes proxy_auth (and
+            # posture) INSIDE `proxy`, and only for token-v1 records — legacy
+            # sidecars keep their original public shape byte-for-byte. Spreading
+            # `**sidecar` leaked a top-level `proxy_auth: legacy` and broke the
+            # exact-shape contract tests (Frank #6331 blocker 2).
+            public_record = {k: v for k, v in sidecar.items() if k != "proxy_auth"}
+            public_record["proxy"] = proxy
+            records.append(public_record)
         else:
             _add_diagnostic_warning(diagnostics, "sidecar_list_truncated", _SIDECAR_WARNING_SOURCE)
             break
@@ -1487,6 +1611,32 @@ def set_extension_sidecar_proxy_consent(extension_id: object, approved: object) 
             if sidecar is None or proxy.get("available") is not True:
                 raise ExtensionSidecarProxyError("Extension sidecar proxy is unavailable", status=409)
             consent_map[ext_id] = sidecar["origin"]
+            # For token-v1, mint the per-extension token NOW and fail the consent
+            # if it can't be persisted+read — otherwise we'd persist consent and
+            # then 503 on every request (a mint failure must surface at grant
+            # time, not as a mysterious later error).
+            if sidecar.get("proxy_auth") == "token-v1":
+                # token-v1 REQUIRES configured WebUI authentication. Without it,
+                # this consent endpoint is itself unauthenticated, so any caller
+                # that can reach the WebUI listener could self-grant consent and
+                # then drive the token-bearing proxy (a forwarding oracle) — the
+                # sidecar token file blocks direct port access but does NOT stop a
+                # caller who simply asks core to inject it. Loopback origin is not
+                # sufficient: another local UID can still reach the listener
+                # without reading the 0600 token file. Fail closed regardless of
+                # origin. (Frank #6331 blocker 1.)
+                from api.auth import is_auth_enabled
+                if not is_auth_enabled():
+                    raise ExtensionSidecarProxyError(
+                        "Sidecar token-v1 proxy requires WebUI authentication; "
+                        "set a password in Settings before granting consent.",
+                        status=403,
+                    )
+                from api import extension_sidecar_auth as _sc_auth
+                if not _sc_auth.ensure_token(ext_id):
+                    raise ExtensionSidecarProxyError(
+                        "Could not provision the sidecar auth token", status=503
+                    )
         else:
             consent_map.pop(ext_id, None)
         _write_extension_state(
@@ -1548,11 +1698,46 @@ def resolve_extension_sidecar_proxy_target(
     upstream_url = f"{sidecar['origin']}{normalized_path}"
     if query:
         upstream_url = f"{upstream_url}?{query}"
+
+    # token-v1 auth (§9.1/§9.2). Legacy sidecars proxy unchanged; token-v1
+    # sidecars get a per-extension secret injected, and only proxy when the
+    # trust posture is sound.
+    proxy_auth = sidecar.get("proxy_auth", "legacy")
+    inject_token: Optional[str] = None
+    if proxy_auth == "token-v1":
+        from api.auth import is_auth_enabled
+        from api import extension_sidecar_auth as _sc_auth
+
+        # token-v1 REQUIRES configured WebUI authentication — fail closed
+        # regardless of the upstream origin (loopback included). The consent
+        # endpoint and this resolution path are both unauthenticated when auth is
+        # off, so a caller that can reach the WebUI listener could otherwise drive
+        # a token-bearing proxy to the sidecar (a forwarding oracle). Loopback is
+        # NOT a sufficient guard: another local UID can reach the listener without
+        # ever reading the 0600 token file. (Frank #6331 blocker 1 — this
+        # mirrors the consent-time check so a pre-existing consent granted while
+        # auth was enabled cannot be exercised after auth is turned off.)
+        if not is_auth_enabled():
+            raise ExtensionSidecarProxyError(
+                "Sidecar token-v1 proxy requires WebUI authentication; "
+                "set a password in Settings.",
+                status=403,
+            )
+        token = _sc_auth.current_token(ext_id) or _sc_auth.ensure_token(ext_id)
+        if not token:
+            # Token could not be persisted+read → fail closed rather than proxy
+            # unauthenticated (never inject an ephemeral secret).
+            raise ExtensionSidecarProxyError(
+                "Sidecar proxy auth token is unavailable", status=503
+            )
+        inject_token = token
     return {
         "extension_id": ext_id,
         "origin": sidecar["origin"],
         "proxy_path": proxy["path"],
         "upstream_url": upstream_url,
+        "proxy_auth": proxy_auth,
+        "auth_token": inject_token,
     }
 
 
@@ -1813,7 +1998,8 @@ def get_extension_registry() -> Dict[str, Any]:
         if cached is not None and (now - cached_at) < _REGISTRY_TTL_SECONDS:
             return {"entries": cached}
         try:
-            raw = urlopen(_REGISTRY_URL, timeout=10).read(2 * 1024 * 1024)
+            opener = _build_gallery_opener()
+            raw = opener.open(_REGISTRY_URL, timeout=10).read(2 * 1024 * 1024)
             data = json.loads(raw.decode("utf-8"))
             if isinstance(data, list):
                 entries = data

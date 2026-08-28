@@ -285,11 +285,19 @@ def test_auth_401_classification_receives_stringified_probe_text(tmp_path, monke
     observed = {}
     real_classify = streaming._classify_provider_error
 
-    def _spy_classify_provider_error(err_str, exc=None, *, silent_failure=False):
+    def _spy_classify_provider_error(
+        err_str, exc=None, *, silent_failure=False, result=None
+    ):
         observed["err_str"] = err_str
         observed["exc"] = exc
         observed["silent_failure"] = silent_failure
-        return real_classify(err_str, exc, silent_failure=silent_failure)
+        observed["result"] = result
+        return real_classify(
+            err_str,
+            exc,
+            silent_failure=silent_failure,
+            result=result,
+        )
 
     with mock.patch.object(streaming, "_classify_provider_error", side_effect=_spy_classify_provider_error):
         _run_stream(monkeypatch, session, "stream_auth_probe_text", agent_cls, workspace=str(tmp_path))
@@ -329,6 +337,53 @@ def test_auth_401_seeded_replayed_assistant_does_not_satisfy_current_turn(tmp_pa
     assert not any(event == "done" for event, _ in events)
 
 
+def test_captured_terminal_http_400_beats_structured_final_answer(tmp_path, monkeypatch):
+    session = _prepare_session("captured_terminal_http_400", "stream_captured_terminal_http_400", pending_user_message="Please use the tool")
+
+    class CapturedTerminalHttp400Agent(MockAgent):
+        def __init__(self, status_callback=None, **kwargs):
+            super().__init__(**kwargs)
+            self.status_callback = status_callback
+
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            status_cb = getattr(self, "status_callback", None)
+            if status_cb is not None:
+                status_cb("lifecycle", "❌ Non-retryable error (HTTP 400): invalid model")
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Partial text before failure")
+            return {
+                "messages": history + [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "name": "weather.lookup", "input": {"city": "Leeds"}},
+                            {"type": "output_text", "output_text": "It is 18C and sunny."},
+                        ],
+                        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "weather.lookup", "arguments": "{}"}}],
+                    }
+                ],
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_captured_terminal_http_400",
+        CapturedTerminalHttp400Agent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("captured_terminal_http_400")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for captured terminal HTTP 400"
+    assert apperrors[-1]["type"] == "model_not_found"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+
+
 def test_auth_retry_success_does_not_append_error_turn(tmp_path, monkeypatch):
     session = _prepare_session("auth_retry", "stream_auth_retry", pending_user_message="Please retry")
     agent_cls = _build_auth_failure_agent(token_text="")
@@ -366,6 +421,77 @@ def test_auth_retry_success_does_not_append_error_turn(tmp_path, monkeypatch):
     assert saved.messages[-1]["role"] == "assistant"
     assert saved.messages[-1]["content"] == "Recovered auth reply"
     assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_auth_exception_retry_structured_failure_still_emits_error(
+    tmp_path,
+    monkeypatch,
+):
+    session = _prepare_session(
+        "auth_retry_structured_failure",
+        "stream_auth_retry_structured_failure",
+        pending_user_message="Please retry",
+    )
+
+    class ExceptionThenStructuredFailureAgent(MockAgent):
+        runs = 0
+
+        def run_conversation(self, **kwargs):
+            type(self).runs += 1
+            if type(self).runs == 1:
+                raise RuntimeError("401 unauthorized")
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("partial retry output")
+            return {
+                "error": {
+                    "type": "authentication_error",
+                    "status_code": 401,
+                    "message": "retry returned a structured failure",
+                },
+                "messages": list(kwargs.get("conversation_history") or []),
+            }
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS["stream_auth_retry_structured_failure"] = fake_queue
+    config.STREAM_PARTIAL_TEXT["stream_auth_retry_structured_failure"] = ""
+    heal_rt = {
+        "provider": "test-provider",
+        "api_key": "fresh-key",
+        "base_url": None,
+    }
+
+    with mock.patch.object(streaming, "get_session", return_value=session), \
+         mock.patch.object(
+             streaming,
+             "_get_ai_agent",
+             return_value=ExceptionThenStructuredFailureAgent,
+         ), \
+         mock.patch.object(
+             streaming,
+             "resolve_model_provider",
+             return_value=("test-model", "test-provider", None),
+         ), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]), \
+         mock.patch.object(
+             streaming,
+             "_attempt_credential_self_heal",
+             return_value=heal_rt,
+         ):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="stream_auth_retry_structured_failure",
+        )
+
+    saved = Session.load("auth_retry_structured_failure")
+    assert saved is not None
+    events = _queue_events(fake_queue)
+    assert any(event == "apperror" for event, _ in events)
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
 
 
 def test_success_repeated_assistant_text_stays_successful_current_turn(tmp_path, monkeypatch):
@@ -452,6 +578,196 @@ def test_non_auth_silent_failure_still_uses_no_response(tmp_path, monkeypatch):
     assert apperrors, "expected apperror for silent failure"
     assert apperrors[-1]["type"] == "no_response"
     assert apperrors[-1]["type"] != "auth_mismatch"
+    assert saved.messages[-1]["_error"] is True
+
+
+def test_live_settlement_empty_hint_does_not_append_empty_emphasis(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "empty_hint_failure",
+        "stream_empty_hint_failure",
+        pending_user_message="Please fail plainly",
+    )
+
+    class EmptyHintFailureAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "status": "failed",
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "synthetic hard failure",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_empty_hint_failure",
+        EmptyHintFailureAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("empty_hint_failure")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for generic terminal failure"
+    assert apperrors[-1]["type"] == "error"
+    assert apperrors[-1].get("hint") in (None, "")
+
+    error_content = saved.messages[-1]["content"]
+    assert saved.messages[-1]["_error"] is True
+    assert error_content == "**Error:** synthetic hard failure"
+    assert "\n\n**" not in error_content
+    assert not error_content.endswith("**")
+
+
+def test_completed_assistant_answer_with_stale_partial_flag_settles_done(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "completed_answer_stale_partial",
+        "stream_completed_answer_stale_partial",
+        pending_user_message="Please finish cleanly",
+    )
+
+    class CompletedAnswerStalePartialAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "status": "partial",
+                "partial": True,
+                "messages": history + [{"role": "assistant", "content": "Completed answer"}],
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_completed_answer_stale_partial",
+        CompletedAnswerStalePartialAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("completed_answer_stale_partial")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Completed answer"
+    assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_stale_partial_with_unfinished_tool_call_still_reports_no_response(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "unfinished_tool_call_stale_partial",
+        "stream_unfinished_tool_call_stale_partial",
+        pending_user_message="Use a tool first",
+    )
+
+    class UnfinishedToolCallStalePartialAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "status": "partial",
+                "partial": True,
+                "messages": history + [
+                    {"role": "user", "content": "Use a tool first"},
+                    {
+                        "role": "assistant",
+                        "content": "Checking the tool result",
+                        "tool_calls": [{"id": "call_1", "type": "function"}],
+                    },
+                ],
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_unfinished_tool_call_stale_partial",
+        UnfinishedToolCallStalePartialAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("unfinished_tool_call_stale_partial")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for unfinished tool-call partial"
+    assert apperrors[-1]["type"] == "no_response"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+
+
+def test_stale_partial_repeated_prompt_replay_still_reports_no_response(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "repeated_prompt_replay_stale_partial",
+        "stream_repeated_prompt_replay_stale_partial",
+        pending_user_message="Please repeat this",
+    )
+    _seed_prior_turn(
+        session,
+        prior_user="Please repeat this",
+        prior_assistant="Old answer",
+    )
+
+    class RepeatedPromptReplayStalePartialAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Partial text before stale replay")
+            return {
+                "status": "partial",
+                "partial": True,
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_repeated_prompt_replay_stale_partial",
+        RepeatedPromptReplayStalePartialAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("repeated_prompt_replay_stale_partial")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for repeated-prompt stale replay"
+    assert apperrors[-1]["type"] == "no_response"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+
+
+def test_hard_failure_with_completed_answer_still_reports_no_response(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "hard_failure_completed_answer",
+        "stream_hard_failure_completed_answer",
+        pending_user_message="Please finish despite failure",
+    )
+
+    class HardFailureCompletedAnswerAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "status": "failed",
+                "messages": history + [{"role": "assistant", "content": "Completed answer"}],
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_hard_failure_completed_answer",
+        HardFailureCompletedAnswerAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("hard_failure_completed_answer")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for hard failed result"
+    assert apperrors[-1]["type"] == "no_response"
+    assert not any(event == "done" for event, _ in events)
     assert saved.messages[-1]["_error"] is True
 
 

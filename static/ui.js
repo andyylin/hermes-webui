@@ -201,7 +201,8 @@ else initOfflineMonitor();
 // Redirect to login when the server responds with 401 (auth session expired).
 // Handles iOS PWA standalone mode and keeps subpath mounts like /hermes/ from
 // escaping to the personal site root /login.
-function _redirectIfUnauth(res){if(res&&res.status===401){window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);return true;}return false;}
+// #5578: on a login-shaped page, reload 'login' WITHOUT a next (avoid self-nesting).
+function _redirectIfUnauth(res){if(res&&res.status===401){var _p=(window.location.pathname||'').replace(/\/+$/,'');if(/(?:^|\/)login$/.test(_p)){window.location.href='login';}else{window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);}return true;}return false;}
 function _getSessionQueue(sid, create=false){
   if(!sid) return [];
   if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
@@ -417,11 +418,115 @@ function _statusCardHtml(card){
   </div>`;
 }
 
+function _compressionRecoveryHtml(recovery, sessionId){
+  if(!recovery||typeof recovery!=='object') return '';
+  if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
+  const action=String(recovery.recommended_action||'');
+  if(action!=='start_focused_continuation') return '';
+  const sid=String(recovery.source_session_id||sessionId||'');
+  const title=String(recovery.title||'Context compression exhausted');
+  const summary=String(recovery.summary||'Start a focused continuation, then describe the next narrow task.');
+  const actionLabel=String(recovery.action_label||'Start focused continuation');
+  const icon=(typeof li==='function')?li('git-branch',14):'';
+  return `<div class="compression-recovery-card" data-compression-recovery-card="1">
+    <div class="compression-recovery-copy">
+      <div class="compression-recovery-title">${esc(title)}</div>
+      <div class="compression-recovery-summary">${esc(summary)}</div>
+    </div>
+    <button class="compression-recovery-action" type="button" data-recovery-session-id="${esc(sid)}" onclick="startCompressionRecovery(this);event.stopPropagation()">${icon}<span>${esc(actionLabel)}</span></button>
+  </div>`;
+}
+
+function _activeCompressionRecoveryPayload(){
+  if(!S||!S.session) return null;
+  const recovery=S.session.compression_recovery;
+  if(recovery&&typeof recovery==='object'&&String(recovery.terminal_state||'')==='compression_exhausted') return recovery;
+  // A cleared session-level recovery payload is authoritative. Only scan
+  // message metadata for older sessions that never exposed this field.
+  if(Object.prototype.hasOwnProperty.call(S.session,'compression_recovery')) return null;
+  const messages=Array.isArray(S.messages)?S.messages:[];
+  for(let i=messages.length-1;i>=0;i--){
+    const msg=messages[i];
+    const msgRecovery=msg&&msg._compressionRecovery;
+    if(msgRecovery&&typeof msgRecovery==='object'&&String(msgRecovery.terminal_state||'')==='compression_exhausted') return msgRecovery;
+  }
+  return null;
+}
+
+function isGenericCompressionContinuationIntent(text){
+  const raw=String(text||'').trim().toLowerCase();
+  if(!raw) return false;
+  const normalized=raw.replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+  const generic=new Set(['continue','continue please','go on','keep going','resume','proceed','carry on','继续','继续吧','接着','接着做','继续做','继续执行']);
+  if(generic.has(normalized)) return true;
+  const parts=normalized.split(/\s+/).filter(Boolean);
+  return !!parts.length&&parts.length<=2&&parts.every(part=>generic.has(part));
+}
+
+function shouldInterceptCompressionRecoveryContinuation(text, files){
+  const hasFiles=Array.isArray(files)&&files.length>0;
+  if(hasFiles||!isGenericCompressionContinuationIntent(text)) return false;
+  const recovery=_activeCompressionRecoveryPayload();
+  return !!(recovery&&String(recovery.recommended_action||'')==='start_focused_continuation');
+}
+
+function showCompressionRecoveryContinuationHint(){
+  const card=document.querySelector('[data-compression-recovery-card="1"]');
+  if(card&&typeof card.scrollIntoView==='function'){
+    try{card.scrollIntoView({block:'center',behavior:'smooth'});}catch(_){card.scrollIntoView();}
+    const btn=card.querySelector('.compression-recovery-action');
+    if(btn&&typeof btn.focus==='function') setTimeout(()=>btn.focus(),120);
+  }
+  if(typeof showToast==='function') showToast('This session exhausted context compression. Start a focused continuation, then describe the next narrow task.',4500,'warning');
+}
+
+async function startCompressionRecovery(btn){
+  const sourceSid=String((btn&&btn.dataset&&btn.dataset.recoverySessionId)||(S.session&&S.session.session_id)||'').trim();
+  if(!sourceSid) return;
+  let retiredRecoveryCard=false;
+  if(btn){btn.disabled=true;btn.classList.add('loading');}
+  try{
+    const data=await api('/api/session/compression-recovery/start',{method:'POST',body:JSON.stringify({session_id:sourceSid})});
+    const sid=data&&data.session&&data.session.session_id;
+    if(!sid) throw new Error('Compression recovery did not return a session.');
+    try{localStorage.setItem('hermes-webui-session',sid);}catch(_){}
+    if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
+    else if(data.session){S.session=data.session;if(typeof _adoptRegenerationRevision==='function')_adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];syncTopbar();renderMessages();}
+    if(typeof renderSessionList==='function') await renderSessionList();
+    if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
+    if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
+    const composer=$('msg');
+    if(composer&&typeof composer.focus==='function') composer.focus();
+  }catch(e){
+    // A 409 means this session no longer has an active recovery action (the
+    // session already moved on — e.g. a substantive prompt cleared it). The
+    // persisted card in the transcript is stale, so retire it and show a neutral
+    // note instead of a raw error. The server is authoritative on availability.
+    if(e&&e.status===409){
+      const staleCard=(btn&&btn.closest&&btn.closest('.compression-recovery-card'))
+        ||document.querySelector('[data-compression-recovery-card="1"]');
+      if(staleCard){
+        staleCard.setAttribute('data-compression-recovery-consumed','1');
+        const staleBtn=staleCard.querySelector('.compression-recovery-action');
+        if(staleBtn){staleBtn.disabled=true;staleBtn.classList.remove('loading');}
+        retiredRecoveryCard=true;
+      }
+      if(typeof showToast==='function') showToast('This conversation already moved on — the focused-continuation action is no longer available.',4000,'info');
+      return;
+    }
+    if(typeof showToast==='function') showToast('Compression recovery failed: '+(e&&e.message||e),5000,'error');
+  }finally{
+    // Do NOT re-enable a button we deliberately retired in the 409 branch.
+    if(btn){if(!retiredRecoveryCard) btn.disabled=false;btn.classList.remove('loading');}
+  }
+}
+
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
 const MESSAGE_VIRTUAL_THRESHOLD_ROWS=80;
 const MESSAGE_VIRTUAL_BUFFER_PX=900;
 const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
   user:120,
+  process_wakeup:96,
   assistant:160,
   tool_call:400,
   default:140,
@@ -494,6 +599,7 @@ function _clearMessageVirtualHeightCache(){
   clearTimeout(_messageVirtualScrollSettleTimer);
   _messageVirtualScrollSettleTimer=0;
   _messageVirtualDeferredMeasurement=null;
+  if(typeof _clearUserRowIntrinsicHeightCache==='function') _clearUserRowIntrinsicHeightCache();
 }
 function _resetMessageRenderWindow(sid){
   _messageRenderWindowSid=sid||null;
@@ -511,7 +617,7 @@ function _cancelMessageVirtualizedRender(){
 }
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
-  if(m._source === 'process_wakeup') return false;
+  if(m._source === 'process_wakeup') return !!(msgContent(m)||m.attachments?.length);
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
   const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -706,6 +812,7 @@ function _syncMessageVirtualHeightCache(visWithIdx){
 function _messageVirtualRoleForEntry(entry){
   const m=entry&&entry.m;
   if(!m) return 'default';
+  if(m._source === 'process_wakeup') return 'process_wakeup';
   if(m.role==='user') return 'user';
   if(m.role==='assistant'){
     if((Array.isArray(m.tool_calls)&&m.tool_calls.length>0)||
@@ -759,11 +866,35 @@ function _messageVisibleIndexForRawIdx(rawIdx, visWithIdx){
   }
   return -1;
 }
+function _safeEncodeURIComponent(v){
+  try{return encodeURIComponent(String(v));}
+  catch(e){
+    // encodeURIComponent threw URIError -> one or more lone UTF-16 surrogates.
+    // Walk the string as UTF-16 code units: keep valid high(D800-DBFF) +
+    // low(DC00-DFFF) pairs intact (so emoji survive) and drop lone surrogates.
+    // No regex lookbehind/lookahead so this parses on every browser engine
+    // (some older WebViews / Safari <16.4 don't support lookbehind in regex
+    // literals, which would otherwise brick ui.js at parse time).
+    const s=String(v);
+    let cleaned='';
+    for(let i=0;i<s.length;i++){
+      const c=s.charCodeAt(i);
+      if(c>=0xD800&&c<=0xDBFF){
+        const n=(i+1<s.length)?s.charCodeAt(i+1):0;
+        if(n>=0xDC00&&n<=0xDFFF){cleaned+=s[i]+s[i+1];i++;}
+      }else if(c<0xDC00||c>0xDFFF){
+        cleaned+=s[i];
+      }
+    }
+    return encodeURIComponent(cleaned);
+  }
+}
+
 function _messageViewportAnchorKeyForMessage(m){
   if(typeof _compressionMessageAnchorKey!=='function') return '';
   const key=_compressionMessageAnchorKey(m);
   if(!key) return '';
-  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>encodeURIComponent(String(v))).join('|');
+  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>_safeEncodeURIComponent(v)).join('|');
 }
 function _messageVisibleIndexForAnchorKey(anchorKey, visWithIdx){
   const key=String(anchorKey||'');
@@ -814,11 +945,23 @@ function _captureMessageViewportAnchor(){
     const rect=row.getBoundingClientRect();
     if(rect.bottom>containerRect.top+1){
       const sessionIdx=Number(row&&row.dataset&&row.dataset.sessionMsgIdx);
+      // Record the current top-spacer (virtual topPad) height so the compensation
+      // path can fall back to a topPad-delta shift when the anchor row itself is
+      // recycled out of the render window after a measurement-driven re-render.
+      const spacer=container.querySelector('[data-virtual-spacer="before"]');
+      const topPadBefore=spacer?parseFloat(spacer.style.height||'0')||0:0;
       return {
         rawIdx,
         sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx),
         key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
         topOffset:rect.top-containerRect.top,
+        topPadBefore,
+        // Snapshot the scroll height at capture so a later realign can detect that
+        // content grew between capture and restore — the streaming case where the
+        // anchor's topOffset is stale and realigning to it would yank a still reader
+        // backward (issue #5637).
+        scrollHeightAtCapture:container.scrollHeight,
+        inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
       };
     }
   }
@@ -844,6 +987,67 @@ function _browserOverflowAnchorActive(el){
   if(!el) return false;
   try{ return getComputedStyle(el).overflowAnchor==='auto'; }catch(_){ return false; }
 }
+// iOS/iPadOS WebKit detection for the issue #5637 stale-anchor hold gate. CSS
+// overflow-anchor is INERT on iOS WebKit (see static/style.css — the mobile
+// content-visibility block deliberately does NOT set overflow-anchor:none because
+// it is a no-op on iOS and, on Android, re-opens the #4856/#5338 jump-to-top
+// regression). So `overflow-anchor:auto` computes on `.messages` on iOS but the
+// engine never actually holds the viewport there. The stale-anchor refusal relies
+// on that engine to hold the reader, so it is only safe on Android (working
+// overflow-anchor), NOT iOS — refusing on iOS leaves a scrolled-up reader unheld,
+// the same class as the desktop regression, one platform over.
+// Detection covers classic iPhone/iPod/iPad UAs AND iPadOS 13+, which reports a
+// desktop 'MacIntel' platform but is distinguishable by touch support (a real Mac
+// has maxTouchPoints 0). Excludes MSStream (old IE on Windows Phone false-matched
+// 'like iPhone').
+function _isIOSWebKit(){
+  try{
+    const nav=(typeof navigator!=='undefined')?navigator:null;
+    if(!nav) return false;
+    if(nav.MSStream) return false;
+    const ua=String(nav.userAgent||'');
+    if(/iP(ad|hone|od)/.test(ua)) return true;
+    // iPadOS 13+ masquerades as macOS; a Mac has no touch, an iPad does.
+    if(nav.platform==='MacIntel' && Number(nav.maxTouchPoints)>1) return true;
+  }catch(_){}
+  return false;
+}
+// Stable "native overflow-anchor holds this viewport" predicate for the issue
+// #5637 stale-anchor hold gate. The two stale-anchor refusals below assume the
+// browser's native overflow-anchor layer will hold the viewport once the JS
+// restore is refused. That is only true where the engine ACTUALLY compensates:
+//   - desktop (hover+fine-pointer): CSS keeps `.messages` at overflow-anchor:none
+//     -> engine off -> refusing leaves nothing to hold the reader. Excluded via
+//     matchMedia('(pointer:coarse)') being false.
+//   - iOS WebKit: overflow-anchor is INERT (see _isIOSWebKit) even though it
+//     computes to `auto` -> engine never holds -> refusing strands a scrolled-up
+//     reader. Excluded via _isIOSWebKit().
+//   - Android touch: overflow-anchor:auto AND the engine works -> refusing is safe,
+//     native anchoring holds. This is the ONLY platform the refusal targets.
+// We must NOT decide this with `_browserOverflowAnchorActive(#messages)` alone,
+// because `_restoreMessageViewportAnchor` temporarily writes an inline
+// `overflowAnchor:'none'` on #messages for its own scroll write and only restores
+// it on the next frame; when the realign fires every live tick that inline 'none'
+// persists across ticks, so a computed-value probe would read 'none' mid-realign
+// and wrongly classify a touch device as "desktop", letting the stale realign
+// through. A matchMedia('(pointer:coarse)') test reflects the input device and
+// cannot be mutated by that inline override, so it stays steady mid-realign;
+// desktop (fine pointer) stays false. Fall back to the computed-anchor probe when
+// matchMedia is unavailable.
+function _isTouchLikeMessageViewport(el){
+  // iOS WebKit is touch (pointer:coarse) but overflow-anchor is inert there, so the
+  // refusal's premise fails — treat it like desktop (keep the semantic realign).
+  if(_isIOSWebKit()) return false;
+  try{
+    if(typeof matchMedia==='function' && matchMedia('(pointer:coarse)').matches) return true;
+  }catch(_){}
+  // Best-effort fallback for the (today essentially non-existent) no-matchMedia
+  // environment: the computed-anchor probe can transiently read 'none' during a
+  // realign burst (see comment above), so on such a touch device this could
+  // re-admit the original yank. matchMedia('(pointer:coarse)') is universally
+  // supported in every browser this UI targets, so the primary path is what runs.
+  return _browserOverflowAnchorActive(el);
+}
 function _suppressBrowserOverflowAnchor(container){
   if(!container||!container.style) return null;
   // Only engage when the browser layer is actually active (auto). On desktop
@@ -868,19 +1072,64 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const container=$('messages');
   if(!container||!anchor) return false;
   const anchorKey=String(anchor.key||'');
-  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
-  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
-  if(!row&&anchorKey) return false;
   const sessionIdx=Number(anchor.sessionIdx);
   const hasSessionIdx=Number.isFinite(sessionIdx);
+  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
+  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
+  // The anchor key is content-derived (role|ts|attachments|first-160-chars, built by
+  // _messageViewportAnchorKeyForMessage) so it goes STALE while a live assistant
+  // message is still streaming: every chunk that changes the first 160 chars
+  // recomputes that row's data-message-anchor-key, so a snapshot captured mid-stream
+  // no longer matches by key. We used to concede the moment the keyed lookup missed
+  // (`if(!row&&anchorKey) return false`), and the caller then fell back to an ABSOLUTE
+  // scrollTop=snapshot.top that does NOT compensate the above-viewport height growth
+  // from that same streaming chunk — the residual DESKTOP scroll jump-back. (Desktop
+  // rests at overflow-anchor:none, so #5392's mobile overflow-anchor guard is a no-op
+  // here; this is a distinct code path.) The anchored row is still in the DOM under
+  // its STABLE session-relative index, so recover it via sessionIdx before conceding.
+  // A genuinely removed anchor (message compressed/deleted away) misses key AND
+  // sessionIdx and still returns false. A missing sessionIdx is NOT degraded to the
+  // window-relative rawIdx (which could resolve to a different message), preserving
+  // the original per-tier guard.
   if(!row&&hasSessionIdx) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
-  if(!row&&hasSessionIdx) return false;
+  if(!row&&(anchorKey||hasSessionIdx)) return false;
   const targetIdx=Number(anchor.rawIdx)+Number(rawIdxDelta||0);
   if(!row&&Number.isFinite(targetIdx)) row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
   if(!row) return false;
   const containerRect=container.getBoundingClientRect();
   const rect=row.getBoundingClientRect();
   const targetTop=Number(anchor.topOffset)||0;
+  // Streaming stale-anchor guard (issue #5637). During a live stream, content grows
+  // ABOVE the viewport between anchor capture and this restore, so the anchor's
+  // captured topOffset is stale and the realign delta becomes a spurious few-hundred-px
+  // value that yanks a still reader backward. Detect it by content growth + absence of
+  // real input intent — NOT by a scrollTop diff, because on an overflow-anchor:auto
+  // container the browser itself moves scrollTop to compensate the growth (so a still
+  // reader's scrollTop is not stationary). _recentMessage*ScrollIntent reflects genuine
+  // touch/wheel/key input, which the browser's anchor layer never writes. If content
+  // grew since capture AND there is no recent input intent AND the realign would move
+  // scrollTop non-trivially, refuse it and let the browser overflow-anchor hold. An
+  // actively scrolling reader (recent intent) keeps the legitimate realign; legacy
+  // snapshots without the captured geometry keep prior behavior.
+  //
+  // Desktop guard (issue #5637 gate cert): the refusal is only safe where the
+  // browser's native overflow-anchor layer can actually hold the viewport, i.e.
+  // touch viewports where `.messages` computes to `overflow-anchor:auto`. On
+  // hover+fine-pointer desktops `.messages` is `overflow-anchor:none`, so refusing
+  // the realign would leave NOTHING to hold the reader after above-viewport growth
+  // — the very yank this fixes on mobile, reintroduced on desktop. Gate the refusal
+  // on `_isTouchLikeMessageViewport` so desktop keeps its semantic scrollTop realign.
+  const _realignDelta=(rect.top-containerRect.top)-targetTop;
+  const _shAtCap=Number(anchor.scrollHeightAtCapture);
+  if(Number.isFinite(_shAtCap)){
+    const _grewSinceCapture=(container.scrollHeight-_shAtCap)>4;
+    const _activeIntent=(typeof _recentMessageScrollIntent==='function' && _recentMessageScrollIntent())
+      || (typeof _recentMessageTouchScrollIntent==='function' && _recentMessageTouchScrollIntent());
+    const _touchHold=(typeof _isTouchLikeMessageViewport==='function' && _isTouchLikeMessageViewport(container));
+    if(_touchHold&&_grewSinceCapture&&!_activeIntent&&Math.abs(_realignDelta)>8){
+      return false;
+    }
+  }
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   // Mobile-only jump fix: the resting overflow-anchor on .messages is `auto` on
   // touch devices (CSS media query keeps it `none` only for hover+fine-pointer
@@ -927,7 +1176,7 @@ function _remountMessageViewportAnchor(anchor){
   if(visIdx<0) return false;
   // A virtualized anchor may be outside the current DOM. Scroll to its virtual
   // row and render once so the semantic restore below has a real target.
-  _programmaticScroll=true;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx,visIdx,container);
   _messageVirtualWindowKey='';
   _messageViewportAnchorRemounting=true;
@@ -955,8 +1204,43 @@ function _compensateScrollForMeasurementDelta(renderFn){
     const spacer=container.querySelector('[data-virtual-spacer="before"]');
     if(!spacer||parseFloat(spacer.style.height||'0')<=0) return;
   }
-  const row=container.querySelector(`[data-msg-idx="${anchorBefore.rawIdx}"]`);
-  if(!row) return;
+  // Re-find the anchor row after the measurement-driven re-render. The primary
+  // lookup is by rawIdx (the DOM index), but on a big virtualized session a large
+  // scroll delta can RECYCLE the old anchor row out of the render window entirely
+  // (verified via real-device telemetry: DOM collapsed to 1 row, scrollHeight
+  // lurched by tens of thousands of px). The old code did `if(!row) return` here,
+  // abandoning compensation → the full estimated↔measured height lurch hit
+  // scrollTop uncompensated and threw the viewport to the top (the recurring
+  // mobile scroll jump-back). Fall back to the stable sessionIdx anchor (captured in
+  // _captureMessageViewportAnchor) before giving up, mirroring the "recover via
+  // sessionIdx when the primary anchor key is gone" approach used elsewhere but for
+  // the virtualization-measurement compensation path.
+  let row=container.querySelector(`[data-msg-idx="${anchorBefore.rawIdx}"]`);
+  if(!row&&Number.isFinite(Number(anchorBefore.sessionIdx))){
+    row=container.querySelector(`[data-session-msg-idx="${anchorBefore.sessionIdx}"]`);
+  }
+  if(!row){
+    // Anchor row is no longer rendered (recycled out of the virtual window). We
+    // cannot measure its live offset, but we CAN keep the viewport visually
+    // stable by compensating for the top-spacer (topPad) height change: the
+    // whole reason scrollHeight lurched is that the estimated topPad was replaced
+    // by a measured one. Shift scrollTop by that same delta so content under the
+    // viewport does not appear to jump. Without this the browser lands at an
+    // uncompensated absolute scrollTop against a wildly different scrollHeight.
+    const spacerAfter=container.querySelector('[data-virtual-spacer="before"]');
+    const topPadAfter=spacerAfter?parseFloat(spacerAfter.style.height||'0')||0:0;
+    const topPadBefore=Number(anchorBefore.topPadBefore);
+    if(Number.isFinite(topPadBefore)){
+      const padDelta=topPadAfter-topPadBefore;
+      if(Math.abs(padDelta)>=2){
+        _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+        container.scrollTop=Math.max(0,scrollTopBefore+padDelta);
+        _lastScrollTop=container.scrollTop;
+        _deferClearProgrammaticScroll();
+      }
+    }
+    return;
+  }
   const containerRect=container.getBoundingClientRect();
   const rowRect=row.getBoundingClientRect();
   const actualOffset=rowRect.top-containerRect.top;
@@ -978,6 +1262,76 @@ function _messageViewportIntersectsRenderedRow(){
   }
   return false;
 }
+// #5637/#5638 follow-up — kill the content-visibility scrollHeight collapse at its
+// source. A virtualization wipe-and-rebuild recreates user rows as FRESH elements, which
+// discards content-visibility:auto's last-remembered size, so an off-screen user row
+// falls back to the flat `contain-intrinsic-size: auto 96px` estimate in the stylesheet.
+// A tall user row (e.g. a long paste) then collapses scrollHeight by (realHeight-96px)
+// the instant it's rebuilt off-screen, and the browser either force-clamps scrollTop
+// (dTop≈dH layer-1 jump) or re-anchors to a far row (dTop≫dH browser re-anchor jump) —
+// both mobile jump-back classes trace to this one collapse. Remember each user row's
+// height keyed by its STABLE session-relative index so a rebuild reserves the real
+// height, not 96px. Measured height (exact) wins; before a row is ever measured, a
+// content-length estimate reserves the bulk so the fresh-element frame doesn't collapse
+// either. Refreshed every measure pass, so edits self-heal. Desktop rests at
+// content-visibility:visible (intrinsic-size ignored) → inert there, zero behavior change.
+const _userRowIntrinsicHeightBySessionIdx=Object.create(null);
+// Cleared on session switch alongside _messageVirtualHeightCache (both are
+// per-session measured-height caches keyed by session-relative index). Without this,
+// keys collide across sessions — _messageSessionIndexForRawIdx = _messageSessionIndexBase()
+// + rawIdx and the base is 0 for the common non-offset session — so a new session's
+// off-screen user rows would inherit the previous session's remembered heights and
+// inflate scrollHeight until each is re-measured. Delete keys in place to keep the
+// const binding stable for any closure that captured it.
+function _clearUserRowIntrinsicHeightCache(){
+  for(const k in _userRowIntrinsicHeightBySessionIdx) delete _userRowIntrinsicHeightBySessionIdx[k];
+}
+function _rememberUserRowIntrinsicHeight(sessionMsgIdx, height){
+  const key=Number(sessionMsgIdx);
+  if(!Number.isFinite(key)||!(height>0)) return;
+  _userRowIntrinsicHeightBySessionIdx[key]=Math.round(height);
+}
+function _estimateUserRowIntrinsicHeight(rawText){
+  const t=String(rawText||'');
+  if(!t) return 96;
+  // ~48 half-width chars/line at the mobile user-bubble width (≈90% of a phone viewport),
+  // ~22px per line + ~24px row chrome; floored at the stylesheet's 96px so a short row never
+  // reserves LESS than today (estimate can only add reserved height for tall rows, never
+  // regress). CJK / full-width characters occupy ~2 columns each, so a Chinese/Japanese/
+  // Korean paste wraps at ~24 chars/line — counting them as 1 badly UNDER-estimates the
+  // height (a 3k-char CJK paste is ~2x taller than the naive length/48 guess). Weight wide
+  // characters as 2 columns so the fresh-row reserve is close to reality even for a row the
+  // reader has never scrolled into view (content-visibility:auto reports only the reserve
+  // for a never-painted row, so a good estimate is the only backstop there). Uses a Unicode
+  // range test (no \p{} — keep the RegExp engine-portable across the supported browsers).
+  const explicitLines=(t.match(/\n/g)||[]).length+1;
+  let columns=0;
+  for(let i=0;i<t.length;i++){
+    const c=t.charCodeAt(i);
+    // CJK Unified + Ext-A, Hiragana/Katakana, Hangul, CJK symbols/punctuation, full-width forms.
+    const wide=(c>=0x1100&&c<=0x115F)||(c>=0x2E80&&c<=0xA4CF)||(c>=0xAC00&&c<=0xD7A3)||
+               (c>=0xF900&&c<=0xFAFF)||(c>=0xFE30&&c<=0xFE4F)||(c>=0xFF00&&c<=0xFF60)||(c>=0xFFE0&&c<=0xFFE6);
+    columns+=wide?2:1;
+  }
+  const wrapLines=Math.ceil(columns/48);
+  const lines=Math.max(explicitLines, wrapLines);
+  return Math.max(96, Math.round(lines*22+24));
+}
+function _applyUserRowIntrinsicHeight(row, rawText){
+  if(!row||!row.style||!row.dataset) return;
+  const key=Number(row.dataset.sessionMsgIdx);
+  const remembered=Number.isFinite(key)?Number(_userRowIntrinsicHeightBySessionIdx[key])||0:0;
+  const estimate=_estimateUserRowIntrinsicHeight(rawText!=null?rawText:row.dataset.rawText);
+  // Reserve the LARGER of the remembered measurement and the content estimate. A remembered
+  // height can be a PARTIAL paint: a user row taller than the viewport that only ever had its
+  // top slice scrolled through content-visibility:auto reports just the painted portion, not
+  // its full height — persisting that would under-reserve and let scrollHeight collapse on the
+  // next rebuild (the jump-back). Taking the max means a good estimate floors the reserve even
+  // when the measurement under-read, while a full measurement (row shorter than the viewport,
+  // fully painted) still wins when it exceeds the estimate.
+  const h=Math.max(remembered, estimate);
+  if(h>0) row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
+}
 function _measureMessageVirtualRow(inner, entry){
   if(!inner||!entry) return 0;
   const primary=inner.querySelector(`[data-msg-idx="${entry.rawIdx}"]`);
@@ -991,6 +1345,16 @@ function _measureMessageVirtualRow(inner, entry){
       totalHeight+=Math.max(0, sibling.getBoundingClientRect().height||0);
       sibling=sibling.nextElementSibling;
     }
+  }
+  // Persist the measured height so a later wipe-and-rebuild of this user row reserves its
+  // real off-screen height instead of collapsing to the 96px estimate (the collapse that
+  // clamps/re-anchors the viewport — #5637/#5638 mobile jump-back, both classes). The
+  // typeof guard keeps _measureMessageVirtualRow runnable in the node test harnesses that
+  // extract it without this helper (they stub every collaborator by name).
+  if(totalHeight>0 && primary.dataset && primary.dataset.role==='user'
+     && typeof _rememberUserRowIntrinsicHeight==='function'){
+    _rememberUserRowIntrinsicHeight(primary.dataset.sessionMsgIdx, totalHeight);
+    primary.style.containIntrinsicSize='auto '+Math.round(totalHeight)+'px';
   }
   return totalHeight;
 }
@@ -1021,6 +1385,70 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
     _scheduleMessageVirtualMeasurementRefresh(virtualWindow);
   }else{
     _markMessageVirtualMeasurementsSettled(virtualWindow);
+  }
+}
+// #5638 follow-up — the non-virtualized transcript path (the #4325 opt-out, where
+// _virtualizeTranscript===false renders every row with no windowing) never runs the
+// virtualized measure pass above, so a user row's real height is never remembered.
+// content-visibility:auto on user rows then collapses a freshly-rebuilt off-screen tall
+// user row to its flat contain-intrinsic-size estimate on every renderMessages() rebuild
+// (each streaming frame does inner.innerHTML='' then rebuilds all rows as FRESH elements
+// that have never painted at full size). scrollHeight shrinks by (realHeight-estimate),
+// the browser force-clamps scrollTop, and the viewport jumps backward — the desktop/mobile
+// jump-back, with JS=none because the clamp is the browser's own.
+//
+// The reliable moment to read a user row's REAL height is JUST BEFORE the wipe: the old
+// rows are still in the DOM, laid out at full height (content-visibility:auto reports the
+// true rect height once an element has painted, at any scroll position — verified: a tall
+// off-screen user row still measures its real height pre-wipe). A POST-render read is
+// unreliable because a freshly-rebuilt off-screen row reports its collapsed reserve, not
+// its real size, so it would persist the wrong (small) value. Capture pre-wipe, keyed by
+// the stable session-relative index, so the rebuild's _applyUserRowIntrinsicHeight reserves
+// the real off-screen height and scrollHeight stays stable across the rebuild.
+// Desktop rests at content-visibility:visible (intrinsic-size ignored) → inert there.
+function _rememberRenderedUserRowIntrinsicHeights(){
+  const container=$('messages');
+  const inner=$('msgInner');
+  if(!container||!inner) return;
+  const rows=inner.querySelectorAll('.msg-row[data-role="user"][data-msg-idx]');
+  if(!rows.length) return;
+  const cRect=container.getBoundingClientRect();
+  // Only trust a row that is currently WITHIN (or straddling) the viewport: such a row has
+  // been painted at full size, so getBoundingClientRect().height is its REAL height. A row
+  // that content-visibility:auto is skipping (fully off-screen and never painted this
+  // session) reports only its contain-intrinsic-size reserve — persisting THAT would poison
+  // the remembered height with the collapsed value and defeat the estimate backstop for a
+  // never-seen row. The viewport intersection test is the reliable "has this row painted?"
+  // signal (an off-screen row that WAS painted earlier keeps its real height too, but we
+  // don't need it here — it either was captured on a prior in-view pass or the estimate
+  // covers it). Small margin so a row just above/below the fold still counts as painted.
+  const margin=Math.max(0, cRect.height||0);
+  for(let i=0;i<rows.length;i++){
+    const row=rows[i];
+    if(!row||!row.dataset||!row.style) continue;
+    const r=row.getBoundingClientRect();
+    const measured=Math.max(0, r.height||0);
+    if(!(measured>0)) continue;
+    // In-viewport (with a one-screen margin) ⇒ painted ⇒ height is trustworthy — but only
+    // for a row that FITS the viewport. A row taller than the viewport only ever paints the
+    // intersecting slice under content-visibility:auto, so its measured height is a PARTIAL
+    // value, not the full row. Floor every persisted height at the content estimate so a
+    // partial paint can never lower the reserve below a reasonable full-row guess; a full
+    // paint (short row) still wins when it exceeds the estimate.
+    const inView=(r.bottom>=cRect.top-margin)&&(r.top<=cRect.bottom+margin);
+    if(!inView) continue;
+    const estimate=(typeof _estimateUserRowIntrinsicHeight==='function')
+      ? _estimateUserRowIntrinsicHeight(row.dataset.rawText) : 0;
+    const h=Math.max(measured, estimate);
+    if(!(h>0)) continue;
+    const key=Number(row.dataset.sessionMsgIdx);
+    const remembered=Number.isFinite(key)?Number(_userRowIntrinsicHeightBySessionIdx[key])||0:0;
+    // Keep the tallest reserve seen — a row mid-collapse (rebuild transient) can report a
+    // shrunken size; never let that overwrite a good taller remembered value.
+    if(h>=remembered && typeof _rememberUserRowIntrinsicHeight==='function'){
+      _rememberUserRowIntrinsicHeight(row.dataset.sessionMsgIdx, h);
+      row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
+    }
   }
 }
 function _scheduleMessageVirtualizedRender(force){
@@ -1085,6 +1513,53 @@ function _getCachedRender(text, isUser){
   if(_renderCache.size > _renderCacheMax) _renderCache.clear();
   _renderCache.set(key, rendered);
   return rendered;
+}
+// ── Message-level media snapshot stamping ─────────────────────────────────
+// /api/media serves a file's CURRENT bytes. Since ETag revalidation (#6922),
+// an in-place overwrite (same filename) also rewrites every historical chat
+// preview that referenced it — the old/new comparison is lost. At settle time
+// the backend freezes the bytes of each local-file MEDIA: reference into a
+// content-addressed store and stamps the message with
+// `_media_snapshots: {path: digest}`. This helper rewrites the rendered HTML
+// of ONE message to append `&snap=<digest>` to the matching /api/media URLs
+// (and `data-snap` on lazy-preview placeholders), so old previews keep
+// showing the file as it was when the message was emitted.
+// Runs AFTER the text-keyed render cache: the cache stays pure-text, and each
+// message stamps its own digests — two messages with identical text but
+// different snapshots (exactly the old/new case) resolve independently.
+function _stampMediaSnapshots(html, snaps){
+  if(!html || !snaps || typeof snaps !== 'object') return html;
+  let out = String(html);
+  // Direct media URLs: rewrite each COMPLETE `path=` query value atomically.
+  // Value-level parsing (decode the whole value, exact map lookup) instead of
+  // substring split/join: when one path is a PREFIX of another
+  // (/tmp/a.png vs /tmp/a.png.backup) the naive rewrite corrupts the longer
+  // URL and drops its own digest. Matching is boundary-aware — the value runs
+  // to the next `&` separator or an attribute quote/whitespace — so nothing
+  // outside the value ever moves.
+  out = out.replace(/api\/media[?&]path=([^&"'\s<>]+)/g, (match, encodedPath)=>{
+    let decoded;
+    try{ decoded = decodeURIComponent(encodedPath); }
+    catch(e){ return match; }
+    const digest = snaps[decoded];
+    if(typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)){
+      return match + '&snap=' + digest;
+    }
+    return match;
+  });
+  // Lazy-preview placeholders: data-path="<html-escaped raw path>" — match the
+  // complete attribute value, unescape HTML entities, then exact lookup (same
+  // prefix-safety: a longer path's attribute can never be partially matched).
+  const _unescapeHtml=(s)=>String(s||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+  out = out.replace(/data-path="([^"]*)"/g, (match, rawValue)=>{
+    const decoded = _unescapeHtml(rawValue);
+    const digest = snaps[decoded];
+    if(typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)){
+      return match + ' data-snap="' + digest + '"';
+    }
+    return match;
+  });
+  return out;
 }
 function _currentMessageRenderWindowSize(){
   return Math.max(
@@ -1185,6 +1660,11 @@ function _highlightQuestionRow(row){
 async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
   const container=$('messages');
   if(!container||typeof questionRawIdx!=='number'||questionRawIdx<0) return;
+  const clampTargetScrollTop=(scrollTop)=>{
+    const maxTop=Math.max(0,container.scrollHeight-container.clientHeight);
+    const n=Number(scrollTop);
+    return Math.max(0,Math.min(Number.isFinite(n)?n:container.scrollTop,maxTop));
+  };
   const scrollToTarget=()=>{
     const hasAssistant=typeof assistantRawIdx==='number'&&assistantRawIdx>=0;
     if(hasAssistant){
@@ -1207,14 +1687,18 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
     _highlightQuestionRow(row);
     return true;
   };
+  // Cancel load-time bottom settling before any visible or virtualized target
+  // path can return. The jump owner keeps every native smooth-scroll frame out
+  // of the manual-reader listener, then reconciles against the final geometry.
+  _cancelBottomSettle();
+  _beginMessageJumpScroll(container);
   if(scrollToTarget()) return;
   const visWithIdx=_getVisibleMessagesWithIdx();
   const visibleIdx=_messageVisibleIndexForRawIdx(questionRawIdx, visWithIdx);
   if(visibleIdx>=0){
-    _scrollPinned=false;
-    _messageUserUnpinned=true;
     _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-    container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container);
+    const virtualTarget=clampTargetScrollTop(_messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container));
+    container.scrollTop=virtualTarget;
     _messageVirtualWindowKey='';
     renderMessages({ preserveScroll:true });
     requestAnimationFrame(()=>{
@@ -1243,9 +1727,50 @@ let _dashboardLastNonNeverMode='auto'; // Server-scoped dashboard config keeps t
 let _dashboardSettingsLoadSeq=0;
 let _dashboardSettingsWriteSeq=0;
 
+function _dashboardHostIsLoopback(host){
+  // Canonical loopback classifier shared by the browser origin and the
+  // resolved dashboard target. Normalizes brackets, case, zone ids, and a
+  // terminal hostname dot; classifies IPv4 127/8, IPv6 ::1, IPv4-mapped IPv6
+  // whose embedded IPv4 is 127/8, and localhost/.localhost names (RFC 6761).
+  if(!host) return false;
+  let h=String(host).replace(/^\[|\]$/g,'').toLowerCase();
+  if(h.endsWith('.')) h=h.slice(0,-1);
+  if(h==='localhost'||h.endsWith('.localhost')) return true;
+  const ipv4=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if(ipv4){
+    const octets=ipv4.slice(1).map(Number);
+    return octets.every(o=>o>=0&&o<=255)&&octets[0]===127;
+  }
+  if(h.includes(':')){
+    const zone=h.indexOf('%');
+    if(zone!==-1) h=h.slice(0,zone);
+    if(h==='::1'||h==='0:0:0:0:0:0:0:1') return true;
+    const mapped=/^(?:::ffff:|0:0:0:0:0:ffff:)(.+)$/.exec(h);
+    if(mapped){
+      const tail=mapped[1];
+      const dotted=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(tail);
+      if(dotted){
+        const octets=dotted.slice(1).map(Number);
+        return octets.every(o=>o>=0&&o<=255)&&octets[0]===127;
+      }
+      const hex=/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
+      if(hex) return (parseInt(hex[1],16)>>>8)===127;
+      return false;
+    }
+    return false;
+  }
+  return false;
+}
+
 function _dashboardIsBrowserLoopback(){
-  const host=(window.location.hostname||'').replace(/^\[|\]$/g,'').toLowerCase();
-  return host==='127.0.0.1'||host==='localhost'||host==='::1';
+  return _dashboardHostIsLoopback(window.location.hostname||'');
+}
+
+function _dashboardUrlIsLoopback(url){
+  if(!url) return false;
+  try{
+    return _dashboardHostIsLoopback(new URL(url).hostname);
+  }catch(_){return false;}
 }
 
 function _normalizeDashboardEnabledMode(mode){
@@ -1275,12 +1800,84 @@ function _dashboardBrowserUrl(status){
   const displayHost=browserHost.includes(':')&&!browserHost.startsWith('[')?'['+browserHost+']':browserHost;
   return source.protocol+'//'+displayHost+':'+status.port;
 }
+function _stripInlineEventHandlers(node){
+  if(!node)return;
+  const strip=el=>{
+    Array.from(el.attributes||[]).forEach(attr=>{
+      if(attr.name&&attr.name.toLowerCase().startsWith('on'))el.removeAttribute(attr.name);
+    });
+    if('onclick' in el)el.onclick=null;
+    Array.from(el.children||[]).forEach(strip);
+  };
+  strip(node);
+}
+function _syncNavActionMirrors(){
+  const rail=document.querySelector('.rail');
+  const sidebar=document.querySelector('.sidebar-nav');
+  if(!rail||!sidebar)return;
+  const anchor=sidebar.querySelector('.dashboard-link,[data-dashboard-link]')||sidebar.querySelector('[data-panel="logs"]');
+  const sources=Array.from(rail.querySelectorAll('.nav-tab:not([data-panel]):not([data-dashboard-link])')).filter(source=>source.id);
+  const mirrors=Array.from(sidebar.querySelectorAll('[data-nav-action-mirror]'));
+  const sourceIds=new Set(sources.map(source=>source.id));
+  mirrors.forEach(mirror=>{
+    if(!sourceIds.has(mirror.getAttribute('data-nav-action-mirror')))mirror.remove();
+  });
+  let next=anchor||null;
+  sources.slice().reverse().forEach(source=>{
+    const sourceVisible=(()=>{
+      if(source.hidden||source.getAttribute('aria-hidden')==='true')return false;
+      if(source.classList.contains('nav-tab-hidden'))return false;
+      if(source.style&&(source.style.display==='none'||source.style.visibility==='hidden'))return false;
+      if(typeof window!=='undefined'&&typeof window.getComputedStyle==='function'){
+        const computed=window.getComputedStyle(source);
+        if(computed&&(computed.display==='none'||computed.visibility==='hidden'))return false;
+      }
+      return true;
+    })();
+    let mirror=mirrors.find(el=>el.getAttribute('data-nav-action-mirror')===source.id);
+    if(!mirror){
+      mirror=source.cloneNode(true);
+      _stripInlineEventHandlers(mirror);
+      mirror.id=source.id+'Mobile';
+      mirror.classList.remove('rail-btn');
+      mirror.classList.add('has-tooltip--bottom');
+      mirror.setAttribute('data-nav-action-mirror',source.id);
+      mirror.addEventListener('click',e=>{
+        e.preventDefault();
+        if(mirror._navActionSource)mirror._navActionSource.click();
+        if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+      });
+    }else{
+      mirror.innerHTML=source.innerHTML;
+      _stripInlineEventHandlers(mirror);
+    }
+    if(mirror.parentNode!==sidebar||mirror.nextElementSibling!==next)sidebar.insertBefore(mirror,next);
+    next=mirror;
+    mirror._navActionSource=source;
+    mirror.classList.toggle('nav-action-visible',sourceVisible);
+    const label=source.getAttribute('data-tooltip')||source.getAttribute('aria-label')||'';
+    if(label)mirror.setAttribute('data-label',label);
+  });
+}
+function _initNavActionMirrors(){
+  _syncNavActionMirrors();
+  const rail=document.querySelector('.rail');
+  if(rail&&window.MutationObserver)new MutationObserver(_syncNavActionMirrors).observe(rail,{
+    childList:true,
+    subtree:true,
+    attributes:true,
+    attributeFilter:['class','style','hidden','aria-hidden','data-tooltip','aria-label'],
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initNavActionMirrors,{once:true});
+else _initNavActionMirrors();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';
-  const warning=running&&!_dashboardIsBrowserLoopback()?t('dashboard_loopback_warning'):'';
+  const warning=running&&!_dashboardIsBrowserLoopback()&&_dashboardUrlIsLoopback(url)?t('dashboard_loopback_warning'):'';
   document.querySelectorAll('[data-dashboard-link]').forEach(btn=>{
     btn.classList.toggle('dashboard-link-visible',running);
+    btn.classList.toggle('nav-action-visible',running);
     btn.style.display=running?'':'none';
     btn.dataset.dashboardUrl=url;
     const tipText=warning||t('tab_dashboard');
@@ -1298,6 +1895,14 @@ function _applyDashboardStatus(status){
 }
 async function refreshDashboardStatus(force=false){
   const now=Date.now();
+  // Skip the interval-driven poll while the tab is hidden: the 60s interval
+  // equals the cache TTL, so every background tick was a real /api/dashboard/status
+  // fetch that never hit the cache — a needless wakeup on a tab nobody is
+  // looking at (battery/CPU, #2476). Forced calls (settings save, init, the
+  // visibilitychange catch-up) still run. A visible tab keeps its live status.
+  if(!force&&typeof document!=='undefined'&&document.hidden){
+    return _dashboardStatusCache;
+  }
   if(!force&&_dashboardStatusCache&&(now-_dashboardStatusFetchedAt)<DASHBOARD_STATUS_TTL_MS){
     _applyDashboardStatus(_dashboardStatusCache);
     return _dashboardStatusCache;
@@ -1363,6 +1968,13 @@ function _initDashboardLinkProbe(){
   loadDashboardSettings();
   refreshDashboardStatus(true);
   setInterval(refreshDashboardStatus,DASHBOARD_STATUS_TTL_MS);
+  // Catch up once when the tab becomes visible again, since the interval poll
+  // was skipped while hidden and its cache is now stale.
+  if(typeof document!=='undefined'&&typeof document.addEventListener==='function'){
+    document.addEventListener('visibilitychange',()=>{
+      if(!document.hidden) refreshDashboardStatus(true);
+    });
+  }
 }
 if(document.readyState==='complete'){
   _initDashboardLinkProbe();
@@ -1407,7 +2019,7 @@ function _mermaidViewerIcon(kind) {
     zoomOut: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6"></path><path d="M15 15l4 4"></path></svg>',
     reset: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9V4H1"></path><path d="M1 4l4 4"></path><path d="M10 4a8 8 0 1 1-5.66 13.66"></path></svg>',
     fit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path></svg>',
-    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"></path></svg>',
+    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path><path d="M4 4l5 5M20 4l-5 5M4 20l5-5M20 20l-5-5"></path></svg>',
   };
   return icons[kind] || '';
 }
@@ -1501,12 +2113,29 @@ function _mountMermaidViewer(svgEl, options = {}) {
     viewport,
     x: 0,
     y: 0,
+    pinching: false,
+    pinchStartDist: 0,
+    pinchStartScale: 1,
+    pinchStartCX: 0,
+    pinchStartCY: 0,
+    pinchStartX: 0,
+    pinchStartY: 0,
   };
   root._mermaidViewer = state;
 
+  function _lightboxViewportEnvelope() {
+    const width = Math.round((window.innerWidth || box.width) * 0.9);
+    const height = Math.round((window.innerHeight || box.height) * 0.9);
+    return {
+      width: Math.max(1, Number.isFinite(width) ? width : 1),
+      height: Math.max(1, Number.isFinite(height) ? height : 1),
+    };
+  }
+
   function _viewportFallbackSize(){
-    const width = mode === 'lightbox' ? Math.round((window.innerWidth || box.width) * 0.9) : Math.round(window.innerWidth || box.width);
-    const height = mode === 'lightbox' ? Math.round((window.innerHeight || box.height) * 0.9) : Math.round((window.innerHeight || box.height) * 0.7);
+    if(mode === 'lightbox') return _lightboxViewportEnvelope();
+    const width = Math.round(window.innerWidth || box.width);
+    const height = Math.round((window.innerHeight || box.height) * 0.7);
     return {
       width: Math.max(1, Number.isFinite(width) ? width : 1),
       height: Math.max(1, Number.isFinite(height) ? height : 1),
@@ -1516,8 +2145,12 @@ function _mountMermaidViewer(svgEl, options = {}) {
   function _viewportSize(){
     const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
     const fallback = _viewportFallbackSize();
-    const width = viewport.clientWidth || (rect && rect.width) || fallback.width;
-    const height = viewport.clientHeight || (rect && rect.height) || fallback.height;
+    const width = mode === 'lightbox'
+      ? fallback.width
+      : (viewport.clientWidth || (rect && rect.width) || fallback.width);
+    const height = mode === 'lightbox'
+      ? fallback.height
+      : (viewport.clientHeight || (rect && rect.height) || fallback.height);
     return {
       width: Math.max(1, Number(width) || box.width || 1),
       height: Math.max(1, Number(height) || box.height || 1),
@@ -1529,10 +2162,10 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   function _minScale(){
-    // Lightbox keeps master's flat minimum (unchanged zoom-out floor / fit
-    // bounds). Only inline mode uses the readable-height-derived minimum so a
-    // short inline viewport can't shrink the diagram below usability (#5434).
-    if(mode === 'lightbox') return _MERMAID_VIEWER_MIN_SCALE;
+    // Inline stays bounded by readable-height minimum to preserve usability.
+    // Lightbox allows fit-to-screen to shrink below the old 0.25 floor when
+    // the diagram envelope is narrower than 25%.
+    if(mode === 'lightbox') return Math.min(_MERMAID_VIEWER_MIN_SCALE, _rawFitScale(_viewportSize()));
     return Math.min(_MERMAID_VIEWER_MIN_SCALE, _inlineViewportHeight() / Math.max(1, box.height));
   }
 
@@ -1578,8 +2211,28 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitViewer(){
     const nextScale = _fitScale();
+    state.fitScale = nextScale;
     state.scale = nextScale;
     _centerForScale(nextScale);
+    _applyTransform();
+  }
+
+  function _resizeToEnvelope(){
+    if(mode !== 'lightbox') return;
+    const hadFitScale = Number.isFinite(state.fitScale);
+    const previousFitScale = hadFitScale ? state.fitScale : _fitScale();
+    const wasAtFit = !hadFitScale || Math.abs(state.scale - previousFitScale) < 1e-9;
+    const envelope = _lightboxViewportEnvelope();
+    viewport.style.width = Math.max(1, Math.round(envelope.width)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(envelope.height)) + 'px';
+    const nextFitScale = _fitScale();
+    state.fitScale = nextFitScale;
+    if(wasAtFit){
+      state.scale = nextFitScale;
+      _centerForScale(state.scale);
+    } else {
+      state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, state.scale));
+    }
     _applyTransform();
   }
 
@@ -1611,6 +2264,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   function _onPointerDown(e){
+    if(state.pinching) return;
     if(e.button != null && e.button !== 0) return;
     state.dragging = true;
     state.dragged = false;
@@ -1625,6 +2279,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   function _onPointerMove(e){
+    if(state.pinching) return;
     if(!state.dragging) return;
     const dx = (Number(e.clientX) || 0) - state.dragOriginX;
     const dy = (Number(e.clientY) || 0) - state.dragOriginY;
@@ -1645,6 +2300,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   function _openViewerOnClick(e){
+    if(state.pinching) return;
     if(mode !== 'inline') return;
     if(state.dragged){
       state.dragged = false;
@@ -1655,6 +2311,53 @@ function _mountMermaidViewer(svgEl, options = {}) {
     openLightbox();
   }
 
+  function _touchDist(touches){
+    if(!touches || touches.length < 2) return 0;
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function _onTouchStart(e){
+    if(e.touches.length === 2){
+      state.pinching = true;
+      state.pinchStartDist = _touchDist(e.touches);
+      state.pinchStartScale = state.scale;
+      state.pinchStartX = state.x;
+      state.pinchStartY = state.y;
+      const rect = viewport.getBoundingClientRect();
+      state.pinchStartCX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
+      state.pinchStartCY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
+      _endPointerDrag();
+      if(e.preventDefault) e.preventDefault();
+    }
+  }
+
+  function _onTouchMove(e){
+    if(!state.pinching || e.touches.length < 2) return;
+    const rect = viewport.getBoundingClientRect();
+    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
+    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
+    const currDist = _touchDist(e.touches);
+    if(state.pinchStartDist > 0 && state.pinchStartScale > 0){
+      const rawScale = state.pinchStartScale * (currDist / state.pinchStartDist);
+      const boundedScale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, rawScale));
+      const ratio = boundedScale / state.pinchStartScale;
+      state.scale = boundedScale;
+      state.x = cx - (state.pinchStartCX - state.pinchStartX) * ratio;
+      state.y = cy - (state.pinchStartCY - state.pinchStartY) * ratio;
+      _applyTransform();
+    }
+    if(e.preventDefault) e.preventDefault();
+  }
+
+  function _onTouchEnd(e){
+    if(e.touches.length < 2 && state.pinching){
+      state.pinching = false;
+      state.dragged = true;
+    }
+  }
+
   viewport.onpointerdown = _onPointerDown;
   viewport.onpointermove = _onPointerMove;
   viewport.onpointerup = _endPointerDrag;
@@ -1662,6 +2365,10 @@ function _mountMermaidViewer(svgEl, options = {}) {
   viewport.onpointerleave = _endPointerDrag;
   viewport.onwheel = _zoomFromWheel;
   viewport.onclick = _openViewerOnClick;
+  viewport.addEventListener('touchstart', _onTouchStart, {passive: false});
+  viewport.addEventListener('touchmove', _onTouchMove, {passive: false});
+  viewport.addEventListener('touchend', _onTouchEnd);
+  viewport.addEventListener('touchcancel', function _onTouchCancel(){ state.pinching = false; });
   root.onclick = e => e.stopPropagation();
   state.fit = _fitViewer;
   state.reset = _resetViewer;
@@ -1669,6 +2376,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   state.zoomOut = _zoomOut;
   state.zoomAt = _setScale;
   state.applyTransform = _applyTransform;
+  state.resizeToEnvelope = _resizeToEnvelope;
   state.openLightbox = openLightbox;
 
   toolbar.appendChild(_createMermaidViewerButton('Zoom in', 'zoomIn', _zoomIn));
@@ -1680,22 +2388,16 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   if(mode === 'lightbox'){
-    // Preserve master's lightbox initialization exactly: fit-to-screen scale
-    // and a viewport envelope sized to the fitted diagram. The inline readable-
-    // height sizing below must NOT leak into lightbox mode (#5434 gate finding).
-    const initialFit = _fitScale();
-    state.scale = initialFit;
-    viewport.style.width = Math.max(1, Math.round(box.width * initialFit)) + 'px';
-    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+    state.resizeToEnvelope();
   } else {
     const initialHeight = _inlineViewportHeight();
     const readableScale = initialHeight / Math.max(1, box.height);
     state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, readableScale));
     viewport.style.width = '100%';
     viewport.style.height = Math.max(1, Math.round(initialHeight)) + 'px';
+    _centerForScale(state.scale);
+    _applyTransform();
   }
-  _centerForScale(state.scale);
-  _applyTransform();
 
   return root;
 }
@@ -1744,6 +2446,18 @@ function _openMermaidLightbox(svgEl) {
   clone.removeAttribute('width');
   clone.removeAttribute('height');
   const viewer = _mountMermaidViewer(clone, {mode:'lightbox'});
+  if(viewer && viewer._mermaidViewer && typeof viewer._mermaidViewer.resizeToEnvelope === 'function'){
+    lb._mermaidResizeHandler = () => {
+      if(lb._mermaidResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._mermaidResizeTimer);
+      lb._mermaidResizeTimer = setTimeout(() => {
+        lb._mermaidResizeTimer = null;
+        viewer._mermaidViewer.resizeToEnvelope();
+      }, 120);
+    };
+    if(window && typeof window.addEventListener === 'function'){
+      window.addEventListener('resize', lb._mermaidResizeHandler);
+    }
+  }
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
@@ -1757,6 +2471,7 @@ function _openMermaidLightbox(svgEl) {
   };
   document.body.appendChild(lb);
   document.addEventListener('keydown', lb._keyHandler);
+  return lb;
 }
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
@@ -1827,6 +2542,13 @@ function _navigateLightbox(lb, direction) {
 function _closeImgLightbox(lb) {
   if(!lb || !lb.parentNode) return;
   document.removeEventListener('keydown', lb._keyHandler);
+  if(lb._mermaidResizeHandler && window && typeof window.removeEventListener === 'function'){
+    window.removeEventListener('resize', lb._mermaidResizeHandler);
+  }
+  if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._mermaidResizeTimer);
+    lb._mermaidResizeTimer = null;
+  }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
 }
@@ -1905,10 +2627,41 @@ function _applyMediaPlaybackRate(media, rate=_getStoredMediaPlaybackRate()){
   media.playbackRate=rate;
   _syncMediaSpeedButtons(media.closest('.msg-media-editor,.preview-media-wrap'),rate);
 }
+let _mediaVisibilityObserver=null;
+function _promoteVisibleVideoPreload(video){
+  if(!video||!video.matches||!video.matches('.msg-media-video')) return;
+  if(video.isConnected===false) return;
+  if(video.dataset&&video.dataset.visiblePreload==='1') return;
+  if(video.dataset) video.dataset.visiblePreload='1';
+  video.preload='auto';
+  // Off-screen history stays metadata-only. Once a card approaches the
+  // viewport, restart just that resource so Chromium fills a playable buffer.
+  if(video.paused&&video.readyState<4&&typeof video.load==='function') video.load();
+}
+function _observeVideoPreload(video){
+  if(!video||!video.matches||!video.matches('.msg-media-video')) return;
+  if(video.dataset&&video.dataset.visiblePreload==='1') return;
+  if(_mediaVisibilityObserver) _mediaVisibilityObserver.observe(video);
+}
+function _unobserveVideoPreload(video){
+  if(!video||!_mediaVisibilityObserver) return;
+  _mediaVisibilityObserver.unobserve(video);
+}
+function _initMediaVisibilityObserver(){
+  if(_mediaVisibilityObserver||typeof IntersectionObserver==='undefined') return;
+  _mediaVisibilityObserver=new IntersectionObserver(entries=>{
+    for(const entry of entries){
+      if(!entry.isIntersecting) continue;
+      const video=entry.target;
+      _unobserveVideoPreload(video);
+      _promoteVisibleVideoPreload(video);
+    }
+  },{root:null,rootMargin:'300px 0px',threshold:0.01});
+}
 function _mediaKindForName(name=''){
   const clean=String(name||'').split('?')[0].toLowerCase();
-  if(_AUDIO_EXTS.test(clean)) return 'audio';
   if(_VIDEO_EXTS.test(clean)) return 'video';
+  if(_AUDIO_EXTS.test(clean)) return 'audio';
   if(_IMAGE_EXTS.test(clean)) return 'image';
   return '';
 }
@@ -1924,6 +2677,126 @@ function _mediaPlayerHtml(kind, src, name, extra=''){
     ? `<video class="msg-media-player msg-media-video" src="${safeSrc}" controls preload="metadata" playsinline title="${safeName}"></video>`
     : `<audio class="msg-media-player msg-media-audio" src="${safeSrc}" controls preload="metadata" title="${safeName}"></audio>`;
   return `<div class="msg-media-editor msg-media-editor--${kind}" data-media-kind="${kind}">${tag}<div class="msg-media-meta"><span class="msg-media-name">${safeName}</span>${extra}</div>${_mediaSpeedControlsHtml(kind,safeName)}</div>`;
+}
+// Shared MEDIA: token renderer used by both the full-pipeline renderMd() and
+// the streaming smd path in messages.js. Centralised so the live + settled
+// representations of the same MEDIA token stay byte-identical, otherwise the
+// streamed prose loses its image when the answer settles (#MEDIA-in-stream).
+// `sessionId` is forwarded into /api/media so the same allow-list check applies
+// to streamed references too; falls back to whatever the current session is.
+// data:image/* URIs the renderer may embed directly as <img src>. Only raster
+// formats plus base64 SVG (scripts do not execute inside <img>), only safe payload
+// chars, and bounded size — everything else (data:text/html etc.) must
+// keep rendering as inert text so a model-emitted data: URI can never become an
+// executable document.
+const _DATA_IMAGE_RE=/^data:image\/(?:png|jpe?g|gif|webp|avif)(?:;base64)?,[a-z0-9+/=%._~:@!$&'()*+,;-]*$/i;
+const _DATA_IMAGE_SVG_RE=/^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i;
+const _DATA_IMAGE_MAX_LEN=2*1024*1024;
+
+// The streaming renderer calls this ui-owned predicate too. Keep the dangerous
+// SVG form base64-only: URL-encoded XML is a document-shaped payload, not a
+// normal inline image transport.
+function _isSafeDataImageUri(ref){
+  const value=String(ref||'');
+  return value.length<=_DATA_IMAGE_MAX_LEN
+    && (_DATA_IMAGE_RE.test(value)||_DATA_IMAGE_SVG_RE.test(value));
+}
+
+function _dataImageHtml(ref, altText){
+  if(!_isSafeDataImageUri(ref)) return null;
+  return `<img class="msg-media-img" src="${esc(ref)}" alt="${esc(altText||'image')}" loading="lazy">`;
+}
+
+// Markdown image syntax ![alt](url) → HTML. https:// keeps the historical direct
+// <img>; file:// and bare data:image/ URIs route through the same helpers the
+// MEDIA: pipeline uses, so ![x](file:///p.png) renders the artifact card instead
+// of the broken "!<a>" anchor it used to produce, and ![x](data:image/...) stops
+// dumping raw base64 text into the chat.
+function _mdImageHtml(alt, url){
+  if(/^data:/i.test(url)){
+    const img=_dataImageHtml(url, alt);
+    if(img) return img;
+    return esc(`![${alt}](${String(url).slice(0,64)}…)`);
+  }
+  if(/^file:\/\//i.test(url)) return _inlineMediaHtmlForRef(url,undefined,alt);
+  return `<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`;
+}
+
+function _inlineMediaHtmlForRef(ref, sessionId, altText){
+  if(ref==null) return '';
+  // data:image/* → inline <img>; any other data: scheme renders as inert
+  // truncated text (never routed to api/media, never embedded).
+  if(/^data:/i.test(ref)){
+    const img=_dataImageHtml(ref,altText===undefined?'image':altText);
+    if(img) return img;
+    return `<code>${esc(String(ref).slice(0,64))}…</code>`;
+  }
+  // Keep this logic self-contained: some tests extract renderMd() alone and
+  // execute it in node, without the top-level helper functions from ui.js.
+  // Tests look for `new URL(ref)` / `u.pathname` / `api/media?path=` patterns,
+  // so the variable name is the original `ref` (not `r`) and the file://
+  // unwrap keeps the matched identifier visible.
+  if(/^file:\/\//i.test(ref)){
+    try{
+      const u=new URL(ref);
+      ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
+    }catch(_){
+      try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
+      catch(__){ref=ref.replace(/^file:\/\//i,'');}
+    }
+  }
+  if(/^https?:\/\//i.test(ref)){
+    let src=ref;
+    if(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(src)){
+      const base=(typeof document!=='undefined'&&document.baseURI||'').replace(/\/$/,'');
+      src=src.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i,base);
+    }
+    const urlPath=src.split('?')[0];
+    // SVG URLs → render inline as image (must precede the https:// <img>
+    // catch-all below so extensionless CDN SVG paths still match)
+    if(_SVG_EXTS.test(urlPath)){
+      return `<img class="msg-media-svg" src="${esc(src)}" alt="${esc(typeof t==='function'?t('media_svg_label'):'svg')}" loading="lazy">`;
+    }
+    const mediaKind=_mediaKindForName(urlPath);
+    if(mediaKind==='audio'||mediaKind==='video') return _mediaPlayerHtml(mediaKind,src,urlPath.split('/').pop()||mediaKind);
+    // Render all https:// URLs as <img> — extensionless CDN paths like fal.media still work (#853)
+    if(_IMAGE_EXTS.test(urlPath) || /^https?:\/\//i.test(src)){
+      return `<img class="msg-media-img" src="${esc(src)}" alt="image" loading="lazy">`;
+    }
+    return `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`;
+  }
+  // Local file path — route through /api/media so the session allow-list check
+  // (api/routes.py _resolve_media_path) gates the access the same way it does
+  // for the full-pipeline renderer.
+  const sid=sessionId
+    || (typeof S!=='undefined'&&S&&S.session&&S.session.session_id?String(S.session.session_id):'')
+    || '';
+  const apiUrl='api/media?path='+encodeURIComponent(ref)+(sid?'&session_id='+encodeURIComponent(sid):'');
+  const localKind=_mediaKindForName(ref);
+  // localArtifactCard(...)
+  if(localKind==='image'){
+    const safeName=esc(altText===undefined?(ref.split('/').pop()||'image'):altText);
+    const tt=(typeof t==='function')?t:(key=>({media_download:'Download'}[key]||key));
+    const dlLabel=esc(tt('media_download'));
+    const dlSvg='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
+    return `<span class="msg-artifact-image"><img class="msg-media-img" src="${esc(apiUrl)}" alt="${safeName}" loading="lazy"><a class="msg-artifact-download" href="${esc(apiUrl)}" download="${safeName}" title="${dlLabel}" aria-label="${dlLabel}" onclick="event.stopPropagation()">${dlSvg}</a></span>`;
+  }
+  if(_SVG_EXTS.test(ref)) return `<img class="msg-media-svg" src="${esc(apiUrl)}" alt="${esc(altText===undefined?(typeof t==='function'?t('media_svg_label'):'svg'):altText)}" loading="lazy">`;
+  if(localKind==='audio'||localKind==='video'){
+    return _mediaPlayerHtml(localKind,apiUrl+'&inline=1',ref.split('/').pop()||ref);
+  }
+  if(_PDF_EXTS.test(ref)){
+    const fname=esc(ref.split('/').pop()||ref);
+    return `<div class="pdf-preview-load" data-path="${esc(ref)}"><span class="pdf-preview-spinner">⏳</span> ${esc(typeof t==='function'?t('pdf_loading'):'Loading')} ${fname}...</div>`;
+  }
+  if(_HTML_EXTS.test(ref)){
+    return `<div class="html-preview-load" data-path="${esc(ref)}"><span class="html-preview-spinner">⏳</span> ${esc(typeof t==='function'?t('html_loading'):'Loading')}...</div>`;
+  }
+  const fname=esc(ref.split('/').pop()||ref);
+  if(/\.(patch|diff)$/i.test(ref)) return `<div class="diff-inline-load" data-path="${esc(ref)}">${esc(typeof t==='function'?t('diff_loading'):'Loading diff')} ${fname}...</div>`;
+  if(_CSV_EXTS.test(ref)) return `<div class="csv-inline-load" data-path="${esc(ref)}">${esc(typeof t==='function'?t('csv_loading'):'Loading')} ${fname}...</div>`;
+  if(_EXCALIDRAW_EXTS.test(ref)) return `<div class="excalidraw-inline-load" data-path="${esc(ref)}">${esc(typeof t==='function'?t('excalidraw_loading'):'Loading')} ${fname}...</div>`;
+  return `<a class="msg-media-link" href="${esc(apiUrl+'&download=1')}" download="${fname}">📎 ${fname}</a>`;
 }
 function _renderAttachmentHtml(fname, url){
   const kind=_mediaKindForName(fname);
@@ -1951,21 +2824,40 @@ document.addEventListener("loadedmetadata", e=>{
     _applyMediaPlaybackRate(e.target);
   }
 },true);
+document.addEventListener('play',e=>{
+  if(e.target&&e.target.matches&&e.target.matches('.msg-media-video')){
+    _promoteVisibleVideoPreload(e.target);
+  }
+},true);
 function _initMediaPlaybackObserver(){
   if(!document.body||window._mediaPlaybackObserver) return;
+  _initMediaVisibilityObserver();
   window._mediaPlaybackObserver=new MutationObserver(records=>{
     for(const rec of records){
+      for(const node of rec.removedNodes||[]){
+        if(!node||node.nodeType!==1) continue;
+        const videos=[];
+        if(node.matches&&node.matches('.msg-media-video')) videos.push(node);
+        if(node.querySelectorAll) videos.push(...node.querySelectorAll('.msg-media-video'));
+        videos.forEach(_unobserveVideoPreload);
+      }
       for(const node of rec.addedNodes||[]){
         if(!node||node.nodeType!==1) continue;
         const media=[];
         if(node.matches&&node.matches('audio,video')) media.push(node);
         if(node.querySelectorAll) media.push(...node.querySelectorAll('audio,video'));
-        media.forEach(m=>_applyMediaPlaybackRate(m));
+        media.forEach(m=>{
+          _applyMediaPlaybackRate(m);
+          _observeVideoPreload(m);
+        });
       }
     }
   });
   window._mediaPlaybackObserver.observe(document.body,{childList:true,subtree:true});
-  document.querySelectorAll('audio,video').forEach(m=>_applyMediaPlaybackRate(m));
+  document.querySelectorAll('audio,video').forEach(m=>{
+    _applyMediaPlaybackRate(m);
+    _observeVideoPreload(m);
+  });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_initMediaPlaybackObserver);
 else _initMediaPlaybackObserver();
@@ -2096,6 +2988,49 @@ function _providerFromModelValue(modelId){
   if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
   return '';
 }
+function _modelPickerOptionIdentity(modelId, providerId){
+  let value=String(modelId||'');
+  const provider=String(providerId||'').trim();
+  if(value.startsWith('@')&&value.includes(':')){
+    const exactPrefix=provider ? `@${provider}:` : '';
+    if(exactPrefix && value.toLowerCase().startsWith(exactPrefix.toLowerCase())){
+      value=value.substring(exactPrefix.length);
+    }else if(value.startsWith('@custom:')){
+      const namedProvider=value.substring('@custom:'.length);
+      const splitAt=namedProvider.indexOf(':');
+      value=splitAt>=0 ? namedProvider.substring(splitAt+1) : namedProvider;
+    }else{
+      value=value.substring(value.indexOf(':')+1);
+    }
+  }
+  return value.replace(/-/g,'.').toLowerCase();
+}
+function _deduplicateModelPickerOptions(sel,selectedValue){
+  if(!sel||!sel.querySelectorAll) return 0;
+  let removed=0;
+  for(const group of sel.querySelectorAll('optgroup')){
+    const options=Array.from(group.children||[]).filter(opt=>opt&&opt.tagName==='OPTION');
+    const byIdentity=new Map();
+    for(const opt of options){
+      const identity=_modelPickerOptionIdentity(opt.value,_getOptionProviderId(opt));
+      if(!identity) continue;
+      if(!byIdentity.has(identity)) byIdentity.set(identity,[]);
+      byIdentity.get(identity).push(opt);
+    }
+    for(const candidates of byIdentity.values()){
+      if(candidates.length<2) continue;
+      const selected=candidates.find(opt=>opt.value===selectedValue);
+      const routable=candidates.find(opt=>String(opt.value||'').startsWith('@'));
+      const survivor=selected||routable||candidates[0];
+      for(const opt of candidates){
+        if(opt===survivor) continue;
+        group.removeChild(opt);
+        removed++;
+      }
+    }
+  }
+  return removed;
+}
 function _providerSkipsModelMismatchWarning(providerId){
   const p=String(providerId||'').toLowerCase();
   return !p||p==='custom'||p.startsWith('custom:')||p==='openrouter';
@@ -2112,8 +3047,36 @@ function _modelStateForSelect(sel, modelId){
   const value=String(modelId||'').trim();
   if(!value) return {model:'',model_provider:null};
   const explicitProvider=_providerFromModelValue(value);
-  if(explicitProvider) return {model:value,model_provider:explicitProvider};
-  const opt=sel&&sel.selectedOptions&&sel.selectedOptions[0];
+  if(explicitProvider){
+    const selected=sel&&sel.options
+      ?Array.from(sel.options).find(o=>String(o.value||'')===value)
+      :null;
+    const routedModel=selected&&selected.dataset&&selected.dataset.model;
+    // Read the provider from the matched option's authoritative data-provider
+    // rather than re-parsing the value at its LAST colon: a colon-bearing model
+    // id (e.g. model-a:free) synthesized as @custom:backup:model-a:free would
+    // otherwise mis-parse to provider "custom:backup:model-a" (#6221 re-gate).
+    const routedProvider=selected?String(_getOptionProviderId(selected)||'').trim():'';
+    return {model:routedModel||value,model_provider:routedProvider||explicitProvider};
+  }
+  // Resolve the provider from the option whose VALUE matches the requested
+  // model — never blindly from sel.selectedOptions[0] (#5567). During a profile
+  // /tab switch or a model-list rebuild the dropdown transiently still has the
+  // PREVIOUS profile's default option selected (e.g. an ollama model), so reading
+  // selectedOptions[0] would stamp that foreign provider onto a model it doesn't
+  // own — which is then persisted into the session's model_provider and re-sent
+  // on every turn, bricking it with a "Provider 'X'…no API key" error for a
+  // provider the session never used.
+  let opt=null;
+  const selected=sel&&sel.selectedOptions&&sel.selectedOptions[0];
+  // Prefer the currently-selected option ONLY when it actually is the requested
+  // model — this preserves the user's exact pick in the same-value/different-
+  // provider collision case (two providers offering the same model id).
+  if(selected&&String(selected.value||'')===value){
+    opt=selected;
+  }else if(sel&&sel.options){
+    opt=Array.from(sel.options).find(o=>String(o.value||'')===value)||null;
+  }
   const provider=String(_getOptionProviderId(opt)||'').trim();
   return {model:value,model_provider:(provider&&provider!=='default')?provider:null};
 }
@@ -2270,6 +3233,65 @@ function _clearPendingSessionModel(sessionId){
   if(!sid) return;
   try{sessionStorage.removeItem(_pendingSessionModelKey(sid));}catch(_){}
 }
+// #5924: the recovery-send deliberate-pick signal. Returns {model, model_provider}
+// ONLY when the active session's own model is a genuine non-default pick vs the
+// profile default — the same signal send()'s persistent-pick path (_isCrossProviderPick)
+// uses, generalized to same-provider non-default picks too. Used by the recovery
+// paths (cmdRetry / submitEdit) to decide whether to re-arm the single-shot
+// explicit-pick marker: the marker is consumed by the failed send before we reach
+// recovery, so we can't read it back, and comparing _chatPayloadModel() to itself
+// either false-negatives (an already-applied pick looks unchanged) or false-positives
+// (provider inference manufactures a "change"). A non-default session model is the
+// durable, inference-free evidence of a real pick. Returns null (no re-arm → the
+// server's compatible-model resolution runs) when the session is on the default.
+function _deliberateSessionModelPick(sessionId){
+  if(!S.session||S.session.session_id!==sessionId) return null;
+  const model=String(S.session.model||'').trim();
+  if(!model) return null;
+  // Require SESSION-OWNED provider evidence — a stored model_provider on the
+  // session itself. Do NOT infer a provider from the model string: an
+  // unreachable/renamed model like "@removed:mistral-large" with no stored
+  // provider must NOT count as a deliberate pick (round-2/3 false-positive).
+  const provider=S.session.model_provider?String(S.session.model_provider).trim():'';
+  if(!provider) return null;
+  // Require a KNOWN profile default to compare against. If we don't know the
+  // default (empty window._defaultModel), we can't prove this is a non-default
+  // pick, so fail closed → no re-arm (server compatible-model resolution runs).
+  const defaultModel=(typeof window!=='undefined'&&window._defaultModel)?String(window._defaultModel):'';
+  const activeProvider=(typeof window!=='undefined'&&window._activeProvider)?String(window._activeProvider):'';
+  if(!defaultModel||!activeProvider) return null;
+  // Non-default = a different model OR a different provider than the profile
+  // default. A session sitting exactly on the profile default is NOT a pick.
+  const isDefault=(model===defaultModel)&&(provider===activeProvider);
+  if(isDefault) return null;
+  return {model, model_provider:provider};
+}
+// #5924: re-arm the single-shot explicit-pick marker from a recovery pick, but
+// ONLY if it's still safe at fire time. Guards the SILENT same-session race where
+// the user changes the model DURING the recovery's awaits: (1) the session must
+// still be the captured one; (2) the session's CURRENT model/provider must still
+// equal the captured pick (a mid-flight change means the pick is stale — skip);
+// (3) never clobber a NEWER pending marker (an onchange during the await already
+// wrote the authoritative one). Returns true if it re-armed.
+function _reArmRecoveryPick(sessionId, pick){
+  if(!pick||!pick.model) return false;
+  if(!S.session||S.session.session_id!==sessionId) return false;
+  // Current session state must still match the captured pick (no mid-flight change).
+  if(String(S.session.model||'')!==String(pick.model||'')
+     ||String(S.session.model_provider||'')!==String(pick.model_provider||'')) return false;
+  // Do not overwrite a newer marker written by an onchange during the await.
+  if(typeof _readPendingSessionModel==='function'){
+    const existing=_readPendingSessionModel(sessionId);
+    if(existing&&existing.model
+       &&(String(existing.model)!==String(pick.model)
+          ||String(existing.model_provider||'')!==String(pick.model_provider||''))) return false;
+  }
+  if(typeof _rememberPendingSessionModel==='function'){
+    _rememberPendingSessionModel(sessionId, pick.model, pick.model_provider);
+    return true;
+  }
+  return false;
+}
 function _applyPendingSessionModelForSession(sessionId){
   if(!S.session||S.session.session_id!==sessionId) return false;
   const pending=_readPendingSessionModel(sessionId);
@@ -2306,9 +3328,14 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
     const pref=String(preferredProviderId||'').toLowerCase();
     if(!pref || !exactProv || exactProv===pref) return modelId;
   }
-  // 1. Normalize: lowercase, strip namespace prefix, replace hyphens→dots.
-  // Also strip @provider: prefix from deduplicated model IDs (#1228, #1313).
-  const norm=s=>s.toLowerCase().replace(/^[^/]+\//,'').replace(/^@([^:]+:)+/,'').replace(/-/g,'.');
+  // 1. Restore lookup keeps the older hierarchy-preserving matcher instead of
+  // the picker-dedup identity, so missing qualified models do not substitute a
+  // different suffix-sharing sibling.
+  const norm=s=>String(s||'')
+    .toLowerCase()
+    .replace(/^@([^:]+:)+/,'')
+    .replace(/^[^/]+\//,'')
+    .replace(/-/g,'.');
   const target=norm(modelId);
   let explicitProvider='';
   const rawModel=String(modelId||'');
@@ -2317,12 +3344,49 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
   }
   const preferred=String(preferredProviderId||explicitProvider||'').toLowerCase();
   if(preferred){
-    const providerMatch=options.find(o=>norm(o.value)===target && _getOptionProviderId(o).toLowerCase()===preferred);
+    if(preferred==='custom'||preferred.startsWith('custom:')){
+      // A slash is part of a custom endpoint's upstream model ID, not a
+      // provider namespace. Match the exact routed ID (allowing only the
+      // WebUI's @provider: wrapper and dash/dot spelling compatibility).
+      const routeNorm=value=>{
+        let routed=String(value||'');
+        const prefix=`@${preferred}:`;
+        if(routed.toLowerCase().startsWith(prefix)) routed=routed.slice(prefix.length);
+        return routed.toLowerCase().replace(/-/g,'.');
+      };
+      const providerOptions=options.filter(o=>_getOptionProviderId(o).toLowerCase()===preferred);
+      const providerMatch=providerOptions.find(o=>routeNorm(o.value)===routeNorm(rawModel));
+      if(providerMatch) return providerMatch.value;
+      // Legacy sessions may store only the bare suffix of a routed custom
+      // option. Preserve #6195's provider-hinted repair, but only for an
+      // explicit @provider: row; an unwrapped slash ID belongs to the active
+      // endpoint and must not substitute for a distinct bare model.
+      if(!rawModel.includes('/')&&!rawModel.startsWith('@')){
+        const prefix=`@${preferred}:`;
+        const suffixMatches=providerOptions.filter(o=>
+          String(o.value||'').toLowerCase().startsWith(prefix)
+          &&norm(o.value)===target
+        );
+        if(suffixMatches.length===1) return suffixMatches[0].value;
+      }
+      return null;
+    }
+    const providerMatch=options.find(o=>norm(o.value)===target&&_getOptionProviderId(o).toLowerCase()===preferred);
     if(providerMatch) return providerMatch.value;
   }
-  // 2. Normalized match
+  // 2. Normalized match — but ONLY when unambiguous. If the bare id
+  // matches across multiple provider groups AND no provider hint is
+  // available, return null instead of snapping to the first group's
+  // option. This prevents a deliberate non-default pick from reverting
+  // to the default provider on re-render (#6195).
   const exact=opts.find(o=>norm(o)===target);
-  if(exact) return exact;
+  if(exact){
+    const normMatches=options.filter(o=>norm(o.value)===target);
+    if(normMatches.length>1 && !preferred && !explicitProvider && !rawModel.includes('/')){
+      return null;  // ambiguous bare id — caller must inject the correct option
+    }
+    return exact;
+  }
   // If the request is provider-qualified (either explicit @provider:model or
   // a slash-qualified vendor/model id), do NOT fuzzy-match a sibling model
   // once exact/provider-aware lookup failed. Returning null lets the caller
@@ -2367,23 +3431,51 @@ function _refreshOpenModelDropdown(){
     renderModelDropdown();
     if(typeof _positionModelDropdown==='function') _positionModelDropdown();
   }
+  const sdd=$('settingsModelDropdown');
+  if(sdd&&sdd.classList&&sdd.classList.contains('open')&&typeof renderModelDropdown==='function'){
+    // Re-rendering the OPEN settings picker (e.g. when a late live-model fetch
+    // resolves) must not re-grab search focus on touch — same coarse-pointer rule
+    // as openSettingsModelDropdown, or the mobile keyboard pops after opening.
+    const _coarsePointer=(typeof window.matchMedia==='function')&&window.matchMedia('(pointer: coarse)').matches;
+    renderModelDropdown({
+      dropdownId:'settingsModelDropdown',
+      selectId:'settingsModel',
+      forceOpenKey:'settingsModel',
+      closeDropdown:closeSettingsModelDropdown,
+      selectModel:selectSettingsModelFromDropdown,
+      scopeNoteText:t('settings_desc_model')||'Used for new conversations. Existing conversations keep their selected model.',
+      autoFocusSearch:!_coarsePointer,
+    });
+  }
 }
 function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
   if(!modelId||!sel) return null;
-  const currentState=(sel.id==='modelSelect'&&typeof _modelStateForSelect==='function')
+  const isRichPickerSelect=sel.id==='modelSelect'||sel.id==='settingsModel';
+  const currentState=(isRichPickerSelect&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(sel, sel.value)
     : null;
   const resolved=_findModelInDropdown(modelId,sel,preferredProviderId);
   if(resolved){
     sel.value=resolved;
-    if(sel.id==='modelSelect'){
+    const preferredProvider=String(preferredProviderId||'').trim().toLowerCase();
+    if(preferredProvider&&sel.options){
+      // Assigning select.value picks the first duplicate value. Restore the
+      // provider-specific option that the caller matched (#6131).
+      const preferredOption=Array.from(sel.options).find(o=>
+        String(o.value||'')===String(resolved)
+        && String(_getOptionProviderId(o)||'').trim().toLowerCase()===preferredProvider
+      );
+      if(preferredOption) preferredOption.selected=true;
+    }
+    if(isRichPickerSelect){
       const resolvedState=typeof _modelStateForSelect==='function'
         ? _modelStateForSelect(sel, resolved)
         : {model:resolved,model_provider:preferredProviderId||null};
       const pickerChanged= !!(opts&&opts.forceRefresh) || !currentState
         || String(currentState.model||'')!==String(resolvedState.model||'')
         || String(currentState.model_provider||'')!==String(resolvedState.model_provider||'');
-      if(typeof syncModelChip==='function') syncModelChip();
+      if(sel.id==='modelSelect'&&typeof syncModelChip==='function') syncModelChip();
+      if(sel.id==='settingsModel'&&typeof syncSettingsModelChip==='function') syncSettingsModelChip();
       if(pickerChanged) _refreshOpenModelDropdown();
     }
     return resolved;
@@ -2392,24 +3484,43 @@ function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
 }
 function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
-  const applied=_applyModelToDropdown(modelId,sel,preferredProviderId);
-  if(applied) return applied;
-  const value=modelId;
+  if(typeof _deduplicateModelPickerOptions==='function') _deduplicateModelPickerOptions(sel,sel.value);
+  const requestedProvider=String(preferredProviderId||_providerFromModelValue(modelId)||'').trim();
+  const applied=_applyModelToDropdown(modelId,sel,requestedProvider||null);
+  if(applied){
+    const appliedState=typeof _modelStateForSelect==='function'
+      ?_modelStateForSelect(sel,applied)
+      :{model:applied,model_provider:null};
+    if(!requestedProvider||String(appliedState&&appliedState.model_provider||'').toLowerCase()===requestedProvider.toLowerCase()) return applied;
+  }
+  const explicitPrefix=requestedProvider?`@${requestedProvider}:`:'';
+  const rawModel=String(modelId||'');
+  const bareModel=explicitPrefix&&rawModel.toLowerCase().startsWith(explicitPrefix.toLowerCase())
+    ?rawModel.slice(explicitPrefix.length)
+    :rawModel;
+  const value=requestedProvider?`${explicitPrefix}${bareModel}`:rawModel;
   const opt=document.createElement('option');
-  opt.value=modelId;
+  opt.value=value;
   opt.textContent=typeof getModelLabel==='function'?getModelLabel(modelId):modelId;
   opt.dataset.custom='1';
   const badge=(window._configuredModelBadges||{})[value];
+  const rawBadge=(window._configuredModelBadges||{})[rawModel];
   if(badge&&badge.provider) opt.dataset.provider=badge.provider;
-  const provider=preferredProviderId||(badge&&badge.provider)||_providerFromModelValue(modelId)||'';
+  if(rawBadge&&rawBadge.provider) opt.dataset.provider=rawBadge.provider;
+  if(requestedProvider) opt.dataset.model=bareModel;
+  const provider=requestedProvider||(badge&&badge.provider)||(rawBadge&&rawBadge.provider)||_providerFromModelValue(value)||'';
   if(provider) opt.dataset.provider=provider;
   sel.appendChild(opt);
-  sel.value=modelId;
+  sel.value=value;
   if(sel.id==='modelSelect'){
     if(typeof syncModelChip==='function') syncModelChip();
     _refreshOpenModelDropdown();
   }
-  return modelId;
+  if(sel.id==='settingsModel'){
+    if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
+    _refreshOpenModelDropdown();
+  }
+  return value;
 }
 function _modelStateFromAppliedDropdown(sel, modelValue){
   const state=(typeof _modelStateForSelect==='function')
@@ -2540,6 +3651,11 @@ async function populateModelDropdown(opts={}){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
+        if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
+          opt.dataset.fast='1';
+        }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
+          opt.dataset.fast='0';
+        }
         og.appendChild(opt);
         _dynamicModelLabels[m.id]=m.label||m.id;
       }
@@ -2556,6 +3672,9 @@ async function populateModelDropdown(opts={}){
         }
       }
       sel.appendChild(og);
+    }
+    if(typeof _deduplicateModelPickerOptions==='function'){
+      _deduplicateModelPickerOptions(sel,previousSelection&&previousSelection.model||'');
     }
     _reconcileModelDropdownSelection(sel,data,previousSelection,opts);
     if(typeof syncModelChip==='function') syncModelChip();
@@ -2607,41 +3726,64 @@ function _addLiveModelsToSelect(provider, models, sel){
     providerGroup.dataset.provider=provider;
   }
   const existingIds=new Set([...sel.options].map(o=>o.value));
-  // Normalized dedup strips provider/custom prefixes and namespaces (#907, #3478).
-  const _normId=id=>{
-    let s=String(id||'');
-    if(s.startsWith('@')&&s.includes(':')){
-      if(s.startsWith('@custom:')){
-        s=s.substring(s.lastIndexOf(':')+1)||s;
-      }else{
-        s=s.substring(s.indexOf(':')+1);
-      }
-    }
-    s=s.split('/').pop();
-    return s.replace(/-/g,'.').toLowerCase();
-  };
-  const existingNorm=new Set([...sel.options].map(o=>_normId(o.value)));
-  let added=0;
   const _ap=(window._activeProvider||'').toLowerCase();
   const _providerLower=String(provider||'').toLowerCase();
   const _isNamedCustomActiveProvider=_ap.startsWith('custom:');
   const _isPortalFetch=_ap && _ap!=='openrouter' && _ap!=='custom' && _ap!=='openai-codex' && (_providerLower===_ap||_isNamedCustomActiveProvider&&_providerLower===_ap);
+  // Keep existingNorm.has( within the #907 source slice.
+  const optionIdentity=typeof _modelPickerOptionIdentity==='function'
+    ? (modelId,providerId)=>_modelPickerOptionIdentity(modelId,providerId)
+    : (modelId,providerId)=>{
+        let value=String(modelId||'');
+        const provider=String(providerId||'').trim();
+      if(value.startsWith('@')&&value.includes(':')){
+        const exactPrefix=provider ? `@${provider}:` : '';
+        if(exactPrefix && value.toLowerCase().startsWith(exactPrefix.toLowerCase())){
+          value=value.substring(exactPrefix.length);
+        }else if(value.startsWith('@custom:')){
+          const namedProvider=value.substring('@custom:'.length);
+          const splitAt=namedProvider.indexOf(':');
+          value=splitAt>=0 ? namedProvider.substring(splitAt+1) : namedProvider;
+        }else{
+          value=value.substring(value.indexOf(':')+1);
+        }
+      }
+        return value.split('/').pop().replace(/-/g,'.').toLowerCase();
+      };
+  const existingNorm=new Set([...sel.options].map(o=>optionIdentity(o.value,_getOptionProviderId(o))));
+  let added=0;
   for(const m of models){
     let mid=m.id;
     if(_isPortalFetch && !mid.startsWith('@')){
       mid=`@${provider}:${mid}`;
     }
     if(existingIds.has(mid)) continue;
-    if(existingNorm.has(_normId(mid))) continue; // dedup cross-prefix duplicates (#907)
+    const identity=optionIdentity(mid,provider);
+    if(existingNorm.has(identity)){
+      const sameGroup=Array.from(providerGroup.children||[]).find(o=>optionIdentity(o.value,_getOptionProviderId(o))===identity);
+      if(sameGroup){
+        const incomingRoutable=String(mid).startsWith('@');
+        const existingRoutable=String(sameGroup.value||'').startsWith('@');
+        if(!(!existingRoutable&&incomingRoutable)) continue; // let proxy replace catalog twin
+      }
+    }
     const opt=document.createElement('option');
     opt.value=mid;
     opt.textContent=m.label||m.id;
     opt.title='Live model — fetched from provider';
     opt.dataset.provider=provider;
+    if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
+      opt.dataset.fast='1';
+    }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
+      opt.dataset.fast='0';
+    }
     providerGroup.appendChild(opt);
+    existingIds.add(mid);
+    existingNorm.add(identity);
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
   }
+  if(typeof _deduplicateModelPickerOptions==='function') _deduplicateModelPickerOptions(sel,currentVal);
   const currentState=(currentVal&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(sel, currentVal)
     : {model:currentVal||'', model_provider:(S.session&&S.session.model_provider)||null};
@@ -2761,6 +3903,30 @@ function _normalizeConfiguredModelKey(modelId){
   return s.replace(/-/g,'.');
 }
 
+function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
+  const normalized=_normalizeConfiguredModelKey(modelId);
+  const provider=String(badge&&badge.provider||'').toLowerCase();
+  const matchingEntries=(entries||[]).filter(existing=>
+    _normalizeConfiguredModelKey(existing.value)===normalized
+  );
+  if(matchingEntries.some(existing=>{
+    const entryProvider=String(existing.providerId||'').toLowerCase();
+    return !provider||!entryProvider||entryProvider===provider;
+  })) return true;
+  // @provider:model is an equivalent routing spelling only when an existing
+  // picker row belongs to that same provider. This supports named custom
+  // providers (@custom:name:model) without collapsing matching model IDs from
+  // different providers.
+  const rawId=String(modelId||'');
+  const prefix=provider?`@${provider}:`:'';
+  if(!prefix||!rawId.toLowerCase().startsWith(prefix)) return false;
+  const routedId=rawId.slice(prefix.length);
+  return (entries||[]).some(entry=>
+    String(entry.providerId||'').toLowerCase()===provider
+    &&_normalizeConfiguredModelKey(entry.value)===_normalizeConfiguredModelKey(routedId)
+  );
+}
+
 function _getConfiguredModelBadge(modelId,badgeMap,providerId){
   const map=badgeMap||window._configuredModelBadges||{};
   if(!modelId||!map) return null;
@@ -2839,6 +4005,35 @@ function syncModelChip(){
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
 
+// Remembers where #composerModelDropdown lives in the composer-footer so the
+// phone path can move it to <body> and put it back exactly. Captured lazily on
+// the first reparent (see _positionModelDropdown phone branch).
+let _modelDropdownHome=null;
+
+// Return the model dropdown into its original .composer-footer slot and clear
+// every inline style the phone path wrote, so the desktop CSS (position:absolute
+// anchored on the relatively-positioned .composer-footer) fully governs again.
+// Safe to call when the element never moved — it just no-ops the reinsert.
+function _restoreModelDropdownHome(){
+  const dd=document.getElementById('composerModelDropdown');
+  if(!dd) return;
+  dd.classList.remove('model-dropdown--floating');
+  dd.style.left='';
+  dd.style.top='';
+  dd.style.bottom='';
+  dd.style.width='';
+  dd.style.maxWidth='';
+  dd.style.maxHeight='';
+  if(_modelDropdownHome&&_modelDropdownHome.parent&&dd.parentNode!==_modelDropdownHome.parent){
+    const ref=_modelDropdownHome.nextSibling;
+    if(ref&&ref.parentNode===_modelDropdownHome.parent){
+      _modelDropdownHome.parent.insertBefore(dd,ref);
+    }else{
+      _modelDropdownHome.parent.appendChild(dd);
+    }
+  }
+}
+
 function _positionModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
@@ -2848,9 +4043,62 @@ function _positionModelDropdown(){
   const panel=$('composerMobileConfigPanel');
   const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:(chip&&chip.offsetParent?chip:mobileAction);
   if(!anchor) return;
-  const chipRect=anchor.getBoundingClientRect();
+  const isPhone=typeof window.matchMedia==='function'&&window.matchMedia('(max-width:640px)').matches;
+  if(isPhone){
+    // #6080: .composer-footer sets container-type:inline-size (and a
+    // backdrop-filter under the Geist Contrast skin) — both establish a fixed
+    // containing block, so a position:fixed dropdown left inside the footer
+    // resolves against the FOOTER (bottom of screen) instead of the viewport
+    // and lands below the fold. Reparent to <body> — exactly the working
+    // #profileDropdown idiom — so position:fixed is viewport-relative on ALL
+    // skins, then compute coordinates against the visual viewport.
+    if(!_modelDropdownHome){
+      _modelDropdownHome={parent:dd.parentNode,nextSibling:dd.nextSibling};
+    }
+    if(dd.parentNode!==document.body) document.body.appendChild(dd);
+    dd.classList.add('model-dropdown--floating');
+    const anchorRect=anchor.getBoundingClientRect();
+    const visualViewport=window.visualViewport;
+    const viewportWidth=Math.max(1,Number(visualViewport&&visualViewport.width)||window.innerWidth||1);
+    const viewportHeight=Math.max(1,Number(visualViewport&&visualViewport.height)||window.innerHeight||1);
+    const viewportTop=Math.max(0,Number(visualViewport&&visualViewport.offsetTop)||0);
+    const viewportBottom=viewportTop+viewportHeight;
+    const margin=8;
+    const gap=6;
+    const viewportLeft=Math.max(0,Number(visualViewport&&visualViewport.offsetLeft)||0);
+    const viewportRight=viewportLeft+viewportWidth;
+    const titlebar=document.querySelector('.app-titlebar');
+    const titlebarBottom=titlebar&&typeof titlebar.getBoundingClientRect==='function'
+      ? Number(titlebar.getBoundingClientRect().bottom)||0
+      : 0;
+    const contentTop=Math.max(viewportTop+margin,titlebarBottom+margin);
+    const menuWidth=Math.max(1,viewportWidth-margin*2);
+    const left=Math.max(viewportLeft+margin,Math.min(anchorRect.left,viewportRight-menuWidth-margin));
+    dd.style.left=`${left}px`;
+    dd.style.width=`${menuWidth}px`;
+    dd.style.maxWidth=`${menuWidth}px`;
+    dd.style.bottom='auto';
+    const menuHeight=Math.max(dd.scrollHeight,dd.offsetHeight);
+    const aboveSpace=Math.max(0,anchorRect.top-contentTop-gap-margin);
+    const belowSpace=Math.max(0,viewportBottom-anchorRect.bottom-gap-margin);
+    const openAbove=aboveSpace>=Math.min(menuHeight,belowSpace)||aboveSpace>=belowSpace;
+    const availableHeight=Math.max(1,openAbove?aboveSpace:belowSpace);
+    dd.style.maxHeight=`${availableHeight}px`;
+    const visibleHeight=Math.min(menuHeight||availableHeight,availableHeight);
+    const top=openAbove
+      ? anchorRect.top-gap-visibleHeight
+      : anchorRect.bottom+gap;
+    dd.style.top=`${Math.max(contentTop,Math.min(top,viewportBottom-margin-visibleHeight))}px`;
+    return;
+  }
+  // Desktop (>640px): keep the current master behaviour — an absolutely
+  // positioned .composer-footer child. Restore the element into the footer (in
+  // case a prior phone open moved it to <body>) and clear the phone inline
+  // styles so the desktop CSS anchor is byte-for-byte identical to master.
+  _restoreModelDropdownHome();
+  const anchorRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
-  let left=chipRect.left-footerRect.left;
+  let left=anchorRect.left-footerRect.left;
   const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
   left=Math.max(0, Math.min(left, maxLeft));
   dd.style.left=`${left}px`;
@@ -3015,9 +4263,21 @@ function _mountSearchableModelSelect(opts={}){
 }
 
 function renderModelDropdown(){
-  const dd=$('composerModelDropdown');
-  const sel=$('modelSelect');
+  const opts=arguments[0]||{};
+  const dd=$(opts.dropdownId||'composerModelDropdown');
+  const sel=$(opts.selectId||'modelSelect');
   if(!dd||!sel) return;
+  if(typeof _deduplicateModelPickerOptions==='function') _deduplicateModelPickerOptions(sel,sel.value);
+  // Whether the search input should auto-grab focus on (re-)render. Default true
+  // preserves the composer picker's behavior exactly; the settings picker passes
+  // false on coarse-pointer devices so opening it doesn't pop the mobile keyboard.
+  const _autoFocusSearch=opts.autoFocusSearch!==false;
+  const selectFromDropdown=typeof opts.selectModel==='function'
+    ? opts.selectModel
+    : (value,provider)=>selectModelFromDropdown(value,provider);
+  const closeDropdown=typeof opts.closeDropdown==='function'
+    ? opts.closeDropdown
+    : closeModelDropdown;
   // Group(s) that must render OPEN even though they aren't the selected group —
   // set when the user expands a group's overflow via "Show more" so a later full
   // re-render doesn't re-collapse it (_groupOpenState is rebuilt per render, so
@@ -3026,8 +4286,10 @@ function renderModelDropdown(){
   // #3691 node test driver evals the function body without module scope).
   const _forceOpenGroups=(()=>{
     const _g=(typeof window!=='undefined')?window:(typeof globalThis!=='undefined'?globalThis:{});
-    if(!_g.__modelGroupForceOpen) _g.__modelGroupForceOpen=new Set();
-    return _g.__modelGroupForceOpen;
+    const key=opts.forceOpenKey||'composer';
+    if(!_g.__modelGroupForceOpenByPicker) _g.__modelGroupForceOpenByPicker={};
+    if(!_g.__modelGroupForceOpenByPicker[key]) _g.__modelGroupForceOpenByPicker[key]=new Set();
+    return _g.__modelGroupForceOpenByPicker[key];
   })();
   const _modelData=[];
   const _groupMeta=new Map();
@@ -3109,9 +4371,8 @@ function renderModelDropdown(){
       _groupMeta.get(groupKey).modelCount++;
     }
   }
-  const _existingConfiguredKeys=new Set(_modelData.map(existing=>_normalizeConfiguredModelKey(existing.value)));
   for(const [modelId,badge] of Object.entries(_badgeMap)){
-    if(_existingConfiguredKeys.has(_normalizeConfiguredModelKey(modelId))) continue;
+    if(_isEquivalentConfiguredModelEntry(modelId,badge,_modelData)) continue;
     _modelData.push({
       value:modelId,
       name:esc(getModelLabel(modelId)),
@@ -3119,12 +4380,11 @@ function renderModelDropdown(){
       group:'',
       badge,
     });
-    _existingConfiguredKeys.add(_normalizeConfiguredModelKey(modelId));
   }
   // Create search input FIRST before filterModels definition
   const _scopeNote=document.createElement('div');
   _scopeNote.className='model-scope-note';
-  _scopeNote.textContent=t('model_scope_advisory')||'Applies to this conversation from your next message.';
+  _scopeNote.textContent=opts.scopeNoteText||(t('model_scope_advisory')||'Applies to this conversation from your next message.');
   const _searchRow=document.createElement('div');
   _searchRow.className='model-search-row';
   _searchRow.innerHTML=`<input class="model-search-input" type="text" placeholder="${esc(t('model_search_placeholder')||'Search models…')}" spellcheck="false" autocomplete="off"><button class="model-search-clear" title="Clear search">${li('x',10)}</button>`;
@@ -3148,6 +4408,15 @@ function renderModelDropdown(){
     }
     return 500;
   };
+  const _selectedModelState=(typeof _modelStateForSelect==='function')?_modelStateForSelect(sel,sel.value):{model:sel&&sel.value||'',model_provider:null};
+  const _modelProviderForSelectedBadge=(m)=>{
+    const _provider=String((m&&m.providerId)||(m&&m.badge&&m.badge.provider)||((typeof _providerFromModelValue==='function')?_providerFromModelValue(m&&m.value):'')||'').trim();
+    return (_provider&&_provider!=='default')?_provider:null;
+  };
+  const _isSelectedModelRow=(m)=>String((m&&m.value)||'')===String((_selectedModelState&&_selectedModelState.model)||(sel&&sel.value)||'')&&String(_modelProviderForSelectedBadge(m)||'')===String((_selectedModelState&&_selectedModelState.model_provider)||'');
+  const _selectedModelBadge=(m)=>_isSelectedModelRow(m)
+    ?`<span class="model-opt-badge model-opt-badge--selected">${esc(t('model_badge_selected')||'Selected')}</span>`
+    :'';
   const _renderProviderEndpointHint=(entry,parent)=>{
     if(!entry||!entry.label||!entry.modelsEndpointError) return;
     const hint=document.createElement('div');
@@ -3157,14 +4426,14 @@ function renderModelDropdown(){
   };
   // Build a single model-option row (mirrors the main render loop's row markup),
   // used both by the main render and by the in-place overflow reveal below.
-  const _buildModelRow=(m,sel,withProviderChip)=>{
+  const _buildModelRow=(m,withProviderChip)=>{
     const row=document.createElement('div');
-    row.className='model-opt'+(m.value===sel.value?' active':'');
+    row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
     const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
     const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
     const providerChip=(_plainGroup&&withProviderChip)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
-    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${_selectedModelBadge(m)}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+    row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
   const _expandOverflowGroup=(groupMetaEntry)=>{
@@ -3188,7 +4457,7 @@ function renderModelDropdown(){
     // expander gone, search term reapplied.
     const _fullReRender=()=>{
       const _term=(_si&&_si.value)||'';
-      renderModelDropdown();
+      renderModelDropdown(opts);
       const ns=dd.querySelector('.model-search-input');
       if(ns){ ns.value=_term; (ns._listeners&&ns._listeners.input)?ns._listeners.input():ns.dispatchEvent(new Event('input')); }
     };
@@ -3217,7 +4486,7 @@ function renderModelDropdown(){
       for(const m of extraModels){
         if(!m||!m.id) continue;
         if(_alreadyShown.has(esc(m.id))) continue;
-        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},$('modelSelect'),false);
+        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},false);
         wrap.insertBefore(row,moreEl);
         if(!firstNewRow) firstNewRow=row;
       }
@@ -3272,21 +4541,25 @@ function renderModelDropdown(){
   const _selectedGroupKey=(()=>{
     const _selVal=String((sel&&sel.value)||'');
     if(!_selVal) return null;
-    const _hit=_modelData.find(m=>m&&!m.endpointErrorOnly&&String(m.value||'')===_selVal);
+    const _hit=_modelData.find(m=>m&&!m.endpointErrorOnly&&_isSelectedModelRow(m)) || _modelData.find(m=>m&&!m.endpointErrorOnly&&String(m.value||'')===_selVal);
     return _hit?_hit.groupKey:null;
   })();
-  const _makeModelRow=(m,sel,shouldRenderHeading)=>{
+  const _makeModelRow=(m,shouldRenderHeading)=>{
     const row=document.createElement('div');
-    row.className='model-opt'+(m.value===sel.value?' active':'');
+    row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
     const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
     const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
     const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
     const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
-    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${_selectedModelBadge(m)}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+    row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
   const _filterModels=(term)=>{
+    // Preserve focus across the re-render if the search input already had it — so a
+    // touch user typing a query (where autoFocusSearch is suppressed to avoid the
+    // initial keyboard pop) doesn't lose focus mid-word on each keystroke re-render.
+    const _hadFocus=(typeof document!=='undefined')&&document.activeElement===_si;
     term=term.trim().toLowerCase();
     const hasSearch=!!term;
     // On a fresh search, expand all groups so every match is visible (#collapse).
@@ -3363,7 +4636,7 @@ function renderModelDropdown(){
       }
       for(const m of configuredModels){
         const row=document.createElement('div');
-        row.className='model-opt'+(m.value===sel.value?' active':'');
+        row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
         let badgeLabel = '';
         let modelName = m.name;
         if (m.badge) {
@@ -3377,8 +4650,8 @@ function renderModelDropdown(){
           }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
-        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-        row.onclick=()=>selectModelFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
+        row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}${_selectedModelBadge(m)}</div><span class="model-opt-id">${esc(m.id)}</span>`;
+        row.onclick=()=>selectFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
         dd.appendChild(row);
       }
     }
@@ -3478,16 +4751,16 @@ function renderModelDropdown(){
               });
               wrapper.appendChild(subHeading);
               wrapper.appendChild(subWrapper);
-              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             } else {
-              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             }
           }
         } else {
-          for(const m of groupRows) wrapper.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+          for(const m of groupRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
         }
       } else {
-        for(const m of groupRows) dd.appendChild(_makeModelRow(m,sel,shouldRenderHeading));
+        for(const m of groupRows) dd.appendChild(_makeModelRow(m,shouldRenderHeading));
       }
       if(!term&&hiddenCount){
         const showAll=document.createElement('div');
@@ -3525,7 +4798,7 @@ function renderModelDropdown(){
       noResult.style.textAlign='center';
       dd.appendChild(noResult);
     }
-    _si.focus();
+    if(_autoFocusSearch||_hadFocus) _si.focus();
   };
   _si.addEventListener('input',()=>_filterModels(_si.value));
   // Keyboard navigation through filtered model rows (#2791).
@@ -3546,7 +4819,7 @@ function renderModelDropdown(){
     if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
   };
   _si.addEventListener('keydown',e=>{
-    if(e.key==='Escape'){closeModelDropdown();return;}
+    if(e.key==='Escape'){closeDropdown();return;}
     if(e.key==='ArrowDown'||e.key==='ArrowUp'||e.key==='Enter'){
       const rows=_visibleModelRows();
       if(!rows.length){if(e.key==='Enter') e.preventDefault();return;}
@@ -3563,9 +4836,9 @@ function renderModelDropdown(){
   _si.addEventListener('click',e=>e.stopPropagation());
   _sc.onclick=()=>{ _si.value=''; _filterModels(''); _si.focus(); };
   _sc.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){ _si.value=''; _filterModels(''); _si.focus(); e.preventDefault(); }});
-  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectModelFromDropdown(v);_ci.value='';};
+  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectFromDropdown(v,null);_ci.value='';};
   _cb.onclick=_applyCustom;
-  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeModelDropdown();}});
+  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeDropdown();}});
   _ci.addEventListener('click',e=>e.stopPropagation());
   dd.appendChild(_scopeNote);
   dd.appendChild(_searchRow);
@@ -3616,6 +4889,8 @@ async function toggleModelDropdown(){
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
+  const activeRow=dd.querySelector('.model-opt.active');
+  if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'nearest'});
   chip.classList.add('active');
   const mobileAction=$('composerMobileModelAction');
   if(mobileAction) mobileAction.classList.add('active');
@@ -3628,6 +4903,106 @@ function closeModelDropdown(){
   if(dd) dd.classList.remove('open');
   if(chip) chip.classList.remove('active');
   if(mobileAction) mobileAction.classList.remove('active');
+  // If the phone path reparented the menu onto <body>, put it back in the
+  // footer and clear the fixed-position inline styles so the DOM returns to its
+  // baseline shape and the next desktop open anchors correctly (#6080).
+  if(typeof _restoreModelDropdownHome==='function') _restoreModelDropdownHome();
+}
+
+function closeSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  const chip=$('settingsModelChip');
+  if(dd) dd.classList.remove('open');
+  if(chip){
+    chip.classList.remove('active');
+    chip.setAttribute('aria-expanded','false');
+  }
+}
+
+function syncSettingsModelChip(){
+  const sel=$('settingsModel');
+  const chip=$('settingsModelChip');
+  if(!sel||!chip) return;
+  const opt=sel.selectedOptions&&sel.selectedOptions[0];
+  const text=(opt&&opt.textContent)||getModelLabel(sel.value||'')||t('settings_label_model')||'Default Model';
+  chip.textContent=text;
+  chip.title=sel.value||text;
+}
+
+function selectSettingsModelFromDropdown(value,preferredProviderId){
+  const sel=$('settingsModel');
+  if(!sel){closeSettingsModelDropdown();return;}
+  const provider=String(preferredProviderId||'').trim()||null;
+  if(typeof _ensureModelOptionInDropdown==='function'){
+    _ensureModelOptionInDropdown(value,sel,provider);
+  }else{
+    sel.value=value;
+    if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
+  }
+  closeSettingsModelDropdown();
+  try{
+    if(typeof Event==='function') sel.dispatchEvent(new Event('change',{bubbles:true}));
+    else if(typeof sel.onchange==='function') sel.onchange();
+  }catch(_){}
+}
+
+function openSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  const sel=$('settingsModel');
+  const chip=$('settingsModelChip');
+  if(!dd||!sel) return;
+  // Auto-focus the search on desktop only. On touch (coarse pointer) grabbing focus
+  // pops the on-screen keyboard the instant the chip is tapped — the composer picker
+  // doesn't do it either, so match that behavior on touch. Computed before render so
+  // renderModelDropdown's own initial focus is suppressed too (not just the outer one).
+  const _coarsePointer=(typeof window.matchMedia==='function')&&window.matchMedia('(pointer: coarse)').matches;
+  renderModelDropdown({
+    dropdownId:'settingsModelDropdown',
+    selectId:'settingsModel',
+    forceOpenKey:'settingsModel',
+    closeDropdown:closeSettingsModelDropdown,
+    selectModel:selectSettingsModelFromDropdown,
+    scopeNoteText:t('settings_desc_model')||'Used for new conversations. Existing conversations keep their selected model.',
+    autoFocusSearch:!_coarsePointer,
+  });
+  dd.classList.add('open');
+  if(chip){
+    chip.classList.add('active');
+    chip.setAttribute('aria-expanded','true');
+  }
+  if(!_coarsePointer){
+    setTimeout(()=>{
+      const input=dd.querySelector('.model-search-input');
+      if(input) input.focus();
+    },0);
+  }
+}
+
+function toggleSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  if(dd&&dd.classList.contains('open')){closeSettingsModelDropdown();return;}
+  openSettingsModelDropdown();
+}
+
+function mountSettingsModelPicker(){
+  const chip=$('settingsModelChip');
+  const sel=$('settingsModel');
+  if(!chip||!sel) return;
+  syncSettingsModelChip();
+  if(!chip._settingsModelPickerBound){
+    chip._settingsModelPickerBound=true;
+    chip.addEventListener('click',e=>{
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSettingsModelDropdown();
+    });
+    chip.addEventListener('keydown',e=>{
+      if(e.key==='Enter'||e.key===' '||e.key==='ArrowDown'){
+        e.preventDefault();
+        toggleSettingsModelDropdown();
+      }
+    });
+  }
 }
 
 document.addEventListener('click',e=>{
@@ -3636,6 +5011,11 @@ document.addEventListener('click',e=>{
     !e.target.closest('#composerMobileModelAction') &&
     !e.target.closest('#composerModelDropdown')
   ) closeModelDropdown();
+  if(
+    !e.target.closest('#settingsModelChip') &&
+    !e.target.closest('#settingsModel') &&
+    !e.target.closest('#settingsModelDropdown')
+  ) closeSettingsModelDropdown();
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
@@ -3647,6 +5027,26 @@ window.addEventListener('resize',()=>{
     _positionReasoningDropdown();
   }
 });
+
+// visualViewport resize/scroll fire on mobile when the on-screen keyboard opens
+// or the URL bar collapses/expands — the phone dropdown is fixed to the visual
+// viewport, so it must be re-measured against the new offsets. Coalesce with rAF
+// so a burst of scroll/resize events triggers at most one reposition per frame.
+let _modelDropdownRepositionScheduled=false;
+function _repositionOpenModelDropdown(){
+  const dd=$('composerModelDropdown');
+  if(!(dd&&dd.classList.contains('open'))||_modelDropdownRepositionScheduled) return;
+  _modelDropdownRepositionScheduled=true;
+  requestAnimationFrame(()=>{
+    _modelDropdownRepositionScheduled=false;
+    const openDd=$('composerModelDropdown');
+    if(openDd&&openDd.classList.contains('open')) _positionModelDropdown();
+  });
+}
+if(window.visualViewport){
+  window.visualViewport.addEventListener('resize',_repositionOpenModelDropdown);
+  window.visualViewport.addEventListener('scroll',_repositionOpenModelDropdown);
+}
 
 // ── Fit-based composer footer collapse ──────────────────────────────────────
 // Stage classes on .composer-footer:
@@ -3729,6 +5129,11 @@ if(document.readyState==='loading'){
 // ── Reasoning effort chip ────────────────────────────────────────────────────
 let _currentReasoningEffort=null;
 let _currentReasoningEffortsSupported=null;
+// Whether the model accepts the thinking on/off toggle when supported_efforts
+// is empty (GLM-4.5–5.1 on native zai). Undefined = unknown, treated as true
+// so the chip stays visible by default (prior behavior).
+let _currentReasoningToggleSupported=undefined;
+let _profileTransitionReasoningContext=null;
 
 function _normalizeReasoningEffort(eff){
   return String(eff||'').trim().toLowerCase();
@@ -3742,10 +5147,19 @@ function _formatReasoningEffortLabel(effort){
   if(effort==='medium') return 'Medium';
   if(effort==='high') return 'High';
   if(effort==='xhigh') return 'XHigh';
+  if(effort==='max') return 'Max';
   return effort.charAt(0).toUpperCase()+effort.slice(1);
 }
 
 function _reasoningEffortContext(){
+  const transition=_profileTransitionReasoningContext;
+  const session=S&&S.session;
+  if(transition&&(!session||session.profile!==transition.profile)){
+    const ctx={};
+    if(transition.model) ctx.model=transition.model;
+    if(transition.provider) ctx.provider=transition.provider;
+    return ctx;
+  }
   const sel=$('modelSelect');
   const model=(S&&S.session&&S.session.model)||(sel&&sel.value)||'';
   let provider=(S&&S.session&&S.session.model_provider)||'';
@@ -3770,7 +5184,14 @@ function _applyReasoningOptions(supportedEfforts){
   const supported=new Set(Array.isArray(supportedEfforts)?supportedEfforts:[]);
   dd.querySelectorAll('.reasoning-option').forEach(function(opt){
     const effort=opt.dataset.effort;
-    if(effort==='none'){
+    // 'none' (turn thinking off) and '' (Default = clear override, provider
+    // default = thinking on) are meta-options outside the effort ladder. They
+    // are always shown so a thinking-toggle-only model (GLM-4.5–5.1 on native
+    // zai, where the ladder is empty) still has an operable two-state control:
+    // Default (on) + None (off). Without the Default option the toggle is
+    // one-way off-only — the user can disable thinking but cannot re-enable it.
+    // (#6219 round-3)
+    if(effort==='none'||effort===''){
       opt.style.display='';
       return;
     }
@@ -3789,6 +5210,15 @@ function _applyReasoningChip(eff){
   if(meta&&Array.isArray(meta.supported_efforts)){
     _currentReasoningEffortsSupported=meta.supported_efforts;
   }
+  // supports_thinking_toggle: the model accepts the thinking on/off toggle even
+  // when the effort ladder is empty (GLM-4.5–5.1 on native zai accept
+  // `thinking: {"type": ...}` but NOT `reasoning_effort`). Without honoring this
+  // flag, returning an empty supported_efforts hides the entire chip and
+  // silently regresses the working thinking on/off control for those models.
+  // Default true preserves prior behavior when the field is absent.
+  if(meta&&typeof meta.supports_thinking_toggle==='boolean'){
+    _currentReasoningToggleSupported=meta.supports_thinking_toggle;
+  }
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
   const chip=$('composerReasoningChip');
@@ -3798,9 +5228,15 @@ function _applyReasoningChip(eff){
   const supportedEfforts=(typeof _currentReasoningEffortsSupported==='undefined')
     ?null
     :_currentReasoningEffortsSupported;
-  const supports=Array.isArray(supportedEfforts)
+  const toggleSupported=(typeof _currentReasoningToggleSupported==='undefined')
+    ?true
+    :_currentReasoningToggleSupported;
+  const hasEffortLadder=Array.isArray(supportedEfforts)
     ?supportedEfforts.length>0
     :true;
+  // Show the chip if there is an effort ladder OR a thinking toggle is still
+  // available. Only hide when the model supports neither.
+  const supports=hasEffortLadder||toggleSupported;
   if(!supports){
     wrap.style.display='none';
     if(mobileAction) mobileAction.style.display='none';
@@ -3835,11 +5271,11 @@ let _lastReasoningFetchKey=null;
 // a different agent.reasoning_effort) — #4650 review.
 let _reasoningFetchSeq=0;
 
-function fetchReasoningChip(){
+function fetchReasoningChip(keyOverride){
   // Set the cache key OPTIMISTICALLY before the request so rapid routine syncs
   // while this GET is in flight short-circuit instead of re-dispatching (that
   // in-flight window is exactly where the #4650 storm lived).
-  const key=_reasoningEffortQuery();
+  const key=keyOverride===undefined?_reasoningEffortQuery():keyOverride;
   const seq=++_reasoningFetchSeq;
   _lastReasoningFetchKey=key;
   api('/api/reasoning'+key).then(function(st){
@@ -3853,8 +5289,26 @@ function fetchReasoningChip(){
     // routine syncs retry after a genuine transient failure.
     if(seq!==_reasoningFetchSeq) return;
     _lastReasoningFetchKey=null;
-    _applyReasoningChip('', {supported_efforts:[]});
+    _applyReasoningChip('', {supported_efforts:[], supports_thinking_toggle:false});
   });
+}
+
+function refreshProfileTransitionReasoningChip(model, provider){
+  _profileTransitionReasoningContext={profile:(S&&S.activeProfile)||'default',model,provider};
+  _currentReasoningEffort=null;
+  _currentReasoningEffortsSupported=null;
+  _currentReasoningToggleSupported=undefined;
+  _lastReasoningFetchKey=null;
+  ++_reasoningFetchSeq;
+  _applyReasoningChip('', {supported_efforts:[], supports_thinking_toggle:false});
+  const params=new URLSearchParams();
+  if(model) params.set('model',model);
+  if(provider) params.set('provider',provider);
+  fetchReasoningChip(params.size?'?'+params.toString():undefined);
+}
+
+function clearProfileTransitionReasoningContext(){
+  _profileTransitionReasoningContext=null;
 }
 
 function syncReasoningChip(){
@@ -3941,12 +5395,19 @@ document.addEventListener('click',function(e){
   if(e.target.closest('.reasoning-option')){
     const opt=e.target.closest('.reasoning-option');
     const effort=opt&&opt.dataset.effort;
-    if(effort){
+    // NOTE: effort may be the empty string for the "Default" option (clears
+    // the override). Check option presence, not truthiness — `if(effort)` would
+    // silently ignore the Default click and leave the toggle one-way off-only.
+    // (#6219 round-3)
+    if(opt){
       const payload=Object.assign({effort:effort},_reasoningEffortContext());
       api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
         .then(function(st){
+          // For Default (effort=''), the returned reasoning_effort is '' (clear)
+          // — display 'Default' rather than an empty toast.
+          const display=(st&&st.reasoning_effort)||effort||'Default';
           _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
-          showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort));
+          showToast('🧠 Reasoning effort set to '+display);
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();
@@ -4379,11 +5840,119 @@ window.addEventListener('resize',function(){
 // Any manual scroll up sets a sticky unpinned flag until the user scrolls back
 // to the bottom (near-bottom hysteresis on downward motion) or clicks ↓.
 // Programmatic scrolls are ignored via _programmaticScroll. Fixes #1469 / #1360 / #1731.
+// #6606 ownership: ui.js/messages.js load before boot.js, and boot.js only
+// assigns window._autoScrollFollow after its awaited settings request. Every
+// consumer in this file (scroll listener, settle paths, scrollIfPinned,
+// DOM-replace gate) can run before that assignment — a bare read would throw
+// ReferenceError. Establish the default synchronously here (single owner);
+// boot.js overwrites it with the saved setting after hydration. The typeof
+// guard preserves an explicit saved `false` if boot.js already ran.
+if(typeof window._autoScrollFollow==='undefined'){ window._autoScrollFollow=true; }
 let _scrollPinned=true;
 let _programmaticScroll=false;
 let _programmaticScrollSetAt=0;
 let _programmaticScrollResetTimer=0;
+const PROGRAMMATIC_SCROLL_VALID_MS=150;
+function _freshProgrammaticScrollActive(){
+  if(!_programmaticScroll) return false;
+  const age=performance.now()-_programmaticScrollSetAt;
+  if(!Number.isFinite(age)||age<0||age>PROGRAMMATIC_SCROLL_VALID_MS){
+    _programmaticScroll=false;
+    return false;
+  }
+  return true;
+}
 function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
+let _messageJumpScrollGeneration=0;
+let _messageJumpScrollOwner=null;
+let _messageJumpScrollSettleTimer=0;
+function _messageJumpSessionId(){
+  if(typeof S!=='undefined'&&S.session&&S.session.session_id) return String(S.session.session_id);
+  return '';
+}
+function _scheduleMessageJumpScrollReconcile(generation,ms){
+  if(!_messageJumpScrollOwner||_messageJumpScrollOwner.generation!==generation) return;
+  clearTimeout(_messageJumpScrollSettleTimer);
+  _messageJumpScrollSettleTimer=setTimeout(()=>_finishMessageJumpScroll(generation),ms||220);
+}
+function _beginMessageJumpScroll(container){
+  const previous=_messageJumpScrollOwner;
+  const preserved=previous?previous.preserved:{
+    scrollPinned:_scrollPinned,
+    messageUserUnpinned:_messageUserUnpinned,
+    nearBottomCount:_nearBottomCount,
+  };
+  clearTimeout(_messageJumpScrollSettleTimer);
+  const generation=++_messageJumpScrollGeneration;
+  _messageJumpScrollOwner={generation,container,sessionId:_messageJumpSessionId(),preserved};
+  // While the jump owner is active, temporarily release the reader pin so a
+  // live token arriving between smooth-scroll frames cannot let scrollIfPinned()
+  // reclaim the bottom and snap the reader off the jump target (#6621). The
+  // preserved snapshot above is what _finishMessageJumpScroll() reconciles
+  // against once the jump settles.
+  _scrollPinned=false;
+  _messageUserUnpinned=true;
+  _nearBottomCount=0;
+  _programmaticScroll=true;
+  _programmaticScrollSetAt=performance.now();
+  _scheduleMessageJumpScrollReconcile(generation,300);
+  return generation;
+}
+function _finishMessageJumpScroll(generation){
+  const owner=_messageJumpScrollOwner;
+  if(!owner||owner.generation!==generation) return;
+  if(owner.sessionId!==_messageJumpSessionId()){
+    _cancelMessageJumpScroll();
+    return;
+  }
+  clearTimeout(_messageJumpScrollSettleTimer);
+  _messageJumpScrollSettleTimer=0;
+  const container=owner.container;
+  const maxTop=Math.max(0,container.scrollHeight-container.clientHeight);
+  const top=Math.max(0,Math.min(Number(container.scrollTop)||0,maxTop));
+  const bottomDistance=maxTop-top;
+  if(bottomDistance>80){
+    _scrollPinned=false;
+    _messageUserUnpinned=true;
+    _nearBottomCount=0;
+  }else{
+    _scrollPinned=owner.preserved.scrollPinned;
+    _messageUserUnpinned=owner.preserved.messageUserUnpinned;
+    _nearBottomCount=owner.preserved.nearBottomCount;
+  }
+  _lastScrollTop=container.scrollTop;
+  _lastMessageClientHeight=container.clientHeight;
+  _messageJumpScrollOwner=null;
+  _programmaticScroll=false;
+  if(typeof _syncScrollToBottomCue==='function'){
+    _syncScrollToBottomCue(!_scrollPinned&&bottomDistance>80,{newMessage:_newMessageCueVisible});
+  }
+  if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
+  // An external-session refresh deferred while the reader was temporarily
+  // unpinned for the jump window (#6621) would otherwise stay stranded once the
+  // near-tail reconciliation restores follow mode. Flush it when the terminal
+  // state is genuinely pinned to the tail.
+  if(_scrollPinned&&!_messageUserUnpinned&&typeof _flushDeferredActiveSessionExternalRefresh==='function'){
+    _flushDeferredActiveSessionExternalRefresh();
+  }
+}
+function _cancelMessageJumpScroll(){
+  ++_messageJumpScrollGeneration;
+  clearTimeout(_messageJumpScrollSettleTimer);
+  _messageJumpScrollSettleTimer=0;
+  // _beginMessageJumpScroll temporarily unpins the reader for the ownership
+  // window (#6621); a cancel that isn't a reconcile must put the pre-jump pin
+  // state back, or the transient unpinned state would leak. Callers that want a
+  // different terminal pin state (e.g. scrollToBottom) set it right after this.
+  const owner=_messageJumpScrollOwner;
+  if(owner&&owner.preserved){
+    _scrollPinned=owner.preserved.scrollPinned;
+    _messageUserUnpinned=owner.preserved.messageUserUnpinned;
+    _nearBottomCount=owner.preserved.nearBottomCount;
+  }
+  _messageJumpScrollOwner=null;
+  _programmaticScroll=false;
+}
 let _nearBottomCount=0;
 let _lastScrollTop=null;
 let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore iOS portrait toolbar-settle reflows (a clientHeight increase fires a scroll event with decreased scrollTop that is NOT a user scroll)
@@ -4396,6 +5965,9 @@ let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore i
 // window after load as suppressed.
 let _lastNonMessageScrollIntentMs=-Infinity;
 let _messageUserUnpinned=false;
+// A monotonic ownership token lets delayed restores distinguish reader input
+// that happened after a snapshot from input that merely happened recently.
+let _messageScrollInputGeneration=0;
 let _bottomSettleToken=0;
 let _settleRAF=0;
 let _settleRO=null;
@@ -4426,7 +5998,7 @@ let _lastMessageRenderAt=-Infinity;
 function _recentMessageRenderArtifactWindow(ms){
   return performance.now()-_lastMessageRenderAt<(ms||1400);
 }
-function _cancelBottomSettle(){ _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); }
+function _cancelBottomSettle(){ _cancelMessageJumpScroll(); _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); }
 function _markMessageTouchScrollIntent(active=true){
   _messageTouchScrollActive=!!active;
   _lastMessageTouchScrollIntentMs=performance.now();
@@ -4479,21 +6051,35 @@ function _recordNonMessageScrollIntent(e){
   const target=e&&e.target;
   if(!el||!target) return;
   if(!el.contains(target)){ _lastNonMessageScrollIntentMs=performance.now(); return; }
-  // #4970: record ANY upward message-pane wheel motion as recent wheel intent,
-  // including gentle low-delta trackpad wheels (e.g. deltaY:-5) that never reach
-  // the decisive -30 sticky-unpin threshold below. The post-render artifact
-  // suppression consults _recentMessageWheelIntent() so it cannot swallow a real
-  // gentle scroll-up. This does NOT unpin on its own — only the <-30 branch and
-  // the scroll listener's movedUp branch flip _messageUserUnpinned.
+  // Capture the guards before cancelling the active owner: cancellation clears
+  // the programmatic flag and jump owner, but a low-delta upward wheel must still
+  // count as reader takeover when it interrupted an owned scroll.
+  const wheelUp=typeof e.deltaY==='number'&&e.deltaY<0;
+  const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
+  const jumpScrollOwned=typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
-    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
-    if(bottomDistance>120) _lastMessageScrollIntentMs=performance.now();
+    if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+    if(jumpScrollOwned||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
+      if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
+    }
+  }
+  // Any message-pane scroll input that interrupts an active jump owner is a
+  // reader takeover, regardless of direction or the programmatic-latch age
+  // (#6621): _cancelBottomSettle above restores the pre-jump snapshot, so
+  // without this a gentle wheel-up OR wheel-down (or a touch scroll) after the
+  // latch expires would leave the reader pinned and let the next token snap to
+  // the bottom. Establish the unpinned reader-owned state explicitly; a reader
+  // who wants the bottom re-pins by reaching it (<=80px) or pressing End.
+  if(jumpScrollOwned&&(wheelUp||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0))){
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
   }
   if(typeof e.deltaY==='number'&&e.deltaY<0) _lastMessageWheelIntentMs=performance.now();
-  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)){
-    _cancelBottomSettle();
+  // Keep e.deltaY< -30 as the ordinary direct sticky-unpin threshold.
+  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
     if(e.type==='touchmove') _markMessageTouchScrollIntent(true);
-    if(typeof e.deltaY==='number'&&e.deltaY< -30){
+    if((typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
       _messageUserUnpinned=true;
       _nearBottomCount=0;
       _scrollPinned=false;
@@ -4510,6 +6096,19 @@ function _recordNonMessageScrollIntent(e){
         _scrollPinned=false;
       }
     }
+  }
+  // #4970: record ANY upward message-pane wheel motion as recent wheel intent,
+  // including gentle low-delta trackpad wheels (e.g. deltaY:-5) that never reach
+  // the decisive -30 sticky-unpin threshold below. The post-render artifact
+  // suppression consults _recentMessageWheelIntent() so it cannot swallow a real
+  // gentle scroll-up. Ordinarily this does NOT unpin on its own: the <-30 branch
+  // and the scroll listener's movedUp branch remain the stable threshold. The
+  // exception is an active programmatic-scroll guard. That guard returns before
+  // its listener can see the native scroll event, so even a small capture-phase
+  // upward wheel input must immediately stop live-tail follow (#6414).
+  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
+    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+    if(bottomDistance>120) _lastMessageScrollIntentMs=performance.now();
   }
 }
 function _recentNonMessageScrollIntent(){
@@ -4570,6 +6169,7 @@ if(typeof document!=='undefined'){
 // prevent the new chat's first scroll comparing against the previous chat's
 // scrollTop (Opus stage-302 SHOULD-FIX, #1731 follow-up).
 function _resetScrollDirectionTracker(){
+  _cancelMessageJumpScroll();
   _clearNewMessageScrollCue();
   _lastScrollTop=null;
   _lastMessageClientHeight=null;
@@ -4591,6 +6191,11 @@ function _resetScrollDirectionTracker(){
   _deferredOlderMessagesTimer=0;
 }
 function _resetStreamScrollFollow(){
+  // Cancel any in-flight jump owner FIRST: a new stream is a definitive
+  // pin-to-follow, and _cancelMessageJumpScroll() restores the pre-jump snapshot
+  // (#6621), so it must run BEFORE the pinned-state assignments below or it would
+  // undo them and silently disable auto-follow for the new stream.
+  _cancelBottomSettle();
   _clearNewMessageScrollCue();
   _messageUserUnpinned=false;
   _scrollPinned=true;
@@ -4603,7 +6208,6 @@ function _resetStreamScrollFollow(){
   _lastMessageScrollIntentMs=-Infinity;
   // #4970 review (greptile P1): same hygiene for keyboard scroll intent.
   _lastMessageKeyScrollIntentMs=-Infinity;
-  _cancelBottomSettle();
 }
 if(typeof window!=='undefined'){
   window._resetScrollDirectionTracker=_resetScrollDirectionTracker;
@@ -4682,7 +6286,11 @@ if(typeof window!=='undefined'){
   const el=document.getElementById('messages');
   if(!el) return;
   el.addEventListener('pointerdown',(e)=>{
-    if(e.target===el&&e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
+    if(e.target===el&&e.offsetX>=el.clientWidth){
+      if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
+      _scrollbarDragActive=true;
+      if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+    }
   },{passive:true});
   window.addEventListener('pointerup',()=>{
     if(!_scrollbarDragActive) return;
@@ -4727,7 +6335,9 @@ if(typeof window!=='undefined'){
     // Count only when the message pane itself is the scroll target: it is focused,
     // contains the focus, or the pointer is over it (keyboard scroll w/o focus).
     if(a===el||el.contains(a)||el.matches(':hover')){
+      if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       const now=performance.now();
+      if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
       _lastMessageKeyScrollIntentMs=now;
       const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
       if(bottomDistance>120) _lastMessageScrollIntentMs=now;
@@ -4736,8 +6346,11 @@ if(typeof window!=='undefined'){
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
     _scheduleMessageVirtualizedRender();
-    if(_programmaticScroll&&(performance.now()-_programmaticScrollSetAt)>150) _programmaticScroll=false;
-    if(_programmaticScroll) return;
+    if(_messageJumpScrollOwner){
+      _scheduleMessageJumpScrollReconcile(_messageJumpScrollOwner.generation);
+      return;
+    }
+    if(_freshProgrammaticScrollActive()) return;
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
@@ -4795,6 +6408,10 @@ if(typeof window!=='undefined'){
       }else if(movedDown&&nearBottom){
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
+          // Only re-pin when the reader has genuinely reached the true bottom
+          // tail (<=80px). nearBottom spans a ~250px band, so proximity alone
+          // must NOT clear the sticky unpin flag (#4295) — a reader scanning the
+          // last lines mid-stream would otherwise get yanked back to the bottom.
           if(!_messageUserUnpinned||bottomDistance<=80){
             _messageUserUnpinned=false;
             _scrollPinned=true;
@@ -4805,7 +6422,7 @@ if(typeof window!=='undefined'){
         if(nearBottom){
           _nearBottomCount=_nearBottomCount+1;
           if(_nearBottomCount>=2){_scrollPinned=true;_nearBottomCount=0;}
-        }else if(!movedUp && _autoScrollFollow && _scrollPinned){
+        }else if(!movedUp && window._autoScrollFollow && _scrollPinned){
           // Content-grew-beneath-a-pinned-viewport case (NOT a user scroll-away).
           // During streaming on a tall transcript (esp. mobile, where chunks land
           // fast), new content increases scrollHeight under a stationary viewport,
@@ -4949,6 +6566,136 @@ function _activityClockLabel(ts){
   const stamp=Number(ts||_activityNowSeconds());
   if(!Number.isFinite(stamp)||stamp<=0)return'';
   try{return new Date(stamp*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}catch(_){return'';}
+}
+// Full date+time label for the worklog event-time tooltip (title attr). Guards the
+// same valid-Date range as _timestampSeconds so a bad epoch never yields "Invalid
+// Date" in the tooltip. (#5739)
+function _activityFullClockLabel(ts){
+  const stamp=Number(ts);
+  if(!Number.isFinite(stamp)||stamp<=0||stamp>8.64e12)return'';
+  try{
+    const d=new Date(stamp*1000);
+    if(isNaN(d.getTime()))return'';
+    return d.toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  }catch(_){return'';}
+}
+function _timestampSeconds(value){
+  if(value===undefined||value===null||value==='') return null;
+  if(value instanceof Date){
+    const stamp=value.getTime()/1000;
+    return (Number.isFinite(stamp)&&stamp>0&&Math.abs(stamp)<=8.64e12)?stamp:null;
+  }
+  const numeric=Number(value);
+  if(Number.isFinite(numeric)&&numeric>0){
+    const stamp=numeric>1e12?numeric/1000:numeric;
+    // Reject epochs outside JavaScript's valid Date range (±8.64e15 ms = ±8.64e12 s);
+    // otherwise new Date(stamp*1000) yields "Invalid Date" and renders literally
+    // (e.g. a garbage numeric timestamp like 1e20 passes finite/>0). (#5739 gate.)
+    return (Number.isFinite(stamp)&&stamp>0&&stamp<=8.64e12)?stamp:null;
+  }
+  if(typeof value==='string'){
+    const text=value.trim();
+    if(!text||/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(text)) return null;
+    const parsed=Date.parse(text);
+    if(Number.isFinite(parsed)&&parsed>0){
+      const stamp=parsed/1000;
+      return stamp<=8.64e12?stamp:null;
+    }
+  }
+  return null;
+}
+function _firstValidTimestampSeconds(...values){
+  for(const value of values){
+    const stamp=_timestampSeconds(value);
+    if(stamp) return stamp;
+  }
+  return null;
+}
+function _transparentEventTimestampSeconds(row, opts){
+  opts=opts||{};
+  for(const key of ['ts','timestamp','created_at']){
+    const stamp=_timestampSeconds(opts[key]);
+    if(stamp) return stamp;
+  }
+  const toolCall=opts.toolCall||row&&row._tcData||null;
+  if(toolCall&&typeof toolCall==='object'){
+    for(const key of ['ts','timestamp','created_at','started_at','completed_at']){
+      const stamp=_timestampSeconds(toolCall[key]);
+      if(stamp) return stamp;
+    }
+  }
+  if(row&&typeof row.getAttribute==='function'){
+    for(const key of ['data-event-at','data-activity-at']){
+      const stamp=_timestampSeconds(row.getAttribute(key));
+      if(stamp) return stamp;
+    }
+  }
+  if(opts.live===true) return _activityNowSeconds();
+  return null;
+}
+function _syncTransparentEventTimestamp(row, header, opts){
+  if(!row||!header) return null;
+  opts=opts||{};
+  const showEventTimestamp=!(typeof window!=='undefined'&&window._transparentEventTimestamps===false);
+  const live=opts.live===true||row.getAttribute&&(
+    row.getAttribute('data-live-tid')==='1'||
+    row.getAttribute('data-live-thinking')==='1'||
+    row.getAttribute('data-live-assistant')==='1'||
+    row.getAttribute('data-live-stream-owned')==='1'
+  );
+  const explicitTs=_firstValidTimestampSeconds(opts.ts, opts.timestamp, opts.created_at);
+  const toolCall=opts.toolCall||row&&row._tcData||null;
+  const toolTs=toolCall&&typeof toolCall==='object'
+    ? _firstValidTimestampSeconds(
+      toolCall.ts,
+      toolCall.timestamp,
+      toolCall.created_at,
+      toolCall.started_at,
+      toolCall.completed_at
+    )
+    : null;
+  const attrTs=row&&typeof row.getAttribute==='function'
+    ? _firstValidTimestampSeconds(
+      row.getAttribute('data-event-at'),
+      row.getAttribute('data-activity-at')
+    )
+    : null;
+  const ts=explicitTs||toolTs||attrTs||(live?_activityNowSeconds():null);
+  const label=ts?_activityClockLabel(ts):'';
+  let timeEl=header.querySelector('.transparent-event-time');
+  if(!label){
+    if(timeEl) timeEl.remove();
+    row.removeAttribute('data-event-at');
+    row.removeAttribute('data-event-at-source');
+    return null;
+  }
+  const source=explicitTs||toolTs||attrTs?'event':'live';
+  row.setAttribute('data-event-at',String(ts));
+  row.setAttribute('data-event-at-source',source);
+  if(!showEventTimestamp){
+    if(timeEl) timeEl.remove();
+    return null;
+  }
+  if(!timeEl){
+    timeEl=document.createElement('span');
+    timeEl.className='transparent-event-time';
+  }
+  timeEl.textContent=label;
+  // Full date+time tooltip: the bare clock label is date-ambiguous when a settled
+  // session is reviewed days later (or a run crosses midnight), and timing is the
+  // whole point of this label. (#5739 Fable UX fix.)
+  const fullLabel=_activityFullClockLabel(ts);
+  if(fullLabel) timeEl.setAttribute('title',fullLabel); else timeEl.removeAttribute('title');
+  timeEl.setAttribute('data-event-at',String(ts));
+  timeEl.setAttribute('data-event-at-source',source);
+  const anchor=header.querySelector('.transparent-event-status,.thinking-card-btn-row,.tool-card-toggle,.thinking-card-toggle');
+  if(timeEl.parentNode!==header){
+    if(anchor&&anchor.parentNode===header) header.insertBefore(timeEl,anchor);
+    else header.appendChild(timeEl);
+  }else if(anchor&&timeEl.nextSibling!==anchor){
+    header.insertBefore(timeEl,anchor);
+  }
+  return timeEl;
 }
 function _activityStatusNode({kind='info',label='',detail='',status='done',ts=null,id=''}){
   const row=document.createElement('div');
@@ -5142,6 +6889,9 @@ function _mergeUsageForCtxIndicator(latest, fallback){
       merged[field]=fallbackObj[field];
     }
   }
+  if(!Object.hasOwn(latestObj,'post_compression_context_tokens_estimate')&&fallbackObj.post_compression_context_tokens_estimate!=null){
+    merged.post_compression_context_tokens_estimate=fallbackObj.post_compression_context_tokens_estimate;
+  }
   return merged;
 }
 
@@ -5162,7 +6912,10 @@ function _syncCtxIndicator(usage){
   // nonsense percentage (often >100%) on long sessions.  When we have no
   // last-prompt data we render "·" + "tokens used" via the !hasPromptTok
   // branch below — honest "no data" instead of misleading "890% used".
+  const postCompressionEstimate=Number(usage.post_compression_context_tokens_estimate)||0;
+  const hasPostCompressionEstimate=postCompressionEstimate>0;
   const promptTok=usage.last_prompt_tokens||0;
+  const contextPromptTok=hasPostCompressionEstimate?postCompressionEstimate:promptTok;
   const totalTok=(usage.input_tokens||0)+(usage.output_tokens||0);
   const cacheReadTok=usage.cache_read_tokens||0;
   const cacheWriteTok=usage.cache_write_tokens||0;
@@ -5182,8 +6935,9 @@ function _syncCtxIndicator(usage){
     wrap.removeAttribute('aria-hidden');
     wrap.style.display='';
   }
-  const hasPromptTok=!!promptTok;
-  const rawPct=hasPromptTok?Math.round((promptTok/ctxWindow)*100):0;
+  let hasPromptTok=!!promptTok;
+  if(hasPostCompressionEstimate) hasPromptTok=true;
+  const rawPct=hasPromptTok?Math.round((contextPromptTok/ctxWindow)*100):0;
   const pct=Math.min(100,rawPct);
   const overflowed=rawPct>100;
   const ring=$('ctxRingValue');
@@ -5211,13 +6965,14 @@ function _syncCtxIndicator(usage){
   _setCtxCompressButton(compressBtn,compressText);
   const cacheHitPct=usage.cache_hit_percent;
   const cacheText=cacheHitPct!=null?t('usage_cache_hit_detail',cacheHitPct,_fmtTokens(cacheReadTok),_fmtTokens(cacheWriteTok)):'';
-  let label=hasPromptTok?`Context window ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
+  const contextLabel=hasPostCompressionEstimate?'Estimated next model context':'Context window';
+  let label=hasPromptTok?`${contextLabel} ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
   if(!hasExplicitCtx&&hasPromptTok) label+=' (est. 128K)';
   if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
   if(cacheText) label+=` \u00b7 ${cacheText}`;
   el.setAttribute('aria-label',label);
-  const usageText=hasPromptTok?(overflowed?`${rawPct}% used (context exceeded)`:`${pct}% used (${100-pct}% left)`):`${_fmtTokens(totalTok)} tokens used`;
-  const tokensText=hasPromptTok?`${_fmtTokens(promptTok)} / ${_fmtTokens(ctxWindow)} tokens used`:`In: ${_fmtTokens(usage.input_tokens||0)} \u00b7 Out: ${_fmtTokens(usage.output_tokens||0)}`;
+  const usageText=hasPromptTok?(overflowed?`${contextLabel}: ${rawPct}% used (context exceeded)`:`${contextLabel}: ${pct}% used (${100-pct}% left)`):`${_fmtTokens(totalTok)} tokens used`;
+  const tokensText=hasPromptTok?`${contextLabel}: ${_fmtTokens(contextPromptTok)} / ${_fmtTokens(ctxWindow)} tokens used`:`In: ${_fmtTokens(usage.input_tokens||0)} \u00b7 Out: ${_fmtTokens(usage.output_tokens||0)}`;
   if(usageLine) usageLine.textContent=usageText;
   if(tokensLine) tokensLine.textContent=tokensText;
   const threshold=usage.threshold_tokens||0;
@@ -5317,12 +7072,32 @@ function _messageBottomDistance(){
   if(!el) return 0;
   return el.scrollHeight-el.scrollTop-el.clientHeight;
 }
+// #5514/#5515: when the composer grows (typing multiple rows, Shift+Enter, a
+// multi-line paste / WisprFlow), the flex:1 `.messages` viewport shrinks by the
+// same delta. A reader pinned to the bottom is then stranded Δpx above it — the
+// transcript appears to "scroll up" one row per composer row, and (the #5515
+// half) it reads as a random upward jump during normal use. autoResize() only
+// resized the textarea; nothing re-pinned the transcript. Re-pin the bottom, but
+// ONLY when the reader is genuinely still pinned (sticky-unpin model: honor
+// _messageUserUnpinned so we never yank a reader who scrolled away, and never
+// fight a stream that already unpinned). Cheap no-op when not pinned.
+function _repinMessagesAfterComposerResize(){
+  if(_messageUserUnpinned || !_scrollPinned) return;
+  const el=$('messages');
+  if(!el) return;
+  // Already at/very near the bottom? nothing to do (avoids needless writes while
+  // idle-reading a short conversation that isn't scrollable).
+  if(_messageBottomDistance()<=1) return;
+  if(typeof _setMessageScrollToBottom==='function') _setMessageScrollToBottom();
+  else { el.scrollTop=el.scrollHeight; }
+}
+if(typeof window!=='undefined') window._repinMessagesAfterComposerResize=_repinMessagesAfterComposerResize;
 function _shouldFollowMessagesOnDomReplace(){
   // Final stream settlement replaces the live DOM with persisted messages. Keep
   // following only for users who are still pinned or effectively at the tail.
   // A broad near-bottom window causes long answers/mobile readers who scroll up
   // a little to read mid-stream to get snapped back to the bottom on completion.
-  return _autoScrollFollow && !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(120));
+  return window._autoScrollFollow && !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(120));
 }
 function _followMessagesAfterDomReplace(){
   if(_shouldFollowMessagesOnDomReplace()){
@@ -5372,7 +7147,7 @@ function _settleMessageScrollToBottom(force, explicit){
   // active one that may now be in the global _settleRO. (Codex review #3.)
   const ro=new ResizeObserver(()=>{
     if(token!==_bottomSettleToken){ ro.disconnect(); if(_settleRO===ro) _settleRO=null; return; }
-    if((!_autoScrollFollow&&!explicit)||!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent()){
+    if((!window._autoScrollFollow&&!explicit)||!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent()){
       ro.disconnect(); if(_settleRO===ro) _settleRO=null;
       _programmaticScroll=false;
       return;
@@ -5411,7 +7186,7 @@ function _settleMessageScrollToBottom(force, explicit){
   _settleFinalTimer=setTimeout(()=>{
     if(token!==_bottomSettleToken) return;
     ro.disconnect(); if(_settleRO===ro) _settleRO=null;
-    if((!_autoScrollFollow&&!explicit)||!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent()){ _programmaticScroll=false; return; }
+    if((!window._autoScrollFollow&&!explicit)||!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent()){ _programmaticScroll=false; return; }
     _settleFinalScroll(token);
   },2000);
 }
@@ -5432,14 +7207,43 @@ function _settleFinalScroll(token){
   _deferClearProgrammaticScroll();
 }
 function scrollIfPinned(){
-  if(!_autoScrollFollow) return;
-  if(_messageUserUnpinned) return;
+  if(!window._autoScrollFollow) return;
+  // A jump-to-question owner is mid-flight: it deliberately holds the reader at
+  // the jump target across smooth-scroll frames, so never let a live token
+  // reclaim the bottom while it is active (#6621). _finishMessageJumpScroll()
+  // reconciles the pin state once the jump settles.
+  if(typeof _messageJumpScrollOwner!=='undefined'&&_messageJumpScrollOwner) return;
+  if(_messageUserUnpinned){
+    // Only scrollToBottom() cleared this flag, so one scroll-up permanently
+    // killed auto-follow. Re-pin ONLY when the reader has genuinely returned to
+    // the true bottom tail (<=80px), NOT on mere near-bottom proximity — the
+    // #4295 invariant is that proximity alone (inside the ~250px band) must not
+    // re-pin, or a reader scanning the last few lines gets yanked to the bottom
+    // mid-stream. Also bail on ANY recent message-pane scroll intent (wheel,
+    // key, touch) and non-message intent, so an active scroll-up near the tail
+    // is never overridden. Uses the same _nearBottomCount debounce as the
+    // scroll listener (~4859-4866).
+    if(_recentNonMessageScrollIntent()||_recentMessageScrollIntent()||_recentMessageTouchScrollIntent()||_recentMessageWheelIntent()||_recentMessageKeyScrollIntent()){ _nearBottomCount=0; return; }
+    if(_messageBottomDistance()>80){ _nearBottomCount=0; return; }
+    _nearBottomCount=_nearBottomCount+1;
+    if(_nearBottomCount<2) return;
+    _nearBottomCount=0;
+    _messageUserUnpinned=false;
+    _scrollPinned=true;
+  }
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
   if(_messageBottomDistance()>500) _setMessageScrollToBottom();
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){
+  // An explicit scroll-to-bottom (End button, or any definitive pin-to-bottom)
+  // supersedes a pending jump-to-question reconciliation: cancel the active jump
+  // owner first so its deferred _finishMessageJumpScroll() can't restore the
+  // pre-jump unpinned snapshot and silently undo this pin (#6621). The jump path
+  // itself never calls scrollToBottom(), and while a jump owner is active the
+  // reader is unpinned so the internal auto-follow callers don't reach here.
+  if(typeof _messageJumpScrollOwner!=='undefined'&&_messageJumpScrollOwner&&typeof _cancelMessageJumpScroll==='function') _cancelMessageJumpScroll();
   _clearNewMessageScrollCue();
   _scrollPinned=true;
   _messageUserUnpinned=false;
@@ -5472,6 +7276,45 @@ function _fmtOllamaLabel(mid){
   return label;
 }
 
+// Bedrock cross-region inference routing heads. `global` belongs here too: the
+// catalog in api/config.py ships six `global.anthropic.claude-*` IDs and the
+// first-party routing notes treat that as the canonical Bedrock shape. Keep this
+// set byte-identical to _regions in api/config.py — backend catalog labels and
+// runtime picker fallback labels diverge otherwise.
+const _BEDROCK_REGION_PREFIXES = new Set(['us', 'eu', 'apac', 'global', 'us-gov']);
+// Vendor namespaces Bedrock/Vertex put in front of the real model id.
+const _DOTTED_VENDOR_PREFIXES = new Set([
+  'anthropic', 'amazon', 'meta', 'mistral', 'cohere', 'ai21',
+  'stability', 'writer', 'deepseek', 'qwen', 'openai', 'google',
+  // Bedrock foundation-model vendors added after the first pass. Without these,
+  // real IDs rendered with the namespace intact ("Us.luma.ray 2",
+  // "Twelvelabs.marengo Embed 2 7", "Ibm.granite 3 8B Instruct").
+  'luma', 'twelvelabs', 'ibm', 'nvidia', 'snowflake',
+]);
+/** Drop a Bedrock/Vertex dotted routing+vendor prefix from a model id.
+ *
+ *  Only the documented shapes are stripped — `<region>.<vendor>.<model>` and
+ *  `<vendor>.<model>` — plus a trailing `:<n>` provisioned-revision suffix.
+ *  Anything else is returned unchanged, so `deepseek.v3`, `foo.bar.baz` and the
+ *  version dot in `gpt-4.1` are never rewritten.
+ *
+ *  Mirrors _strip_dotted_provider_prefix() in api/config.py. */
+function _stripDottedModelPrefix(bare){
+  const value = String(bare || '');
+  if (!value || !value.includes('.') || value.includes('://') || value.startsWith('@')) return value;
+  const segs = value.split('.');
+  let i = 0;
+  if (segs.length - i >= 3 && _BEDROCK_REGION_PREFIXES.has((segs[i] || '').toLowerCase())
+      && _DOTTED_VENDOR_PREFIXES.has((segs[i + 1] || '').toLowerCase())) i++;
+  if (segs.length - i >= 2 && _DOTTED_VENDOR_PREFIXES.has((segs[i] || '').toLowerCase())) {
+    // Dropping the vendor is only safe when what remains still names the model.
+    // A bare version remainder (`deepseek.v3`) means the vendor WAS the name.
+    const remainder = segs.slice(i + 1).join('.');
+    if (!/^v?\d+(?:[.\-]\d+)*$/i.test(remainder)) i++;
+  }
+  if (i === 0) return value;
+  return segs.slice(i).join('.').replace(/:\d+$/, '');
+}
 function getModelLabel(modelId){
   if(!modelId) return 'Unknown';
   const rawId=String(modelId||'');
@@ -5533,6 +7376,41 @@ function getModelLabel(modelId){
   }
   // Strip @provider: prefix if present (e.g. @ollama-cloud:kimi-k2.6)
   if (_last.startsWith('@') && _last.includes(':')) _last = _last.split(':').slice(1).join(':');
+  // Bedrock/Vertex ids carry a dotted region + vendor prefix and sometimes a
+  // trailing `:<n>` version — `us.anthropic.claude-opus-5`,
+  // `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. Left intact, the dotted head
+  // survives into the label as raw plumbing ("Us.anthropic.claude Opus 5" in the
+  // turn footer).
+  //
+  // Only the documented `<region>.<vendor>.<model>` / `<vendor>.<model>` shapes
+  // are stripped, via a CLOSED allow-list. A generic "drop leading letters-only
+  // dot segments" loop rewrites any uncatalogued id — `deepseek.v3` became "V3"
+  // and `foo.bar.baz` became "BAZ". Kept in lockstep with
+  // _strip_dotted_provider_prefix() in api/config.py; the paired test
+  // tests/test_dotted_model_label.py asserts both agree.
+  const _stripped = _stripDottedModelPrefix(_last);
+  if (_stripped !== _last) {
+    _last = _stripped;
+    // The normalized id is what the label tables are keyed on, so retry them —
+    // `us.anthropic.claude-sonnet-4-5` should land on the same "Sonnet 4.5" as
+    // `anthropic/claude-sonnet-4-5` rather than falling through to the raw id.
+    if (_dynamicModelLabels[_last]) return _dynamicModelLabels[_last];
+    if (STATIC_LABELS[_last]) return STATIC_LABELS[_last];
+    if (STATIC_LABELS['anthropic/' + _last]) return STATIC_LABELS['anthropic/' + _last];
+    // No table entry: prettify the Claude family the way the tables do — drop
+    // the `claude-` vendor word, the `-YYYYMMDD` date-pin and `-v1` revision
+    // (snapshot noise, not a name), then title-case. Bedrock is the only
+    // dotted-prefix source here, so this stays scoped to that path.
+    if (/^claude-/i.test(_last)) {
+      _last = _last
+        .replace(/^claude-/i, '')
+        .replace(/-v\d+$/i, '')
+        .replace(/-\d{8}$/, '')
+        .replace(/-/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .trim();
+    }
+  }
   const looksLikeOllamaTag = /^[a-z0-9][\w.-]*:[\w.-]+$/i.test(_last);
   const atProvider=(rawId.startsWith('@')&&rawId.includes(':'))
     ? rawId.slice(1,rawId.indexOf(':')).toLowerCase()
@@ -5566,6 +7444,17 @@ function _formatGatewayModelLabel(modelId,labelText,routing){
     :_compactComposerModelChipLabel(modelId,labelText||getModelLabel(modelId));
   const via=_gatewayRoutingLabel(routing);
   return via?`${base} ${via}`:base;
+}
+function _usedModelTurnChipLabel(msg){
+  if(!msg)return'';
+  // Gateway turns own their model label via _formatGatewayModelLabel (which
+  // falls back to msg._usedModel when routing omits used_model), so suppress
+  // the additive chip whenever routing metadata is present — not only when
+  // routing.used_model is set — to guarantee one model label per turn.
+  if(msg._gatewayRouting)return'';
+  const usedModel=String(msg._usedModel||'').trim();
+  if(!usedModel)return'';
+  return _compactComposerModelChipLabel(usedModel,getModelLabel(usedModel));
 }
 function _gatewayRoutingFailoverText(routing){
   if(!routing||!routing.has_failover)return'';
@@ -5865,7 +7754,7 @@ function renderMd(raw){
     // backticks stays protected as a \x00C token and is never rendered as <img>.
     // Must run before _code_stash restore and before _link_stash so the image
     // is not consumed by the [label](url) link regex.
-    t=t.replace(/!\[([^\]]*)\]\((https?:\/\/[^\)]+)\)/g,(_,alt,url)=>`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+    t=t.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>(typeof _mdImageHtml==='function')?_mdImageHtml(alt,url):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
     // Stash rendered <img> tags so autolink never matches URLs inside src=
     const _img_stash=[];
     t=t.replace(/(<img\b[^>]*>)/g,m=>{_img_stash.push(m);return `\x00G${_img_stash.length-1}\x00`;});
@@ -5873,7 +7762,7 @@ function renderMd(raw){
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
     t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
-    t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
+    t=t.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{const trail=url.match(/[.,;:!?)\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
@@ -5978,7 +7867,7 @@ function renderMd(raw){
   // Tables: | col | col | header row followed by | --- | --- | separator then data rows
   // NOTE: table pass runs BEFORE outer link pass so [label](url) in table cells
   // is handled by inlineMd() only — prevents double-linking.
-  s=s.replace(/((?:^\|.+\|\n?)+)/gm,block=>{
+  s=s.replace(/((?:^ {0,3}\|.+\|[ \t]*\n?)+)/gm,block=>{
     const rows=block.trim().split('\n').filter(r=>r.trim());
     if(rows.length<2)return block;
     const isSep=r=>/^\|[\s|:-]+\|$/.test(r.trim());
@@ -6007,7 +7896,7 @@ function renderMd(raw){
   // #487: Outer image pass — handles ![alt](url) in plain paragraphs (outside tables/lists).
   // Runs AFTER the table pass (images in table cells are handled by inlineMd() above).
   // Runs BEFORE the outer [label](url) link pass so the image is not consumed as a plain link.
-  s=s.replace(/!\[([^\]]*)\]\((https?:\/\/[^\)]+)\)/g,(_,alt,url)=>`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+  s=s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>(typeof _mdImageHtml==='function')?_mdImageHtml(alt,url):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
   // Outer link pass for labeled links in plain paragraphs (outside table cells).
   // Runs AFTER the table pass so table cells are processed by inlineMd() only.
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
@@ -6097,7 +7986,11 @@ function renderMd(raw){
     const raw=_safeAttrValue(v);
     const compact=raw.replace(/[\u0000-\u001f\u007f\s]+/g,'').toLowerCase();
     if(!compact) return false;
-    if(/^(javascript|data|vbscript):/i.test(compact)) return false;
+    // data:image/* is permitted for <img> only, validated by the shared strict
+    // predicate. Every other
+    // data: scheme stays blocked for both anchors and images.
+    if(/^data:/i.test(compact)) return !!(img && typeof _isSafeDataImageUri==='function' && _isSafeDataImageUri(raw));
+    if(/^(javascript|vbscript):/i.test(compact)) return false;
     if(/^https?:\/\//i.test(raw)) return true;
     if(/^(mailto:|tel:|message:)/i.test(raw)) return true;
     if(img && /^api\//i.test(raw)) return true;
@@ -6171,9 +8064,11 @@ function renderMd(raw){
   // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
-  s=s.replace(/(https?:\/\/[^\s<>"'\)\]]+)/g,(url)=>{
-    // Strip trailing punctuation that was likely not part of the URL
-    const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';
+  s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
+    // Strip trailing punctuation that was likely not part of the URL.
+    // CJK full-width punctuation (）。，；：！？、) is included because LLMs
+    // frequently use full-width delimiters in Chinese/Japanese text.
+    const trail=url.match(/[.,;:!?)]$/)||url.match(/[\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';
     const clean=trail?url.slice(0,-1):url;
     return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
   });
@@ -6213,115 +8108,7 @@ function renderMd(raw){
   s=parts.map(p=>{p=p.trim();if(!p)return '';if(/^<(h[1-6]|ul|ol|table|pre|hr|blockquote)|^\x00[EQ]/.test(p))return p;return `<p>${p.replace(/\n/g,'<br>')}</p>`;}).join('\n');
   s=s.replace(/\x00E(\d+)\x00/g,(_,i)=>_pre_stash[+i]);
   // ── Restore MEDIA stash → inline images or download links ─────────────────
-  s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>{
-    let ref=media_stash[+i];
-    // Keep this logic self-contained: some tests extract renderMd() alone and
-    // execute it in node, without the top-level helper functions from ui.js.
-    const mediaKindForName=(name='')=>{
-      const clean=String(name||'').split('?')[0].toLowerCase();
-      if(/\.(mp3|wav|m4a|aac|ogg|oga|opus|flac)$/i.test(clean)) return 'audio';
-      if(/\.(mp4|mov|m4v|webm|ogv|avi|mkv)$/i.test(clean)) return 'video';
-      if(_IMAGE_EXTS.test(clean)) return 'image';
-      return '';
-    };
-    const mediaPlayerHtml=(kind,src,name)=>{
-      if(typeof _mediaPlayerHtml==='function') return _mediaPlayerHtml(kind,src,name);
-      const safeName=esc(name||kind||'media');
-      const safeSrc=esc(src);
-      const tag=kind==='video'
-        ? `<video class="msg-media-player msg-media-video" src="${safeSrc}" controls preload="metadata" playsinline title="${safeName}"></video>`
-        : `<audio class="msg-media-player msg-media-audio" src="${safeSrc}" controls preload="metadata" title="${safeName}"></audio>`;
-      return `<div class="msg-media-editor msg-media-editor--${kind}" data-media-kind="${kind}">${tag}<div class="msg-media-meta"><span class="msg-media-name">${safeName}</span></div></div>`;
-    };
-    const localArtifactCard=(src,name)=>{
-      const safeSrc=esc(src);
-      const safeName=esc(name||'image');
-      const tt=(typeof t==='function')?t:(key=>({media_download:'Download'}[key]||key));
-      // Clean inline image (keeps the existing .msg-media-img lightbox-on-click
-      // behavior) with a hover/focus-revealed Download action overlaid top-right,
-      // matching the ChatGPT/Claude/Gemini pattern. The image stays the hero —
-      // no permanent card chrome. Download is the one affordance the lightbox
-      // (zoom-on-click) doesn't already provide.
-      const dlLabel=esc(tt('media_download'));
-      const dlSvg='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
-      return `<span class="msg-artifact-image"><img class="msg-media-img" src="${safeSrc}" alt="${safeName}" loading="lazy"><a class="msg-artifact-download" href="${safeSrc}" download="${safeName}" title="${dlLabel}" aria-label="${dlLabel}" onclick="event.stopPropagation()">${dlSvg}</a></span>`;
-    };
-    if(/^file:\/\//i.test(ref)){
-      try{
-        const u=new URL(ref);
-        ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
-      }catch(_){
-        try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
-        catch(__){ref=ref.replace(/^file:\/\//i,'');}
-      }
-    }
-    // HTTP(S) URL
-    if(/^https?:\/\//i.test(ref)){
-      // Rewrite localhost/127.0.0.1 to the actual server base URL so remote
-      // users (VPN, Docker, deployed) can load agent-generated images (#642).
-      // Strip the trailing slash from document.baseURI so the URL's own path
-      // joins cleanly — this preserves any subpath mount (e.g. /hermes/).
-      let src=ref;
-      if(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(src)){
-        const base=(document.baseURI||'').replace(/\/$/,'');
-        src=src.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i,base);
-      }
-      // MEDIA: tokens are usually tool-generated images. Render all https://
-      // URLs as <img> so extensionless CDN paths still work (#853), while
-      // preserving explicit audio/video/SVG URLs with their proper handlers.
-      const urlPath=src.split('?')[0];
-      const mediaKind=mediaKindForName(urlPath);
-      // SVG URLs → render inline as image
-      if(_SVG_EXTS.test(urlPath)){
-        return `<img class="msg-media-svg" src="${esc(src)}" alt="${t('media_svg_label')}" loading="lazy">`;
-      }
-      if(mediaKind==='audio'||mediaKind==='video') return mediaPlayerHtml(mediaKind,src,urlPath.split('/').pop()||mediaKind);
-      // Render all https:// URLs as <img> — extensionless CDN paths like fal.media still work (#853)
-      if(_IMAGE_EXTS.test(urlPath) || /^https?:\/\//i.test(src)){
-        return `<img class="msg-media-img" src="${esc(src)}" alt="image" loading="lazy">`;
-      }
-      return `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`;
-    }
-    // Local file path
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const apiUrl='api/media?path='+encodeURIComponent(ref)+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
-    const localKind=mediaKindForName(ref);
-    if(localKind==='image'){
-      return localArtifactCard(apiUrl,ref.split('/').pop()||'image');
-    }
-    // SVG → inline image (no download, render directly)
-    if(_SVG_EXTS.test(ref)){
-      return `<img class="msg-media-svg" src="${esc(apiUrl)}" alt="${t('media_svg_label')}" loading="lazy">`;
-    }
-    // Audio/video → inline player with speed controls; use &inline=1 for byte-range seeking
-    if(_AUDIO_EXTS.test(ref)||_VIDEO_EXTS.test(ref)){
-      const kind=_AUDIO_EXTS.test(ref)?'audio':'video';
-      return _mediaPlayerHtml(kind,apiUrl+'&inline=1',ref.split('/').pop()||ref);
-    }
-    // PDF files → render first page preview with lazy-load
-    if(_PDF_EXTS.test(ref)){
-      const fname=esc(ref.split('/').pop()||ref);
-      return `<div class="pdf-preview-load" data-path="${esc(ref)}"><span class="pdf-preview-spinner">⏳</span> ${t('pdf_loading')} ${fname}...</div>`;
-    }
-    // HTML files → render inline in sandboxed iframe with lazy-load
-    if(_HTML_EXTS.test(ref)){
-      return `<div class="html-preview-load" data-path="${esc(ref)}"><span class="html-preview-spinner">⏳</span> ${t('html_loading')}</div>`;
-    }
-    // .patch/.diff files → render inline as colored diff instead of download
-    const fname=esc(ref.split('/').pop()||ref);
-    if(/\.(patch|diff)$/i.test(ref)){
-      return `<div class="diff-inline-load" data-path="${esc(ref)}">${t('diff_loading')} ${fname}...</div>`;
-    }
-    // CSV files → lazy-load and render as table
-    if(_CSV_EXTS.test(ref)){
-      return `<div class="csv-inline-load" data-path="${esc(ref)}">${t('csv_loading')} ${fname}...</div>`;
-    }
-    // Excalidraw files → lazy-load inline embed
-    if(_EXCALIDRAW_EXTS.test(ref)){
-      return `<div class="excalidraw-inline-load" data-path="${esc(ref)}">${t('excalidraw_loading')} ${fname}...</div>`;
-    }
-    return `<a class="msg-media-link" href="${esc(apiUrl+'&download=1')}" download="${fname}">📎 ${fname}</a>`;
-  });
+  s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>_inlineMediaHtmlForRef(media_stash[+i]));
 
   // ── End MEDIA restore ──────────────────────────────────────────────────────
   // Restore blockquote stash. Done last so the inner HTML (already produced
@@ -6340,7 +8127,13 @@ function setStatus(t){
   showToast(t, 4000);
 }
 
-function setComposerStatus(t){
+let _composerStatusTimer=null;
+
+function setComposerStatus(t,timeoutMs){
+  if(_composerStatusTimer!==null){
+    clearTimeout(_composerStatusTimer);
+    _composerStatusTimer=null;
+  }
   const el=$('composerStatus');
   if(!el)return;
   const statusHidden=!!(window._composerControlVisibility&&window._composerControlVisibility.hide_composer_status);
@@ -6359,6 +8152,14 @@ function setComposerStatus(t){
   el.removeAttribute('aria-hidden');
   el.textContent=t;
   el.style.display='';
+  if(timeoutMs>0){
+    const timer=setTimeout(()=>{
+      if(_composerStatusTimer!==timer)return;
+      _composerStatusTimer=null;
+      setComposerStatus('');
+    },timeoutMs);
+    _composerStatusTimer=timer;
+  }
 }
 
 let _composerLockState=null;
@@ -6542,7 +8343,7 @@ async function handleComposerPrimaryAction(){
   const action=typeof getComposerPrimaryAction==='function'?getComposerPrimaryAction():'send';
   if(action==='disabled') return;
   if(action==='stop'){
-    if(typeof cancelStream==='function') await cancelStream('composer-stop');
+    if(typeof cancelStream==='function' && !await cancelStream('composer-stop')) showToast(t('cancel_failed'),null,'error');
     return;
   }
   await send();
@@ -7610,6 +9411,7 @@ function _compactInflightState(state){
     lastAssistantText:state.lastAssistantText||'',
     lastReasoningText:state.lastReasoningText||'',
     lastRunJournalSeq:state.lastRunJournalSeq||0,
+    lastRunJournalEventId:state.lastRunJournalEventId||'',
     journalReplayFromStart:!!state.journalReplayFromStart,
     currentActivityBurstId:state.currentActivityBurstId||0,
     currentLiveSegmentSeq:state.currentLiveSegmentSeq||0,
@@ -7901,7 +9703,33 @@ function snapshotLiveTurnHtmlForSession(sid){
   const turn=$('liveAssistantTurn');
   if(!turn) return;
   if(turn.dataset&&turn.dataset.sessionId&&turn.dataset.sessionId!==sid) return;
-  INFLIGHT[sid].liveTurnHtml=turn.outerHTML;
+  let snapshotTurn=turn;
+  const sourceControls=turn.querySelectorAll
+    ? Array.from(turn.querySelectorAll('.transparent-event-copy,.thinking-copy-btn'))
+    : [];
+  if(sourceControls.some(control=>!!control._transparentCopiedFeedbackNormal)){
+    // Copy-success feedback is transient, while its normal presentation lives
+    // only on element properties. Sanitize an independent clone so switching
+    // sessions cannot persist the check/Copied/accent presentation, without
+    // mutating the visible control or disturbing its active feedback timer.
+    snapshotTurn=turn.cloneNode(true);
+    const clonedControls=Array.from(snapshotTurn.querySelectorAll('.transparent-event-copy,.thinking-copy-btn'));
+    sourceControls.forEach((source,index)=>{
+      const normal=source._transparentCopiedFeedbackNormal;
+      const clone=clonedControls[index];
+      if(!normal||!clone) return;
+      clone.innerHTML=normal.innerHTML;
+      if(clone.style){
+        if(normal.styleCssText!==null) clone.style.cssText=normal.styleCssText;
+        else clone.style.color=normal.color||'';
+      }
+      if(normal.titleAttr===null) clone.removeAttribute('title');
+      else clone.setAttribute('title',normal.titleAttr);
+      if(normal.ariaLabel===null) clone.removeAttribute('aria-label');
+      else clone.setAttribute('aria-label',normal.ariaLabel);
+    });
+  }
+  INFLIGHT[sid].liveTurnHtml=snapshotTurn.outerHTML;
 }
 
 function _liveAssistantSegmentTextLength(seg){
@@ -8195,12 +10023,15 @@ async function refreshSession() {
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
+    if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.messages = data.session.messages || [];
     _messagesTruncated = !!data.session._messages_truncated;
     _oldestIdx = data.session._messages_offset || 0;
-    const pendingMsg=getPendingSessionMessage(data.session,S.messages);
-    if(pendingMsg) S.messages.push(pendingMsg);
-    S.activeStreamId=data.session.active_stream_id||null;
+    if (typeof _mergePendingSessionMessage !== 'function') {
+      throw new Error('Pending-session merge helper unavailable');
+    }
+    _mergePendingSessionMessage(data.session, S.messages);
+    S.activeStreamId = data.session.active_stream_id || null;
 
     syncTopbar(); _renderMessagesWithScrollSnapshot();
     showToast('Conversation refreshed');
@@ -8208,12 +10039,17 @@ async function refreshSession() {
 }
 // ── Update banner ──
 function _formatUpdateTargetStatus(label,info){
-  if(!info||info.no_git||!(info.behind>0)) return null;
+  const manualNoGit=!!(info&&info.no_git&&info.manual_update&&info.behind>0);
+  if(!info||(info.no_git&&!manualNoGit)||!(info.behind>0)) return null;
   const release=(info.release_based&&info.latest_version)
     ?` (${info.current_version||'unknown'} -> ${info.latest_version})`
     :(info.branch?` (${info.branch})`:'');
   const noun=info.release_based?'release':'update';
   return `${label}${release}: ${info.behind} ${noun}${info.behind>1?'s':''}`;
+}
+function _formatManualUpdateInstruction(info){
+  if(!(info&&info.no_git&&info.manual_update&&info.behind>0)) return null;
+  return t('settings_update_manual_docker','docker pull ghcr.io/nesquena/hermes-webui:latest');
 }
 function _formatUpdateCheckError(label,info){
   if(!info||!info.error) return null;
@@ -8521,6 +10357,21 @@ function _showUpdateBanner(data){
   if(webuiPart) parts.push(webuiPart);
   if(agentPart) parts.push(agentPart);
   window._updateData=data;
+  const btnApply=$('btnApplyUpdate');
+  if(btnApply){
+    const webuiManual=!!(data&&data.webui&&data.webui.manual_update&&data.webui.behind>0);
+    const webuiUpdatable=!!(data&&data.webui&&data.webui.behind>0&&!webuiManual);
+    const agentUpdatable=!!(data&&data.agent&&data.agent.behind>0);
+    const hasApplyTargets=webuiUpdatable||agentUpdatable;
+    btnApply.disabled=!hasApplyTargets;
+    btnApply.style.display=hasApplyTargets?'':'none';
+    if(webuiManual){
+      const forceBtn=$('btnForceUpdate');
+      if(forceBtn){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
+      const clearLockBtn=$('btnClearUpdateLock');
+      if(clearLockBtn){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
+    }
+  }
   if(!parts.length){
     _renderUpdateWhatsNewLinks(data);
     const staleBanner=$('updateBanner');
@@ -8528,11 +10379,21 @@ function _showUpdateBanner(data){
     return;
   }
   const msg=$('updateMsg');
-  if(msg) msg.textContent='\u2B06 '+parts.join(', ')+' available';
+  if(msg){
+    const manualInstruction=_formatManualUpdateInstruction(data&&data.webui);
+    msg.textContent='\u2B06 '+parts.join(', ')+' available'+(manualInstruction?' · '+manualInstruction:'');
+  }
   const banner=$('updateBanner');
   if(banner) banner.classList.add('visible');
   const summaryMode=window._whatsNewSummaryEnabled===true?'summary':'diff';
   _renderUpdateWhatsNewLinks(data,{mode:summaryMode});
+}
+function _i18nUpdateText(key, fallback){
+  if(typeof t==='function'){
+    const val=t(key);
+    if(val&&val!==key) return val;
+  }
+  return fallback;
 }
 function dismissUpdate(){
   const b=$('updateBanner');if(b)b.classList.remove('visible');
@@ -8545,24 +10406,25 @@ function _isUpdateApplyNetworkError(error){
 }
 function _formatUpdateApplyExceptionMessage(error){
   if(_isUpdateApplyNetworkError(error)){
-    return 'Update failed: could not reach the WebUI server. It may have restarted or the connection was interrupted. Please wait a few seconds, reload the page, then check the server if it still does not come back.';
+    return _i18nUpdateText('update_failed_network','Update failed: could not reach the WebUI server. It may have restarted or the connection was interrupted. Please wait a few seconds, reload the page, then check the server if it still does not come back.');
   }
   const message=(error&&error.message)||String(error||'unknown error');
-  return 'Update failed: '+message;
+  return _i18nUpdateText('update_failed_prefix','Update failed: ')+message;
 }
 async function applyUpdates(){
   if(window._updateApplyInFlight) return;
   window._updateApplyInFlight=true;
+  const updateText=(key,fallback)=>(typeof _i18nUpdateText==='function'?_i18nUpdateText(key,fallback):fallback);
   const btn=$('btnApplyUpdate');
   const resetApplyButton=(delayMs)=>{
     const reset=()=>{
       window._updateApplyInFlight=false;
-      if(btn){btn.disabled=false;btn.textContent='Update Now';}
+      if(btn){btn.disabled=false;btn.textContent=updateText('update_now','Update Now');}
     };
     if(delayMs>0) setTimeout(reset,delayMs);
     else reset();
   };
-  if(btn){btn.disabled=true;btn.textContent='Updating\u2026';}
+  if(btn){btn.disabled=true;btn.textContent=updateText('update_updating','Updating\u2026');}
   const errEl=$('updateError');
   if(errEl){errEl.style.display='none';errEl.textContent='';}
   // Hide any leftover force-update button from a prior conflict so a fresh
@@ -8571,9 +10433,9 @@ async function applyUpdates(){
   if(forceBtnReset){forceBtnReset.style.display='none';forceBtnReset.dataset.target='';}
   const targets=[];
   if(window._updateData?.agent?.behind>0) targets.push('agent');
-  if(window._updateData?.webui?.behind>0) targets.push('webui');
+  if(window._updateData?.webui?.behind>0&&!window._updateData?.webui?.manual_update) targets.push('webui');
   if(!targets.length){
-    const msg='No update target selected. Refresh update status and retry.';
+    const msg=updateText('update_no_target','No update target selected. Refresh update status and retry.');
     if(errEl){errEl.textContent=msg;errEl.style.display='block';}
     else showToast(msg,5000,'error');
     resetApplyButton(0);
@@ -8583,7 +10445,15 @@ async function applyUpdates(){
     const stashConflictMessages=[];
     const baselineServerIdentity = await _readHealthServerIdentity();
     for(const target of targets){
-      const res=await api('/api/updates/apply',{method:'POST',body:JSON.stringify({target}),timeoutMs:120000});
+      // Send the channel the CHECK reported for this target (what was actually
+      // offered in the banner), not a fresh settings read — otherwise a channel
+      // switch whose debounced autosave hasn't landed yet races apply, which
+      // would then read the OLD saved channel (Codex gate). webui carries the
+      // channel; agent is channel-neutral server-side so omitting it is fine.
+      const _applyBody={target};
+      const _ch=window._updateData?.[target]?.channel;
+      if(_ch==='stable'||_ch==='experimental') _applyBody.channel=_ch;
+      const res=await api('/api/updates/apply',{method:'POST',body:JSON.stringify(_applyBody),timeoutMs:120000});
       if(!res.ok){
         _showUpdateError(target,res);
         resetApplyButton(0);
@@ -8616,10 +10486,127 @@ function _showUpdateError(target,res){
   } else {
     showToast(msg);
   }
-  // Show "Force update" button when the error is recoverable by a hard reset
+  // Show "Force update" button ONLY for errors recoverable by a destructive
+  // hard reset. Lock-only failures are routed to a separate non-destructive
+  // "Clear lock and retry update" button (BRICK-2 fix for PR #5688: a lock
+  // error should never invoke apply_force_update, which would discard local
+  // modifications).
   if(forceBtn&&(res.conflict||res.diverged)){
     forceBtn.dataset.target=target;
     forceBtn.style.display='inline-block';
+  }
+  // Show "Clear lock and retry update" when the only failure was a stale
+  // git lock. This calls the new non-destructive /api/updates/clear_lock
+  // endpoint, which probes the lock for a holder and refuses if held.
+  const clearLockBtn=$('btnClearUpdateLock');
+  if(clearLockBtn&&res.lock_conflict){
+    clearLockBtn.dataset.target=target;
+    clearLockBtn.style.display='inline-block';
+  }
+}
+async function applyClearUpdateLock(btn){
+  if(window._clearLockInFlight) return;
+  const target=btn.dataset.target;
+  if(!target) return;
+  window._clearLockInFlight=true;
+  btn.disabled=true;
+  const originalLabel=btn.textContent;
+  btn.textContent='Checking lock…';
+  try{
+    const res=await api('/api/updates/clear_lock',{method:'POST',body:JSON.stringify({target}),timeoutMs:60000});
+    if(res.ok){
+      sessionStorage.removeItem('hermes-update-checked');
+      sessionStorage.removeItem('hermes-update-dismissed');
+      showToast('Update applied — restarting…');
+      _waitForServerThenReload({});
+    } else if(res.lock_held){
+      // v2.2: server returns manual-instruction. Show the exact `rm`
+      // command + a one-click "I've removed it, retry update" affordance
+      // that POSTs the same endpoint a second time (now that the user
+      // has presumably removed the lock, the server's success branch
+      // runs the normal non-destructive apply).
+      _renderLockManualInstruction(target, res);
+    } else {
+      const msg='Could not check the lock: '+(res.message||'unknown error');
+      const errEl=$('updateError');
+      if(errEl){errEl.textContent=msg;errEl.style.display='block';}
+      else showToast(msg);
+    }
+  }catch(e){
+    const msg='Lock-check request failed: '+((e&&e.message)||String(e));
+    const errEl=$('updateError');
+    if(errEl){errEl.textContent=msg;errEl.style.display='block';}
+    else showToast(msg);
+  }finally{
+    window._clearLockInFlight=false;
+    btn.disabled=false;
+    btn.textContent=originalLabel;
+  }
+}
+function _renderLockManualInstruction(target, res){
+  // Replace the inline `updateError` text with a richer block that shows
+  // the exact manual command and offers a one-click retry button. The
+  // "retry" handler re-invokes `applyClearUpdateLock`; this time, with
+  // the lock gone, the server's success branch runs the normal apply.
+  const cmd = res.manual_command || ('rm -f ' + (res.well_known_lock_path || '.git/index.lock'));
+  const errEl=$('updateError');
+  if(!errEl){
+    showToast('Lock present. Run: '+cmd);
+    return;
+  }
+  errEl.style.display='block';
+  errEl.innerHTML='';
+  const intro=document.createElement('div');
+  intro.style.marginBottom='6px';
+  intro.textContent='A stale .git/index.lock is present. The server cannot remove it safely — please run this command on the host:';
+  errEl.appendChild(intro);
+  const code=document.createElement('pre');
+  code.style.background='rgba(0,0,0,0.05)';
+  code.style.padding='6px';
+  code.style.margin='4px 0';
+  code.style.fontFamily='var(--font-mono)';
+  code.style.borderRadius='4px';
+  code.style.whiteSpace='pre-wrap';
+  code.style.wordBreak='break-all';
+  code.textContent=cmd;
+  errEl.appendChild(code);
+  const actions=document.createElement('div');
+  actions.style.display='flex';
+  actions.style.gap='8px';
+  actions.style.flexWrap='wrap';
+  const copyBtn=document.createElement('button');
+  copyBtn.type='button';
+  copyBtn.className='update-btn';
+  copyBtn.textContent='Copy command';
+  copyBtn.onclick=async()=>{
+    try{
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        await navigator.clipboard.writeText(cmd);
+        copyBtn.textContent='Copied';
+        setTimeout(()=>{ copyBtn.textContent='Copy command'; }, 1500);
+      } else {
+        copyBtn.textContent='Clipboard unavailable';
+      }
+    } catch(_){
+      copyBtn.textContent='Copy failed';
+    }
+  };
+  actions.appendChild(copyBtn);
+  const retryBtn=document.createElement('button');
+  retryBtn.type='button';
+  retryBtn.className='update-btn update-primary';
+  retryBtn.textContent="I've removed the lock — retry update";
+  retryBtn.dataset.target=target;
+  retryBtn.onclick=()=>{ applyClearUpdateLock(retryBtn); };
+  actions.appendChild(retryBtn);
+  errEl.appendChild(actions);
+  if(Array.isArray(res.other_locks)&&res.other_locks.length){
+    const other=document.createElement('div');
+    other.style.marginTop='6px';
+    other.style.fontSize='11px';
+    other.style.opacity='0.85';
+    other.textContent='Other lock files also present: '+res.other_locks.join(', ');
+    errEl.appendChild(other);
   }
 }
 function _normalizeHealthServerIdentity(rawIdentity){
@@ -8668,7 +10655,7 @@ async function forceUpdate(btn){
   if(errEl){errEl.style.display='none';}
   try{
     const baselineServerIdentity = await _readHealthServerIdentity();
-    const res=await api('/api/updates/force',{method:'POST',body:JSON.stringify({target}),timeoutMs:120000});
+    const res=await api('/api/updates/force',{method:'POST',body:JSON.stringify((()=>{const b={target};const _ch=window._updateData?.[target]?.channel;if(_ch==='stable'||_ch==='experimental')b.channel=_ch;return b;})()),timeoutMs:120000});
     if(!res.ok){
       if(errEl){errEl.textContent='Force update failed: '+(res.message||'unknown error');errEl.style.display='block';}
       btn.disabled=false;btn.textContent='Force update';
@@ -8814,10 +10801,103 @@ function _pendingCurrentTailUserMessage(messages){
   for(let i=list.length-1;i>=0;i--){
     const msg=list[i];
     if(!msg) continue;
-    if(String(msg.role||'')==='user') return msg;
+    if(String(msg.role||'')==='user'){
+      // Compaction rows are synthetic user-role markers, not submitted turns.
+      if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
+      return msg;
+    }
     if(msg._live||String(msg.role||'')==='tool') continue;
     return null;
   }
+  return null;
+}
+
+// Precision-only epsilon when matching a transcript row against
+// session.pending_started_at. The server stamps the active turn's user row with
+// the exact pending_started_at float; state.db round-trips can lose
+// sub-microsecond precision, so 1e-6 absorbs float drift without ever treating a
+// whole-second (or sub-second) difference as identity. Anything wider is
+// ambiguous — a fast "继续"/"continue" double-send lands ~1s after the previous
+// turn — and must NOT match: fail toward materializing the pending turn (a
+// harmless transient duplicate the settle render clears) rather than hiding a
+// turn and moving its attachments onto an earlier row.
+const _PENDING_ACTIVE_TURN_TS_EPSILON=1e-6;
+
+function _messageTimestampSeconds(msg){
+  if(!msg) return null;
+  const raw=msg._ts!=null?msg._ts:msg.timestamp;
+  const value=Number(raw);
+  return Number.isFinite(value)&&value>0?value:null;
+}
+
+/**
+ * Exact-identity match for the active turn's user row via its
+ * `_active_turn_token`, mirroring the server's `build_active_turn_token`
+ * ("{stream_id}:{started_at}") stamped by the eager-checkpoint path. The token
+ * embeds the stream_id, which no other turn can share, so a row carrying the
+ * current session's token IS the active turn — no timestamp tolerance needed.
+ */
+function _activeTurnTokenMatches(msg, session){
+  if(!msg||typeof msg._active_turn_token!=='string') return false;
+  const streamId=session&&session.active_stream_id;
+  const startedAt=Number(session&&session.pending_started_at);
+  if(!streamId||!Number.isFinite(startedAt)||startedAt<=0) return false;
+  const sep=msg._active_turn_token.lastIndexOf(':');
+  if(sep<=0) return false;
+  if(msg._active_turn_token.slice(0,sep).trim()!==String(streamId).trim()) return false;
+  const tokenStarted=Number(msg._active_turn_token.slice(sep+1));
+  return Number.isFinite(tokenStarted)&&tokenStarted>0
+    && Math.abs(tokenStarted-startedAt)<=_PENDING_ACTIVE_TURN_TS_EPSILON;
+}
+
+/**
+ * Find the active turn's user row even when the current turn's output already
+ * follows it in the transcript.
+ *
+ * While a turn is live the server can reconcile the current user row into the
+ * returned transcript (the sidecar/state.db merge picks it up from state.db,
+ * where the agent writes it immediately) while `pending_user_message` is still
+ * set. The row is then followed by that same turn's assistant/tool rows, so the
+ * strict tail scan in `_pendingCurrentTailUserMessage` stops at the completed
+ * assistant and reports "no current user row" — and the caller materializes the
+ * pending prompt a SECOND time, rendering a duplicate user bubble until the
+ * settle render replaces the list.
+ *
+ * Scanning past assistant/tool rows alone would be wrong: a user who submits the
+ * same text twice in a row (a plain "继续" follow-up) legitimately gets two
+ * identical user turns, and matching on text would swallow the new one. The
+ * discriminator is therefore exact identity, never proximity: the active turn's
+ * public row carries `_active_turn_user`, while private rows carry the server-
+ * stamped `_active_turn_token` (stream_id + started_at — unique to this turn),
+ * or their timestamp equals `pending_started_at` within a precision-only epsilon
+ * that absorbs float/state.db drift but never a full second. A whole-second (or
+ * sub-second) mismatch is ambiguous and returns null so the caller materializes
+ * the pending turn — the transient duplicate is harmless, hiding a turn + moving
+ * its attachments is not. Text equality is still required downstream, so a false
+ * match needs identical text AND an exact identity signal.
+ */
+function _pendingActiveTurnUserMessage(messages, session){
+  const startedAt=Number(session?.pending_started_at);
+  if(!Number.isFinite(startedAt)||startedAt<=0) return null;
+  const list=Array.isArray(messages)?messages:[];
+  for(let i=list.length-1;i>=0;i--){
+    const msg=list[i];
+    if(!msg||String(msg.role||'')!=='user') continue;
+    if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
+    // Public projections replace the private token with this authoritative marker.
+    if(msg._active_turn_user===true) return msg;
+    // Unambiguous: the row carries the active turn's exact token
+    // (stream_id + started_at) stamped by the server's eager-checkpoint path.
+    if(typeof _activeTurnTokenMatches==='function'&&_activeTurnTokenMatches(msg,session)) return msg;
+    // Unambiguous: the row's timestamp IS pending_started_at within
+    // precision-only float drift (never a whole second).
+    const ts=_messageTimestampSeconds(msg);
+    if(ts===null) continue;
+    if(Math.abs(ts-startedAt)<=_PENDING_ACTIVE_TURN_TS_EPSILON) return msg;
+  }
+  // Any wider drift (whole-second truncation, a rapid repeat ~1s later) is
+  // ambiguous: return null so getPendingSessionMessage() materializes the
+  // pending turn rather than guessing.
   return null;
 }
 
@@ -8827,16 +10907,33 @@ function getPendingSessionMessage(session, messagesOverride=null){
   const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
   const sourceMessages=Array.isArray(messagesOverride)?messagesOverride:session?.messages;
   const messages=Array.isArray(sourceMessages)?sourceMessages:[];
+  const pendingCandidate={role:'user',content:text};
+  const _matchesPending=(row)=>{
+    if(!row) return false;
+    return typeof _sameTranscriptMessage==='function'
+      ? _sameTranscriptMessage(row,pendingCandidate)
+      : String(msgContent(row)||'').trim()===text;
+  };
+  const _adoptExistingRow=(row)=>{
+    if(attachments.length&&!row.attachments?.length) row.attachments=attachments;
+    return null;
+  };
   const currentTailUser=_pendingCurrentTailUserMessage(messages);
   if(currentTailUser){
-    const pendingCandidate={role:'user',content:text};
-    const sameCurrentTurn=typeof _sameTranscriptMessage==='function'
-      ? _sameTranscriptMessage(currentTailUser,pendingCandidate)
-      : String(msgContent(currentTailUser)||'').trim()===text;
-    if(sameCurrentTurn){
-      if(attachments.length&&!currentTailUser.attachments?.length) currentTailUser.attachments=attachments;
-      return null;
-    }
+    const sameCurrentTurn=_matchesPending(currentTailUser);
+    if(sameCurrentTurn) return _adoptExistingRow(currentTailUser);
+  }
+  // Fallback: the current turn's user row is already in the transcript but the
+  // strict tail scan above could not see it because this turn's assistant/tool
+  // output follows it. Matched by pending_started_at, so previous turns that
+  // repeat the same text are unaffected. Guarded with typeof so a partial load
+  // (or a static probe that extracts only some helpers) degrades to the
+  // original strict-tail behaviour instead of throwing.
+  const activeTurnUser=typeof _pendingActiveTurnUserMessage==='function'
+    ? _pendingActiveTurnUserMessage(messages,session)
+    : null;
+  if(activeTurnUser&&activeTurnUser!==currentTailUser&&_matchesPending(activeTurnUser)){
+    return _adoptExistingRow(activeTurnUser);
   }
   return {
     role:'user',
@@ -9127,7 +11224,7 @@ function isTpsDisplayEnabled(){
 function _assistantRoleHtml(tsTitle='', tpsText=''){
   const _bn=assistantDisplayName();
   const tps=(isTpsDisplayEnabled()&&tpsText)?`<span class="msg-tps-inline" title="Tokens per second">${esc(tpsText)}</span>`:'';
-  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span style="font-size:12px">${esc(_bn)}</span>${tps}</div>`;
+  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span class="msg-role-name">${esc(_bn)}</span>${tps}</div>`;
 }
 function _setAssistantTurnTps(turn, tpsText=''){
   if(!turn) return;
@@ -9394,6 +11491,16 @@ function _worklogDetailScrollableBody(el){
 }
 function _setWorklogDetailDisclosureOpen(el, open){
   if(!el||!el.classList) return;
+  // #5966 (Codex F2 r2): restoring an OPEN state on a settled Transparent Stream
+  // tool row whose detail was deferred must MATERIALIZE the body first, or the
+  // card restores open-but-empty after an in-session renderMessages() rebuild
+  // (e.g. the next send re-defers it, then this toggles .open with no content).
+  if(open){
+    const drow=(el.matches&&el.matches('.transparent-event-row[data-transparent-detail-deferred="1"]'))
+      ? el
+      : (el.closest&&el.closest('.transparent-event-row[data-transparent-detail-deferred="1"]'));
+    if(drow&&typeof _materializeTransparentToolDetail==='function') _materializeTransparentToolDetail(drow);
+  }
   el.classList.toggle('open', !!open);
   if(el.matches&&el.matches('.tool-group[data-tool-worklog-tool-group="1"],.tool-worklog-tool-group')){
     el.classList.toggle('tool-worklog-tool-group-collapsed', !open);
@@ -9468,17 +11575,23 @@ function _thinkingActivityNode(text, open, disclosureKey){
 }
 function chatActivityMode(){
   if(typeof window==='undefined') return 'compact_worklog';
-  return window._chatActivityDisplayMode || (window._transparentStream ? 'transparent_stream' : 'compact_worklog') || 'compact_worklog';
+  const mode=window._chatActivityDisplayMode;
+  if(mode==='compact_worklog'||mode==='transparent_stream'||mode==='hide_all_activity') return mode;
+  return window._transparentStream ? 'transparent_stream' : 'compact_worklog';
 }
 function isTransparentStream(){
   return chatActivityMode()==='transparent_stream';
 }
+function isFinalAnswerOnlyMode(){
+  return chatActivityMode()==='hide_all_activity';
+}
 function isCompactWorklogMode(){
-  return isSimplifiedToolCalling()&&!isTransparentStream();
+  return isSimplifiedToolCalling()&&chatActivityMode()==='compact_worklog';
 }
 if(typeof window!=='undefined'){
   window.chatActivityMode=chatActivityMode;
   window.isTransparentStream=isTransparentStream;
+  window.isFinalAnswerOnlyMode=isFinalAnswerOnlyMode;
   window.isCompactWorklogMode=isCompactWorklogMode;
 }
 function _toolShortName(name){
@@ -9525,11 +11638,128 @@ function _transparentToolSummary(tc){
   // with only {workdir} or an unknown tool with {mode:"dry-run"}) must yield an
   // EMPTY collapsed preview rather than dumping a raw arg snippet — that keeps the
   // collapsed row quiet and consistent with the no-args case (#4658 review).
-  const target=typeof _toolVisibleTargetLabel==='function'?_toolVisibleTargetLabel(tc,{limit:160}):'';
+  const target=typeof _toolVisibleTargetLabel==='function'?_toolVisibleTargetLabel(tc,{limit:160,rangeFirst:true}):'';
   if(target) return target;
   return '';
 }
-function _copyEventToClipboard(row){
+function _showTransparentCopiedFeedback(control,row,opts){
+  if(!control&&!row) return;
+  opts=opts||{};
+  // A live-row refresh may replace a header's copy control with new markup.
+  // Keep the lifetime on the persistent row, then resolve the currently visible
+  // control for every render/expiry rather than retaining a detached button.
+  const feedbackRow=row||(control&&control.closest?control.closest('.transparent-event-row'):null);
+  const owner=feedbackRow||control;
+  if(!owner) return;
+  const currentControl=()=>{
+    if(feedbackRow&&feedbackRow.querySelector){
+      return feedbackRow.querySelector('.transparent-event-copy,.thinking-copy-btn');
+    }
+    return control||null;
+  };
+  const connectedControl=()=>{
+    const target=currentControl();
+    if(!target||target.isConnected!==true) return null;
+    if(feedbackRow&&feedbackRow.isConnected!==true) return null;
+    return target;
+  };
+  const clearFeedbackState=(state)=>{
+    if(state&&state.timer){
+      clearTimeout(state.timer);
+      state.timer=null;
+    }
+    if(owner._transparentCopiedFeedback===state) delete owner._transparentCopiedFeedback;
+  };
+  const restoreControl=(target)=>{
+    if(!target) return;
+    const normal=target._transparentCopiedFeedbackNormal;
+    if(!normal) return;
+    target.innerHTML=normal.innerHTML;
+    if(target.style){
+      if(normal.styleCssText!==null) target.style.cssText=normal.styleCssText;
+      else target.style.color=normal.color||'';
+    }
+    if(normal.titleAttr===null){
+      if(target.removeAttribute) target.removeAttribute('title');
+    }else if(target.setAttribute){
+      target.setAttribute('title',normal.titleAttr);
+    }
+    if(normal.ariaLabel===null){
+      if(target.removeAttribute) target.removeAttribute('aria-label');
+    }else if(target.setAttribute){
+      target.setAttribute('aria-label',normal.ariaLabel);
+    }
+    delete target._transparentCopiedFeedbackNormal;
+  };
+  const renderCopiedControl=(target)=>{
+    if(!target) return;
+    if(!target._transparentCopiedFeedbackNormal){
+      target._transparentCopiedFeedbackNormal={
+        innerHTML:target.innerHTML,
+        color:target.style?target.style.color:undefined,
+        styleCssText:target.style&&typeof target.style.cssText==='string'?target.style.cssText:null,
+        titleAttr:target.getAttribute?target.getAttribute('title'):null,
+        ariaLabel:target.getAttribute?target.getAttribute('aria-label'):null,
+      };
+    }
+    const copiedLabel=t('copied')||'Copied';
+    target.innerHTML=typeof li==='function'?li('check',11):'✓';
+    if(target.style){
+      target.style.color='var(--accent)';
+      target.style.opacity='1';
+    }
+    if(target.setAttribute) target.setAttribute('title',copiedLabel);
+    else target.title=copiedLabel;
+    if(target.setAttribute) target.setAttribute('aria-label',copiedLabel);
+  };
+  const now=Date.now();
+  let state=owner._transparentCopiedFeedback;
+  if(opts.rehydrate){
+    if(!state) return;
+    const target=connectedControl();
+    if(!target){
+      clearFeedbackState(state);
+      return;
+    }
+    if(!state.expiresAt||state.expiresAt<=now){
+      if(state.timer) clearTimeout(state.timer);
+      state.timer=null;
+      restoreControl(target);
+      if(owner._transparentCopiedFeedback===state) delete owner._transparentCopiedFeedback;
+      return;
+    }
+    renderCopiedControl(target);
+    return;
+  }
+  const target=connectedControl();
+  if(!target){
+    if(state) clearFeedbackState(state);
+    return;
+  }
+  if(!state){
+    state={timer:null,generation:0,expiresAt:0};
+    owner._transparentCopiedFeedback=state;
+  }else if(state.timer){
+    clearTimeout(state.timer);
+  }
+  state.generation+=1;
+  const generation=state.generation;
+  state.expiresAt=now+1500;
+  renderCopiedControl(target);
+  state.timer=setTimeout(()=>{
+    if(owner._transparentCopiedFeedback!==state||state.generation!==generation) return;
+    const expiryTarget=connectedControl();
+    if(!expiryTarget){
+      state.timer=null;
+      delete owner._transparentCopiedFeedback;
+      return;
+    }
+    state.timer=null;
+    restoreControl(expiryTarget);
+    delete owner._transparentCopiedFeedback;
+  },1500);
+}
+function _copyEventToClipboard(row,control){
   if(!row) return;
   const type=row.getAttribute('data-event-type');
   let text='';
@@ -9572,9 +11802,12 @@ function _copyEventToClipboard(row){
   }else{
     text=row.textContent||'';
   }
+  if(!text) return;
+  const copied=()=>_showTransparentCopiedFeedback(control,row);
   const fallback=()=>{
+    let ta=null;
     try{
-      const ta=document.createElement('textarea');
+      ta=document.createElement('textarea');
       ta.value=text;
       ta.setAttribute('readonly','');
       ta.style.position='absolute';
@@ -9582,14 +11815,17 @@ function _copyEventToClipboard(row){
       document.body.appendChild(ta);
       ta.select();
       const ok=document.execCommand('copy');
-      document.body.removeChild(ta);
+      if(ok) copied();
       if(typeof showToast==='function') showToast(ok?(t('copied')||'Copied'):(t('copy_failed')||'Copy failed'),1600);
     }catch(_){
       if(typeof showToast==='function') showToast(t('copy_failed')||'Copy failed',2000,'error');
+    }finally{
+      if(ta&&ta.parentNode) ta.parentNode.removeChild(ta);
     }
   };
   if(navigator&&navigator.clipboard&&navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(()=>{
+      copied();
       if(typeof showToast==='function') showToast(`${t('copied')||'Copied'} ${label}`,1600);
     }).catch(fallback);
   }else{
@@ -9600,21 +11836,29 @@ function _attachCopyButton(header){
   if(!header) return null;
   const bindCopyButton=(btn)=>{
     if(!btn) return null;
+    const row=header.closest?header.closest('.transparent-event-row'):null;
+    const feedbackState=row&&row._transparentCopiedFeedback;
+    const feedbackActive=!!(feedbackState&&Number(feedbackState.expiresAt)>Date.now());
     btn.classList.add('transparent-event-copy');
     btn.setAttribute('role','button');
     btn.setAttribute('tabindex','0');
-    btn.setAttribute('aria-label',t('copy')||'Copy');
     btn.setAttribute('data-transparent-copy','1');
-    btn.title=t('copy')||'Copy';
+    if(!btn._transparentCopiedFeedback&&!feedbackActive){
+      btn.setAttribute('aria-label',t('copy')||'Copy');
+      btn.title=t('copy')||'Copy';
+    }
     const handler=function(ev){
       ev.stopPropagation();
       ev.preventDefault();
-      _copyEventToClipboard(header.closest('.transparent-event-row'));
+      _copyEventToClipboard(header.closest('.transparent-event-row'),btn);
     };
     btn.onclick=handler;
     btn.onkeydown=function(ev){
       if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();handler(ev);}
     };
+    if(btn.parentNode&&typeof _showTransparentCopiedFeedback==='function'){
+      _showTransparentCopiedFeedback(btn,row,{rehydrate:true});
+    }
     return btn;
   };
   // Reuse ANY existing copy button (handles both .transparent-event-copy
@@ -9637,6 +11881,8 @@ function _attachCopyButton(header){
   const toggle=header.querySelector('.tool-card-toggle,.thinking-card-toggle');
   if(toggle&&toggle.parentNode===header) header.insertBefore(btn,toggle);
   else header.appendChild(btn);
+  const row=header.closest?header.closest('.transparent-event-row'):null;
+  if(typeof _showTransparentCopiedFeedback==='function') _showTransparentCopiedFeedback(btn,row,{rehydrate:true});
   return btn;
 }
 function _transparentEventCountLabel(toolCount){
@@ -9655,11 +11901,116 @@ function _setTransparentDetailMode(tab, mode){
 function _setTransparentCardOpen(card, open){
   if(!card) return;
   const expanded=!!open;
-  card.classList.toggle('open',expanded);
   const row=card.closest&&card.closest('.transparent-event-row');
+  // #5966: a settled tool row whose detail body was deferred at render must
+  // materialize it the first time it's opened (before we flip .open so the
+  // detail exists for the same paint). No-op on live/already-materialized rows.
+  if(expanded&&row&&row.getAttribute('data-transparent-detail-deferred')==='1'){
+    _materializeTransparentToolDetail(row);
+  }
+  card.classList.toggle('open',expanded);
   if(row) row.setAttribute('data-expanded',expanded?'1':'0');
   const header=card.querySelector('.tool-card-header,.thinking-card-header');
   if(header) header.setAttribute('aria-expanded',expanded?'true':'false');
+}
+// #5966: build the deferred `.tool-card-detail` for a settled transparent tool
+// row on first expand — the lazy counterpart of the eager build in
+// _decorateTransparentEventRow. Recovers the tool call from the in-memory stash
+// or, after a _sessionHtmlCache innerHTML round-trip drops the JS property, from
+// the row's data-anchor-row-id → S.messages scene (the #5839 recovery pattern).
+// Idempotent: clears the deferred flag and runs anchor-suppressed post-processing
+// (Prism / copy buttons / KaTeX / Mermaid / trees) on just the new subtree so an
+// expanded deferred row is byte-identical to the eager path.
+// #5966: does this tool call have a detail body worth deferring? Mirrors
+// buildToolCard's `hasDetail` (snippet OR args, gated by _toolCardAllowsDetail)
+// so we only mark a row deferred/expandable when there's genuinely something to
+// build — a detail-less tool row keeps its `tool-card-no-detail` (no chevron).
+function _transparentToolRowHasDetail(tc){
+  if(!tc||typeof tc!=='object') return false;
+  const hasRaw=!!tc.snippet||(tc.args&&typeof tc.args==='object'&&Object.keys(tc.args).length>0);
+  if(!hasRaw) return false;
+  if(typeof _toolActionKind==='function'&&typeof _toolCardAllowsDetail==='function'){
+    try{ return !!_toolCardAllowsDetail(_toolActionKind(tc), tc); }catch(_){ return true; }
+  }
+  return true;
+}
+function _materializeTransparentToolDetail(row){
+  if(!row||row.getAttribute('data-transparent-detail-deferred')!=='1') return false;
+  const card=row.querySelector('.tool-card');
+  if(!card){ row.removeAttribute('data-transparent-detail-deferred'); return false; }
+  let tc=row._deferredToolCall;
+  if(!tc){
+    tc=_transparentToolCallFromRowDataset(row);
+  }
+  if(!tc){ row.removeAttribute('data-transparent-detail-deferred'); return false; }
+  const status=String(row.getAttribute('data-event-status')||_transparentToolStatus(tc,true));
+  row.removeAttribute('data-transparent-detail-deferred');
+  row._deferredToolCall=null;
+  if(!card.querySelector('.tool-card-detail')){
+    // Codex F1(r2): rebuild through the CANONICAL buildToolCard() detail path, not
+    // the thinner _transparentToolDetailHtml() — the latter drops diff coloring,
+    // "Show diff/Show more", and canonical shell-command detail that buildToolCard
+    // produces, so an expanded deferred row must transplant buildToolCard's own
+    // `.tool-card-detail` to stay byte-identical to the eager path.
+    let sourceDetail=null;
+    try{
+      const rebuilt=buildToolCard(tc);
+      sourceDetail=rebuilt&&rebuilt.querySelector('.tool-card-detail');
+    }catch(_){ sourceDetail=null; }
+    if(sourceDetail){
+      card.appendChild(sourceDetail);   // move the canonical detail node onto the live card
+    }else{
+      // Fallback (e.g. buildToolCard unavailable): the lighter detail is better than none.
+      card.insertAdjacentHTML('beforeend',_transparentToolDetailHtml(tc,status));
+    }
+    const detail=card.querySelector('.tool-card-detail');
+    if(detail&&!detail.querySelector('.transparent-detail-modes')){
+      const modes=document.createElement('div');
+      modes.className='transparent-detail-modes';
+      modes.setAttribute('role','tablist');
+      modes.innerHTML=`<span class="transparent-detail-mode active" role="tab" tabindex="0" data-mode="full" onclick="_setTransparentDetailMode(this,'full')">Full</span><span class="transparent-detail-mode" role="tab" tabindex="0" data-mode="output" onclick="_setTransparentDetailMode(this,'output')">Output</span>`;
+      const firstChild=detail.firstChild;
+      if(firstChild&&firstChild.parentNode===detail) detail.insertBefore(modes, firstChild);
+      else detail.appendChild(modes);
+      detail.setAttribute('data-transparent-detail-mode','full');
+    }
+    // Match the eager path's post-processing so highlight/copy/KaTeX/Mermaid land.
+    if(typeof _postProcessWithAnchorSuppression==='function'){
+      requestAnimationFrame(()=>{ try{ _postProcessWithAnchorSuppression(card); }catch(_){ } });
+    }
+  }
+  return true;
+}
+// Recover a tool call for a deferred row whose _deferredToolCall JS property was
+// dropped by an innerHTML cache round-trip: walk data-anchor-row-id back to the
+// owning message's anchor scene and rebuild the tool call from the matching row.
+function _transparentToolCallFromRowDataset(row){
+  try{
+    const rowId=row.getAttribute('data-anchor-row-id')||'';
+    // #5966 (Codex F2): resolve the OWNER message by its stamped index, not the
+    // turn's first assistant segment — a multi-segment turn's scene is owned by a
+    // later segment, so the first-segment lookup recovered the wrong (or no) scene.
+    const ownerIdxAttr=row.getAttribute('data-anchor-owner-idx');
+    let msg=null;
+    if(ownerIdxAttr!==null&&ownerIdxAttr!==''){
+      const oi=Number(ownerIdxAttr);
+      if(Number.isFinite(oi)) msg=S.messages[oi];
+    }
+    if(!msg){
+      // Fallback: find the assistant segment in this turn that actually owns a scene.
+      const turn=row.closest&&row.closest('.assistant-turn');
+      const segs=turn?Array.from(turn.querySelectorAll('.assistant-segment[data-msg-idx]')):[];
+      for(const seg of segs){
+        const i=Number(seg.getAttribute('data-msg-idx'));
+        if(Number.isFinite(i)&&S.messages[i]&&S.messages[i]._anchor_activity_scene){ msg=S.messages[i]; break; }
+      }
+    }
+    const scene=msg&&msg._anchor_activity_scene;
+    if(!scene||!rowId) return null;
+    const rows=_anchorSceneRowsForRendering(scene,{settled:true})||[];
+    const match=rows.find(r=>String(r.row_id||r.local_id||'')===rowId&&String(r.role||'')==='tool');
+    return match?_anchorSceneToolCallFromRow(match,{settled:true}):null;
+  }catch(_){ return null; }
 }
 function _wireTransparentHeaderToggle(header){
   if(!header) return;
@@ -9703,7 +12054,13 @@ function _syncTransparentEventControls(turn){
   const blocks=_assistantTurnBlocks(turn);
   if(!blocks) return;
   const rows=Array.from(blocks.querySelectorAll(':scope > .transparent-event-row,[data-transparent-event-row="1"]'));
-  const toolCount=rows.filter(row=>row.getAttribute('data-event-type')==='tool').length;
+  const mountedToolCount=rows.filter(row=>row.getAttribute('data-event-type')==='tool').length;
+  // #5966: when this turn's earlier steps are capped (some prefix rows are not
+  // mounted yet), the true tool count is stashed on the turn so the "Trace: N
+  // tools" label reflects the whole run, not just what's currently in the DOM.
+  // Falls back to the mounted count for uncapped turns and the live path.
+  const stashedTotal=Number(turn.getAttribute('data-transparent-total-tool-count'));
+  const toolCount=(Number.isFinite(stashedTotal)&&stashedTotal>mountedToolCount)?stashedTotal:mountedToolCount;
   let bar=blocks.querySelector(':scope > .transparent-event-controls');
   if(!rows.length){
     if(bar) bar.remove();
@@ -9784,6 +12141,34 @@ function _rehydrateTransparentStreamDom(root){
     }
     if(card) _setTransparentCardOpen(card,card.classList.contains('open'));
   });
+  // #5966: re-wire the "Show earlier steps" affordance. Its click handler was
+  // added via addEventListener and is lost when the session HTML-cache restores
+  // innerHTML; the DOM + data-earlier-count survive, so rebind by walking back to
+  // the owning message/segment. _revealTransparentEarlierSteps recovers the rows
+  // from the scene, so no JS-property stash is needed.
+  root.querySelectorAll('.transparent-earlier-steps[data-anchor-earlier-steps="1"]').forEach(el=>{
+    if(el.getAttribute('data-earlier-rewired')==='1') return;
+    el.setAttribute('data-earlier-rewired','1');
+    // #5966 (Codex F2): rebind to the OWNER message by stamped index (multi-segment
+    // turns own the scene on a later segment, not the first).
+    const turn=el.closest&&el.closest('.assistant-turn');
+    const ownerIdxAttr=el.getAttribute('data-anchor-owner-idx');
+    let idx=(ownerIdxAttr!==null&&ownerIdxAttr!=='')?Number(ownerIdxAttr):NaN;
+    let msg=Number.isFinite(idx)?S.messages[idx]:null;
+    let seg=(turn&&Number.isFinite(idx))?turn.querySelector('.assistant-segment[data-msg-idx="'+idx+'"]'):null;
+    if(!msg||!msg._anchor_activity_scene||!seg){
+      // Fallback: the scene-owning segment in this turn.
+      const segs=turn?Array.from(turn.querySelectorAll('.assistant-segment[data-msg-idx]')):[];
+      for(const s of segs){
+        const i=Number(s.getAttribute('data-msg-idx'));
+        if(Number.isFinite(i)&&S.messages[i]&&S.messages[i]._anchor_activity_scene){ idx=i; msg=S.messages[i]; seg=s; break; }
+      }
+    }
+    if(!msg||!seg){ return; }
+    const handler=()=>_revealTransparentEarlierSteps(msg,seg,idx,el);
+    el.addEventListener('click',handler);
+    el.addEventListener('keydown',(ev)=>{ if(ev.key==='Enter'||ev.key===' '){ ev.preventDefault(); el.click(); } });
+  });
 }
 function _decorateTransparentEventRow(row, opts){
   if(!row) return row;
@@ -9858,7 +12243,32 @@ function _decorateTransparentEventRow(row, opts){
         }
       }
       let detail=row.querySelector('.tool-card-detail');
-      if(!detail&&card){
+      // #5966: on a SETTLED, COLLAPSED tool row, defer the heavy `.tool-card-detail`
+      // body (full tool input/output HTML + Prism/KaTeX/Mermaid post-processing)
+      // until first expand. A reasoning-heavy history can carry thousands of settled
+      // tool rows; eagerly materializing every detail at load is the Transparent-
+      // Stream analogue of the #5860 compact-worklog freeze. NOTE buildToolCard
+      // PRE-BUILDS `.tool-card-detail` whenever the tool has args/output (hasDetail),
+      // so we must strip that prebuilt body too — a `!detail` guard would skip
+      // exactly the heavy rows we need to defer (Codex gate F1). The header (name,
+      // preview, status, chevron) stays; a deferred row looks identical collapsed.
+      // _materializeTransparentToolDetail() rebuilds on expand from the stashed tool
+      // call, or from data-anchor-row-id → owner message scene after the
+      // _sessionHtmlCache innerHTML round-trip drops the JS stash (#5839 class).
+      // Live and already-open rows keep their detail (about to be read).
+      const _deferDetail=card&&opts.settled===true&&!card.classList.contains('open')&&_transparentToolRowHasDetail(tc);
+      if(_deferDetail){
+        if(detail){ detail.remove(); detail=null; }   // drop any buildToolCard prebuilt body
+        if(!header.querySelector('.tool-card-toggle')){
+          const toggle=document.createElement('span');
+          toggle.className='tool-card-toggle';
+          toggle.innerHTML=li('chevron-right',12);
+          header.appendChild(toggle);
+        }
+        card.classList.remove('tool-card-no-detail');  // it DOES have detail (deferred)
+        row._deferredToolCall=tc;
+        row.setAttribute('data-transparent-detail-deferred','1');
+      }else if(!detail&&card){
         card.insertAdjacentHTML('beforeend',_transparentToolDetailHtml(tc,status));
         detail=row.querySelector('.tool-card-detail');
         if(!header.querySelector('.tool-card-toggle')){
@@ -9879,6 +12289,7 @@ function _decorateTransparentEventRow(row, opts){
         else detail.appendChild(modes);
         detail.setAttribute('data-transparent-detail-mode','full');
       }
+      if(typeof _syncTransparentEventTimestamp==='function') _syncTransparentEventTimestamp(row, header, {toolCall:tc, ts:opts.ts, live:opts.live===true});
       _wireTransparentHeaderToggle(header);
       _attachCopyButton(header);
     }
@@ -9919,6 +12330,7 @@ function _decorateTransparentEventRow(row, opts){
       }else if(preview){
         preview.remove();
       }
+      if(typeof _syncTransparentEventTimestamp==='function') _syncTransparentEventTimestamp(row, header, {ts:opts.ts, live:opts.live===true});
       _wireTransparentHeaderToggle(header);
       _attachCopyButton(header);
     }
@@ -9963,6 +12375,14 @@ function _attachProgressBar(row, opts){
 }
 function _setTransparentRowsExpanded(root, expanded){
   const scope=root||document;
+  // #5966: "Expand all" must include a capped turn's hidden earlier steps —
+  // reveal them first so expansion genuinely opens the whole run. (Collapse-all
+  // leaves the cap as-is; it only closes what's mounted.)
+  if(expanded){
+    scope.querySelectorAll('.transparent-earlier-steps[data-anchor-earlier-steps="1"]').forEach(el=>{
+      if(typeof el.click==='function') el.click();
+    });
+  }
   scope.querySelectorAll('.transparent-event-row .tool-card,.transparent-event-row .thinking-card').forEach(card=>{
     _setTransparentCardOpen(card,!!expanded);
   });
@@ -10040,13 +12460,40 @@ function _applyTransparentRowFading(turn){
     row.setAttribute('data-transparent-fade',String(step));
   }
 }
+// Resolve the assistant message that carries a transparent turn's settled
+// metadata (duration / used model / TTFT / usage). A tool-using turn renders
+// multiple assistant segments — earlier activity segment(s) then the final
+// answer — and the metadata is stamped only on the LAST assistant message
+// (see api/streaming.py finalization). `turn.querySelector('.assistant-segment')`
+// returns the FIRST segment, which has no metadata, so the footer (model chip
+// included) would render empty exactly on tool turns (#6068 gate round 2).
+// Scan segments last→first for the final metadata-bearing assistant message,
+// falling back to the last assistant segment when none carries metadata yet.
+function _transparentTurnMetaMessage(turn){
+  if(!turn)return null;
+  const segs=turn.querySelectorAll('.assistant-segment[data-msg-idx]');
+  let fallback=null;
+  for(let si=segs.length-1;si>=0;si--){
+    const mi=segs[si].getAttribute('data-msg-idx');
+    if(mi==null)continue;
+    const candidate=S.messages[Number(mi)];
+    if(!candidate||candidate.role!=='assistant')continue;
+    if(!fallback)fallback=candidate;
+    if(candidate._turnDuration!=null||candidate._usedModel||candidate._firstTokenMs!=null||candidate._turnUsage)return candidate;
+  }
+  return fallback;
+}
 // ── Transparent turn footer (elapsed · tokens · TTFT · status) ───────────
 // Mirrors the live run-status line for settled turns in transparent
 // mode. Shows duration, first-token time, token usage, and final status.
 // Only rendered for turns that have transparent event rows.
-function _transparentTurnFooterHtml(durationText, ttftText, tokensText, statusText){
+function _transparentTurnFooterHtml(durationText, modelText, ttftText, tokensText, statusText, modelTitle){
   const parts=[];
   if(durationText) parts.push(`<span class="lf-time">${esc(durationText)}</span>`);
+  if(modelText){
+    const titleAttr=(modelTitle&&modelTitle!==modelText)?` title="${esc(modelTitle)}"`:'';
+    parts.push(`<span class="lf-model"${titleAttr}>${esc(modelText)}</span>`);
+  }
   if(ttftText) parts.push(`<span class="lf-ttft" title="${esc(t('first_token_time')||'Time to first token')}">TTFT ${esc(ttftText)}</span>`);
   if(tokensText) parts.push(`<span class="lf-tokens">${esc(tokensText)}</span>`);
   if(statusText) parts.push(`<span class="lf-status">${esc(statusText)}</span>`);
@@ -10065,10 +12512,12 @@ function _renderTransparentTurnFooter(turn, opts){
     return;
   }
   const durationText=opts&&opts.durationText||'';
+  const modelText=opts&&opts.modelText||'';
+  const modelTitle=opts&&opts.modelTitle||'';
   const ttftText=opts&&opts.ttftText||'';
   const tokensText=opts&&opts.tokensText||'';
   const statusText=opts&&opts.statusText||(t('done')||'Done');
-  const html=_transparentTurnFooterHtml(durationText, ttftText, tokensText, statusText);
+  const html=_transparentTurnFooterHtml(durationText, modelText, ttftText, tokensText, statusText, modelTitle);
   let footer=turn.querySelector('.transparent-turn-footer');
   if(!html){
     if(footer) footer.remove();
@@ -10134,12 +12583,77 @@ function _onLiveActivityToggle(group){
   if(group.getAttribute('data-live-tool-call-group')!=='1') return;
   _liveActivityUserExpanded = !group.classList.contains('tool-call-group-collapsed');
 }
+function _materializeDeferredWorklogRows(group){
+  // #5839: build the row DOM for a settled worklog whose rows were deferred at
+  // render time (collapsed). Idempotent — clears the marker so it runs once.
+  if(!group||group.getAttribute('data-worklog-rows-deferred')!=='1') return false;
+  let rows=group._deferredWorklogRows;
+  // The JS-property stash is dropped when the transcript is restored from the
+  // HTML cache (innerHTML round-trip). Recover the rows from the owning message
+  // via the disclosure key (anchor-scene:<rawIdx>) so a post-restore expand
+  // still fills the worklog. (#5839)
+  if((!rows||!rows.length)&&typeof _deferredWorklogRowsFromGroup==='function'){
+    rows=_deferredWorklogRowsFromGroup(group);
+  }
+  group.removeAttribute('data-worklog-rows-deferred');
+  group._deferredWorklogRows=null;
+  if(!rows||!rows.length) return false;
+  const ok=_renderAnchorSceneRowsIntoWorklog(group,rows,{settled:true});
+  if(!ok) return false;
+  // #5839 fix: the eager render path post-processes its rows (syntax highlight,
+  // copy buttons, mermaid, katex, structured trees) and restores detail-disclosure
+  // state; a lazily-materialized group must do the same or expanded rows render
+  // un-enhanced and any captured open/scroll state is lost. Post-process on the
+  // next frame (matching the eager rebuild paths), then re-apply the disclosure
+  // state stashed with the group at defer time.
+  const disclosure=group._deferredWorklogDisclosure;
+  group._deferredWorklogDisclosure=null;
+  if(typeof _postProcessWithAnchorSuppression==='function'
+     && typeof requestAnimationFrame==='function'){
+    requestAnimationFrame(()=>{
+      _postProcessWithAnchorSuppression(group);
+      if(disclosure&&disclosure.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+        _restoreWorklogDetailDisclosureState(group, disclosure);
+      }
+    });
+  }else if(disclosure&&disclosure.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+    _restoreWorklogDetailDisclosureState(group, disclosure);
+  }
+  return true;
+}
+function _deferredWorklogRowsFromGroup(group){
+  // Recover a settled worklog's rows from S.messages using the group's
+  // disclosure key `anchor-scene:<rawIdx>`. Used after an HTML-cache restore
+  // where the _deferredWorklogRows JS property was dropped. (#5839)
+  const key=group&&group.getAttribute&&group.getAttribute('data-activity-disclosure-key');
+  const m=key&&/^anchor-scene:(\d+)$/.exec(key);
+  if(!m) return null;
+  const msg=S.messages&&S.messages[Number(m[1])];
+  const scene=msg&&msg._anchor_activity_scene;
+  if(!scene) return null;
+  return _anchorSceneRowsForRendering(scene,{settled:true});
+}
+function _rehydrateDeferredWorklogsFromCache(root){
+  // After restoring a transcript from _sessionHtmlCache, deferred settled
+  // worklogs carry data-worklog-rows-deferred="1" but lost their stashed rows
+  // (JS properties don't survive innerHTML). Re-stash from the owning message so
+  // the first expand materializes correctly. (#5839)
+  if(!root||!root.querySelectorAll) return;
+  root.querySelectorAll('[data-worklog-rows-deferred="1"]').forEach(group=>{
+    if(group._deferredWorklogRows&&group._deferredWorklogRows.length) return;
+    const rows=_deferredWorklogRowsFromGroup(group);
+    if(rows&&rows.length) group._deferredWorklogRows=rows;
+    else group.removeAttribute('data-worklog-rows-deferred'); // nothing to defer
+  });
+}
 function _toggleActivityGroup(summary){
   const group=summary&&summary.closest?summary.closest('.agent-activity-group,.tool-call-group'):null;
   if(!group) return;
   const collapsed=group.classList.toggle('tool-call-group-collapsed');
   group.classList.toggle('open',!collapsed);
   summary.setAttribute('aria-expanded',String(!collapsed));
+  // #5839: materialize deferred settled rows on first expand (lazy render).
+  if(!collapsed) _materializeDeferredWorklogRows(group);
   _writeActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'), !collapsed);
   if(typeof _onLiveActivityToggle==='function') _onLiveActivityToggle(group);
 }
@@ -10505,6 +13019,22 @@ function _anchorSceneIsSettledSuccessfulCompression(row, settled){
 function _anchorSceneToolCallFromRow(row, opts){
   const tool=(row&&row.tool&&typeof row.tool==='object')?row.tool:{};
   const payload=(row&&row.payload&&typeof row.payload==='object')?row.payload:{};
+  const timestampSeconds=typeof _timestampSeconds==='function'?_timestampSeconds:function(value){
+    const stamp=Number(value);
+    return Number.isFinite(stamp)&&stamp>0?(stamp>1e12?stamp/1000:stamp):null;
+  };
+  const firstValidTimestampSeconds=typeof _firstValidTimestampSeconds==='function'
+    ? _firstValidTimestampSeconds
+    : function(...values){
+        for(const value of values){
+          const stamp=timestampSeconds(value);
+          if(stamp) return stamp;
+        }
+        return null;
+      };
+  const rowTs=typeof _anchorSceneRowTimestampSeconds==='function'
+    ? _anchorSceneRowTimestampSeconds(row)
+    : firstValidTimestampSeconds(row&&row.created_at, row&&row.timestamp, row&&row.ts, row&&row.started_at, row&&row.completed_at);
   const id=tool.id||row.tool_call_id||payload.tid||payload.id||payload.tool_call_id||payload.tool_use_id||payload.call_id||'';
   const settled=!!(opts&&opts.settled);
   return {
@@ -10518,11 +13048,35 @@ function _anchorSceneToolCallFromRow(row, opts){
     )||'',
     done:settled?true:(tool.done!==null&&tool.done!==undefined?tool.done:(row.status!=='running'&&row.status!=='pending')),
     is_error:!!(tool.is_error||payload.is_error||row.status==='error'||row.status==='failed'),
+    is_diff:!!(tool.is_diff||payload.is_diff||payload.isDiff),
     duration:tool.duration||payload.duration||payload.duration_seconds,
-    started_at:tool.started_at||payload.started_at,
+    started_at:firstValidTimestampSeconds(tool.started_at, payload.started_at, rowTs),
+    created_at:firstValidTimestampSeconds(tool.created_at, payload.created_at, rowTs),
+    timestamp:firstValidTimestampSeconds(tool.timestamp, payload.timestamp, rowTs),
+    ts:firstValidTimestampSeconds(
+      tool.ts,
+      payload.ts,
+      tool.timestamp,
+      payload.timestamp,
+      tool.created_at,
+      payload.created_at,
+      rowTs
+    ),
     tid:id,
     id,
   };
+}
+function _anchorSceneRowTimestampSeconds(row){
+  if(!row) return null;
+  const timestampSeconds=typeof _timestampSeconds==='function'?_timestampSeconds:function(value){
+    const stamp=Number(value);
+    return Number.isFinite(stamp)&&stamp>0?(stamp>1e12?stamp/1000:stamp):null;
+  };
+  for(const key of ['created_at','timestamp','ts','started_at','completed_at']){
+    const stamp=timestampSeconds(row[key]);
+    if(stamp) return stamp;
+  }
+  return null;
 }
 function _anchorSceneNodeForRow(row, opts){
   const settled=!!(opts&&opts.settled);
@@ -10531,11 +13085,28 @@ function _anchorSceneNodeForRow(row, opts){
   if(row.role==='prose'){
     const text=String(row.text||'').trim();
     if(!text) return null;
-    node=document.createElement('div');
-    node.className='assistant-segment';
-    node.setAttribute('data-anchor-scene-prose','1');
-    node.dataset.rawText=text;
-    node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    // Incremental live rendering: reuse a persistent smd node fed only the delta
+    // instead of re-parsing the whole growing answer on every streamed frame
+    // (O(n^2) -> O(n)). Settled rows and any failure fall through to the full
+    // renderMd path below, which stays the source of truth for the final DOM.
+    const proseKey=row.local_id||row.row_id||'';
+    if(!settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
+      const inc=window.__anchorProseIncrementalNode(proseKey,text,{
+        finalize:String(row.status||'').toLowerCase()==='completed',
+      });
+      // Route the incremental node through the shared row-decoration block below
+      // (data-anchor-scene-row / -row-id / -row-role / -source-event-type) instead
+      // of returning early — otherwise live incremental prose rows lose the
+      // identity attributes the scene reconciler matches on. (Codex gate #5466)
+      if(inc){ node=inc; }
+    }
+    if(!node){
+      node=document.createElement('div');
+      node.className='assistant-segment';
+      node.setAttribute('data-anchor-scene-prose','1');
+      node.dataset.rawText=text;
+      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
@@ -10578,6 +13149,7 @@ function _anchorSceneNodeForRow(row, opts){
   if(!node) return null;
   node.setAttribute('data-anchor-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
   return node;
@@ -10587,6 +13159,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
   const live=!!(opts&&opts.live);
   if(!row) return null;
   let node=null;
+  const eventTs=typeof _anchorSceneRowTimestampSeconds==='function'?_anchorSceneRowTimestampSeconds(row):null;
   const meta={
     segmentSeq:row.segment_seq||row.segmentSeq||'',
     burstId:row.activity_burst_id||row.burst_id||row.burstId||'',
@@ -10604,6 +13177,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     const text=String(row.text||'').trim();
     if(!text) return null;
     const finalAnswer=String((opts&&opts.finalAnswer)||'').trim();
+    if(opts&&opts.liveTokenFinalPrefixEligible&&_anchorSceneLiveTokenFinalPrefix(row,text,finalAnswer)) return null;
     if(finalAnswer&&_anchorSceneProseMatchesFinalAnswer(text,finalAnswer)) return null;
     node=_anchorSceneNodeForRow(row,{settled});
     if(!node) return null;
@@ -10616,22 +13190,28 @@ function _anchorSceneTransparentNodeForRow(row, opts){
       type:'thinking',
       text,
       preview:text,
+      ts:eventTs,
       ...meta,
+      live,
     });
   }else if(row.role==='tool'){
     const toolCall=_anchorSceneToolCallFromRow(row,{settled});
     node=_decorateTransparentEventRow(buildToolCard(toolCall),{
       type:'tool',
       name:toolCall&&toolCall.name,
-      status:_transparentToolStatus(toolCall,true),
+      status:_transparentToolStatus(toolCall,settled),
       toolCall,
+      ts:eventTs,
       ...meta,
+      live,
+      settled,
     });
   }else{
     node=_anchorSceneNodeForRow(row,{settled});
     node=_decorateTransparentEventRow(node,{
       type:String(row.role||'activity'),
       ...meta,
+      live,
     });
   }
   if(!node) return null;
@@ -10639,12 +13219,25 @@ function _anchorSceneTransparentNodeForRow(row, opts){
   if(settled) node.setAttribute('data-anchor-settled-scene-row','1');
   if(live) node.setAttribute('data-anchor-live-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
   if(opts&&opts.streamId) node.setAttribute('data-anchor-stream-id',String(opts.streamId));
   if(opts&&opts.sessionId) node.setAttribute('data-session-id',String(opts.sessionId));
   if(live) node.setAttribute('data-live-stream-owned','1');
   return node;
+}
+function _anchorSceneLiveTokenFinalPrefix(row, proseText, finalAnswer){
+  if(!row||row.role!=='prose'||row.kind!=='process_prose') return false;
+  if(String(row.source_event_type||'')!=='token') return false;
+  if(!String(row.local_id||'').startsWith('live-prose:')) return false;
+  const norm=(s)=>String(s||'').replace(/\s+/g,' ').trim().toLowerCase();
+  const rowKey=norm(proseText), finalKey=norm(finalAnswer);
+  return !!(rowKey&&finalKey&&rowKey.length<finalKey.length&&finalKey.startsWith(rowKey));
+}
+function _anchorSceneLastNonTerminalWorkRowIndex(rows){
+  if(!Array.isArray(rows)) return -1;
+  return rows.reduce((last,row,idx)=>(row&&row.role==='tool')?idx:last,-1);
 }
 // Whitespace-insensitive compare so a scene prose row that IS the final answer
 // (possibly re-wrapped) is recognized and not duplicated against the segment.
@@ -10818,12 +13411,125 @@ function _prepareLiveAnchorScrollRebuildGuard(scrollSnapshot){
     },
   };
 }
+function _restoreLiveAnchorScrollSnapshotAfterRebuild(scrollSnapshot, scrollRebuildGuard){
+  if(!scrollSnapshot) return;
+  const hasHeightGuard=!!(scrollRebuildGuard&&scrollRebuildGuard.release);
+  // Pinned renders have no height guard to release, but still need the same
+  // queued ownership check: a reader can provide real input before the frame
+  // settles, and that input must win over the captured tail position.
+  if(!hasHeightGuard&&scrollSnapshot.pinned!==true) return;
+  requestAnimationFrame(()=>{
+    if(hasHeightGuard) scrollRebuildGuard.release();
+    // Only re-restore the unpinned snapshot if the reader is STILL unpinned at
+    // rAF time. If they re-pinned between guard-engage and this frame, the
+    // stale re-restore would yank them back off the bottom (Opus gate finding).
+    if(scrollSnapshot.pinned===true||_messageUserUnpinned){
+      _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+    }
+  });
+}
+function _resetMismatchedLiveAssistantTurnForSession(turn, sessionId){
+  const sid=String(sessionId||'');
+  if(!turn||!sid||!turn.dataset) return false;
+  const existingSid=String(turn.dataset.sessionId||'');
+  if(!existingSid||existingSid===sid) return false;
+  const blocks=typeof _assistantTurnBlocks==='function' ? _assistantTurnBlocks(turn) : turn;
+  if(blocks){
+    try{
+      blocks.innerHTML='';
+    }catch(_){
+      while(blocks.firstChild) blocks.removeChild(blocks.firstChild);
+    }
+  }
+  turn.dataset.sessionId=sid;
+  return true;
+}
+function _liveAnchorReasoningRowForFallback(turn, opts){
+  opts=opts||{};
+  const blocks=typeof _assistantTurnBlocks==='function' ? _assistantTurnBlocks(turn) : turn;
+  if(!turn||!blocks||!blocks.querySelectorAll) return null;
+  const streamId=String(opts.streamId||S.activeStreamId||'');
+  const sessionId=String(opts.sessionId||(S.session&&S.session.session_id)||'');
+  const localId=String(opts.anchorReasoningLocalId||opts.localId||'').trim();
+  if(!localId) return null;
+  const rows=blocks.querySelectorAll(
+    '[data-anchor-scene-row="1"][data-anchor-local-id]'
+  );
+  for(const row of Array.from(rows)){
+    const anchorLocalId=String(row.getAttribute&&row.getAttribute('data-anchor-local-id')||'');
+    if(anchorLocalId!==localId) continue;
+    const rowRole=String(row.getAttribute&&row.getAttribute('data-anchor-row-role')||'');
+    const rowSource=String(row.getAttribute&&row.getAttribute('data-anchor-source-event-type')||'');
+    if(rowRole!=='thinking'&&rowSource!=='reasoning') continue;
+    const rowStreamId=String(row.getAttribute&&row.getAttribute('data-anchor-stream-id')||'');
+    if(rowStreamId&&streamId&&rowStreamId!==streamId) continue;
+    const rowSessionId=String(row.getAttribute&&row.getAttribute('data-session-id')||'');
+    if(rowSessionId&&sessionId&&rowSessionId!==sessionId) continue;
+    return row;
+  }
+  return null;
+}
+function _updateLiveAnchorReasoningRowForFallback(turn, text, opts){
+  const clean=_sanitizeThinkingDisplayText(text);
+  if(!clean||window._showThinking===false) return false;
+  const row=_liveAnchorReasoningRowForFallback(turn, opts);
+  if(!row) return false;
+  if(row.classList&&row.classList.contains('wl-reason')){
+    if(typeof _renderWorklogReasonInto==='function') _renderWorklogReasonInto(row, clean);
+    else row.textContent=clean;
+    const group=row.closest&&row.closest('.tool-worklog-group,.tool-call-group,.live-worklog');
+    if(group&&typeof _syncToolCallGroupSummary==='function') _syncToolCallGroupSummary(group);
+  }else if(row.classList&&row.classList.contains('transparent-event-row')){
+    _renderThinkingInto(row, clean);
+    const eventAt=row.getAttribute&&row.getAttribute('data-event-at');
+    const nextTs=typeof _firstValidTimestampSeconds==='function'
+      ? _firstValidTimestampSeconds(opts&&opts.ts, opts&&opts.timestamp, opts&&opts.created_at, eventAt)
+      : null;
+    if(typeof _decorateTransparentEventRow==='function'){
+      _decorateTransparentEventRow(row,{
+        type:'thinking',
+        text:clean,
+        preview:clean,
+        ts:nextTs||undefined,
+        live:true,
+        segmentSeq:opts&&opts.segmentSeq,
+        burstId:opts&&opts.burstId,
+      });
+    }
+  }else{
+    _renderThinkingInto(row, clean);
+  }
+  if(turn&&typeof _syncTransparentEventControls==='function') _syncTransparentEventControls(turn);
+  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  return true;
+}
 function renderLiveAnchorActivityScene(streamId, scene, opts){
   opts=opts||{};
-  if(typeof isTransparentStream==='function'&&isTransparentStream()){
+  const requestedMode=opts.mode;
+  const activeMode=chatActivityMode();
+  // The USER's active activity-display mode is authoritative for what gets
+  // painted. `requestedMode` (opts.mode) is only a fallback hint from callers
+  // that hardcode {mode:'compact_worklog'} (appendLiveToolCard / ensureLiveWorklogShell
+  // / appendLiveCompressionCard, etc.) — it must NEVER override the active mode, or a
+  // transparent_stream turn gets a compact grouped-worklog frame forced onto it. That
+  // regressed #5942 (grouped↔individual alternating) + #5943 (per-tick row rebuild /
+  // flicker) when #5746's requestedMode-precedence landed: the good build always
+  // checked isTransparentStream() FIRST and ignored the hint. Restore active-mode-wins:
+  // honor requestedMode ONLY when there is no usable active mode.
+  const knownMode=(m)=>m==='compact_worklog'||m==='transparent_stream'||m==='hide_all_activity';
+  const sceneMode=knownMode(activeMode)?activeMode:(knownMode(requestedMode)?requestedMode:activeMode);
+  if(sceneMode==='hide_all_activity') return false;
+  const existingTurn=$('liveAssistantTurn');
+  const requestedSessionId=String(opts.sessionId||'');
+  const existingTurnSessionId=String(existingTurn&&existingTurn.dataset&&existingTurn.dataset.sessionId||'');
+  if(existingTurn&&requestedSessionId&&existingTurnSessionId&&existingTurnSessionId!==requestedSessionId){
+    if(!_resetMismatchedLiveAssistantTurnForSession(existingTurn, requestedSessionId)) return false;
+  }
+  if(sceneMode==='transparent_stream'){
     return _renderLiveAnchorActivitySceneTransparent(streamId,scene,opts);
   }
-  if(typeof isCompactWorklogMode==='function'&&!isCompactWorklogMode()) return false;
+  if(typeof isSimplifiedToolCalling==='function'&&!isSimplifiedToolCalling()) return false;
+  if(sceneMode!=='compact_worklog') return false;
   if(!S.session||!S.activeStreamId) return false;
   if(opts.sessionId&&S.session.session_id!==opts.sessionId) return false;
   if(streamId&&S.activeStreamId!==streamId) return false;
@@ -10871,15 +13577,7 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   _dedupeLiveProcessedWorklogAnchors(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-  if(scrollRebuildGuard&&scrollRebuildGuard.release){
-    requestAnimationFrame(()=>{
-      scrollRebuildGuard.release();
-      // Only re-restore the unpinned snapshot if the reader is STILL unpinned at
-      // rAF time. If they re-pinned between guard-engage and this frame, the
-      // stale re-restore would yank them back off the bottom (Opus gate finding).
-      if(_messageUserUnpinned) _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-    });
-  }
+  _restoreLiveAnchorScrollSnapshotAfterRebuild(scrollSnapshot,scrollRebuildGuard);
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
@@ -10944,8 +13642,9 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     el.hidden=true;
   });
   const liveFooter=blocks.querySelector('#liveRunStatus');
-  let wrote=false;
+  const renderedRows=[];
   for(const row of rows){
+    const rowEventTs=typeof _anchorSceneRowTimestampSeconds==='function'?_anchorSceneRowTimestampSeconds(row):null;
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
       settled:false,
@@ -10956,26 +13655,37 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     const key = _transparentLiveRowKey(node, activeStreamId);
     const existing = key ? preserveByKey.get(key) : null;
     const renderedNode = existing && _transparentLiveRowsCompatible(existing, node)
-      ? _refreshTransparentLiveRow(existing, node)
+      ? _refreshTransparentLiveRow(existing, node, {
+        preserveEventAt:!rowEventTs&&existing.getAttribute?existing.getAttribute('data-event-at'):null,
+      })
       : node;
     if(existing) preserveByKey.delete(key);
     if(!renderedNode) continue;
-    if(liveFooter&&liveFooter.parentElement===blocks) blocks.insertBefore(renderedNode,liveFooter);
+    renderedRows.push(renderedNode);
+  }
+  const transparentLiveRowAlreadyPositioned=(node, expectedNextSibling)=>!!(
+    node &&
+    node.parentElement===blocks &&
+    node.nextSibling===expectedNextSibling
+  );
+  let expectedNextSibling=(liveFooter&&liveFooter.parentElement===blocks) ? liveFooter : null;
+  for(let i=renderedRows.length-1;i>=0;i--){
+    const renderedNode=renderedRows[i];
+    if(transparentLiveRowAlreadyPositioned(renderedNode,expectedNextSibling)){
+      expectedNextSibling=renderedNode;
+      continue;
+    }
+    if(expectedNextSibling&&expectedNextSibling.parentElement===blocks) blocks.insertBefore(renderedNode,expectedNextSibling);
     else blocks.appendChild(renderedNode);
-    wrote=true;
+    expectedNextSibling=renderedNode;
   }
   preserveByKey.forEach(stale=>stale.remove());
-  if(wrote) _syncTransparentEventControls(turn);
+  if(renderedRows.length) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-  if(scrollRebuildGuard&&scrollRebuildGuard.release){
-    requestAnimationFrame(()=>{
-      scrollRebuildGuard.release();
-      if(_messageUserUnpinned) _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-    });
-  }
+  _restoreLiveAnchorScrollSnapshotAfterRebuild(scrollSnapshot,scrollRebuildGuard);
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
-  return wrote;
+  return !!renderedRows.length;
 }
 
 function _transparentLiveRowKey(node, streamId){
@@ -11029,6 +13739,7 @@ function _rehydrateTransparentLiveRow(existing, node, preservedState){
   if(!existing) return;
   if(node && Object.prototype.hasOwnProperty.call(node, '_tcData')) existing._tcData = node._tcData;
   else if(Object.prototype.hasOwnProperty.call(existing, '_tcData')) delete existing._tcData;
+  try{ delete node._tcData; }catch(_){}
   const header = existing.querySelector ? existing.querySelector('.tool-card-header,.thinking-card-header') : null;
   if(header){
     if(typeof _wireTransparentHeaderToggle === 'function') _wireTransparentHeaderToggle(header);
@@ -11049,10 +13760,86 @@ function _rehydrateTransparentLiveRow(existing, node, preservedState){
   }
 }
 
-function _refreshTransparentLiveRow(existing, node){
-  if(!existing || !node || !existing.getAttribute) return node;
-  if(existing===node) return existing;
-  const preservedState = _transparentLiveRowInteractiveState(existing);
+function _refreshTransparentThinkingLiveRow(existing, node){
+  if(!existing || !node || !existing.querySelector || !node.querySelector) return false;
+  const existingType = String(existing.getAttribute('data-event-type') || '');
+  const nodeType = String(node.getAttribute('data-event-type') || '');
+  const existingIsThinking = existingType === 'thinking' || (existing.classList&&existing.classList.contains('transparent-thinking-event'));
+  const nodeIsThinking = nodeType === 'thinking' || (node.classList&&node.classList.contains('transparent-thinking-event'));
+  if(!existingIsThinking || !nodeIsThinking) return false;
+  const existingPre = existing.querySelector('.thinking-card-body pre');
+  const nodePre = node.querySelector('.thinking-card-body pre');
+  if(!existingPre || !nodePre) return false;
+  const nextText = String(nodePre.textContent || '');
+  if(existingPre.textContent !== nextText) existingPre.textContent = nextText;
+  const nodePreview = node.querySelector('.transparent-event-thinking-preview');
+  const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
+  if(typeof _decorateTransparentEventRow === 'function'){
+    const nodeStampSource = node.getAttribute ? String(node.getAttribute('data-event-at-source') || '') : '';
+    const existingStamp = existing.getAttribute ? existing.getAttribute('data-event-at') : null;
+    const nodeStamp = node.getAttribute ? node.getAttribute('data-event-at') : null;
+    const nextStamp = nodeStampSource === 'event'
+      ? (nodeStamp || existingStamp)
+      : (existingStamp || nodeStamp);
+    _decorateTransparentEventRow(existing,{
+      type:'thinking',
+      text:nextText,
+      preview:previewText,
+      ts:nextStamp||undefined,
+      live:true,
+    });
+  }
+  return true;
+}
+
+function _bindTransparentFadeCleanup(body){
+  if(!body || body._transparentFadeCleanupBound || typeof body.addEventListener !== 'function') return;
+  body._transparentFadeCleanupBound = true;
+  body.addEventListener('animationend', e=>{
+    const span = e.target;
+    if(!span || !span.classList || !span.classList.contains('stream-fade-word')) return;
+    // Keep the animated inline node stable for the lifetime of the live turn,
+    // exactly like _streamFadeBindCleanup() in messages.js. Replacing each word
+    // with a fresh text node makes native scroll anchoring choose a new anchor
+    // while the transparent prose row is still growing, producing a visible
+    // vertical bounce. Final settlement rebuilds plain persisted DOM.
+    span.classList.remove('is-new');
+    if(span.style) span.style.removeProperty('--stream-fade-ms');
+  });
+}
+
+function _appendTransparentFadeText(body, text){
+  if(!body) return;
+  const value = String(text || '');
+  if(!value) return;
+  _bindTransparentFadeCleanup(body);
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const frag = document.createDocumentFragment();
+  const wordRe = /(\S+)(\s*)/g;
+  let last = 0, match, changed = false;
+  while((match = wordRe.exec(value))){
+    if(match.index > last) frag.appendChild(document.createTextNode(value.slice(last, match.index)));
+    if(reduceMotion){
+      frag.appendChild(document.createTextNode(match[1]));
+    }else{
+      const span = document.createElement('span');
+      span.className = 'stream-fade-word is-new';
+      span.textContent = match[1];
+      frag.appendChild(span);
+    }
+    if(match[2]) frag.appendChild(document.createTextNode(match[2]));
+    last = match.index + match[0].length;
+    changed = true;
+  }
+  if(!changed) frag.appendChild(document.createTextNode(value));
+  else if(last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
+  body.appendChild(frag);
+}
+
+function _refreshTransparentFadeProseRow(existing, node, preservedState){
+  let body = existing.querySelector ? existing.querySelector('.msg-body') : null;
+  const nextText = String((node.dataset && node.dataset.rawText) || (node.textContent || ''));
+  const currentText = String(existing.getAttribute('data-stream-fade-text') || (body && body.textContent) || '');
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
   for(const pair of pairs){
@@ -11067,14 +13854,71 @@ function _refreshTransparentLiveRow(existing, node){
     existing.setAttribute(name, value);
   }
   existing.className = node.className || '';
-  existing.innerHTML = node.innerHTML || '';
+  if(!body){
+    body = document.createElement('div');
+    body.className = 'msg-body';
+    existing.appendChild(body);
+  }
+  if(body.classList) body.classList.add('stream-fade-active');
+  if(!nextText.startsWith(currentText)){
+    body.textContent = '';
+    existing.setAttribute('data-stream-fade-text', '');
+    _appendTransparentFadeText(body, nextText);
+  }else{
+    _appendTransparentFadeText(body, nextText.slice(currentText.length));
+  }
+  existing.setAttribute('data-stream-fade-text', nextText);
   _rehydrateTransparentLiveRow(existing, node, preservedState);
   return existing;
 }
+
+function _refreshTransparentLiveRow(existing, node, opts){
+  opts=opts||{};
+  if(!existing || !node || !existing.getAttribute) return node;
+  if(existing===node) return existing;
+  const preservedState = _transparentLiveRowInteractiveState(existing);
+  const candidateIsFadeProse = node.getAttribute('data-anchor-row-role') === 'prose' &&
+    node.querySelector &&
+    !!node.querySelector('.msg-body.stream-fade-active,.stream-fade-word');
+  if(candidateIsFadeProse){
+    return _refreshTransparentFadeProseRow(existing, node, preservedState);
+  }
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  if(_refreshTransparentThinkingLiveRow(existing, node)){
+    _rehydrateTransparentLiveRow(existing, node, preservedState);
+    return existing;
+  }
+  const newHtml = node.innerHTML || '';
+  const htmlChanged = existing.innerHTML !== newHtml;
+  if(htmlChanged) existing.innerHTML = newHtml;
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  if(opts.preserveEventAt){
+    const header = existing.querySelector ? existing.querySelector('.tool-card-header,.thinking-card-header') : null;
+    if(header) _syncTransparentEventTimestamp(existing, header, {ts:opts.preserveEventAt, live:false});
+  }
+  return existing;
+}
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
-  const mode=(typeof isTransparentStream==='function'&&isTransparentStream())
-    ? 'transparent_stream'
-    : ((opts&&opts.mode)||'compact_worklog');
+  const requestedMode=opts&&opts.mode;
+  const activeMode=chatActivityMode();
+  const mode=activeMode==='hide_all_activity'
+    ? 'hide_all_activity'
+    : (requestedMode==='compact_worklog'||requestedMode==='transparent_stream'||requestedMode==='hide_all_activity'
+    ? requestedMode
+    : activeMode);
   const scene=_projectLiveAnchorActivitySceneForStream(streamId,mode);
   if(!scene) return false;
   return renderLiveAnchorActivityScene(streamId,scene,{...(opts||{}),sessionId});
@@ -11114,6 +13958,23 @@ function _anchorSceneSceneHasWorklogWorthyRows(scene){
   }
   return false;
 }
+// #5941: an errored/failed turn's terminal_state. A turn that ended in a
+// provider/agent failure but which DID produce assistant content (tool calls,
+// reasoning) still folds that content into a collapsed worklog above the error
+// card — so the user reads a lone error bubble as "nothing came back", even
+// though the real response is one click away. These are the terminal states
+// that must keep the produced content VISIBLE by default. `completed` (normal
+// turn) and null are deliberately excluded, and `cancelled`/`interrupted`
+// (user-initiated stops with their own dedicated cards + #5224 transcript
+// preservation) are left to their existing behavior — this is scoped to the
+// error/failure family the report is about.
+const _ANCHOR_SCENE_ERRORED_TERMINAL_STATES=new Set([
+  'error','no_response','degraded','connection_lost','tool_limit_reached','compression_exhausted',
+]);
+function _anchorSceneHasErroredTerminalState(scene){
+  const state=String(scene&&scene.terminal_state||'').trim().toLowerCase();
+  return _ANCHOR_SCENE_ERRORED_TERMINAL_STATES.has(state);
+}
 function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx){
   if(!message||!message._anchor_activity_scene||!segment) return false;
   if(!_anchorSceneSceneHasWorklogWorthyRows(message._anchor_activity_scene)) return false;
@@ -11122,6 +13983,7 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
   const scene=message._anchor_activity_scene;
   const rows=_anchorSceneRowsForRendering(scene,{settled:true});
   if(!rows.length) return false;
+  const lastNonTerminalWorkRowIndex=_anchorSceneLastNonTerminalWorkRowIndex(rows);
   // The assistant segment owns the final answer; pass it so intermediate prose
   // rows render but the final-answer-duplicate prose row is suppressed.
   const finalAnswer=String(
@@ -11131,6 +13993,7 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
     || ''
   );
   blocks.querySelectorAll('[data-anchor-settled-scene-row="1"],.transparent-event-row[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  blocks.querySelectorAll('.transparent-earlier-steps[data-anchor-earlier-steps="1"]').forEach(el=>el.remove());
   blocks.querySelectorAll('.assistant-segment[data-msg-idx]').forEach(node=>{
     const idx=Number(node.getAttribute('data-msg-idx'));
     if(Number.isFinite(idx)&&idx<rawIdx){
@@ -11139,19 +14002,189 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
       node.hidden=true;
     }
   });
-  let wrote=false;
-  for(const row of rows){
-    const node=_anchorSceneTransparentNodeForRow(row,{settled:true,finalAnswer});
-    if(!node) continue;
+  // #5966: per-turn row cap. A reasoning-heavy settled turn can carry hundreds of
+  // activity rows; rendering them all inline is the node-count half of the
+  // Transparent-Stream memory blowup (detail-deferral above handles per-row
+  // weight). Render only the last _TRANSPARENT_SETTLED_ROW_CAP rows and, when the
+  // turn exceeds cap + slack, prepend a single "Show earlier steps (N)" affordance
+  // that materializes the omitted prefix in place on click. Two exemptions keep
+  // behavior identical where a cap would be wrong or unhelpful:
+  //   • the JUST-SETTLED turn (its stream id matches the keep-open token) renders
+  //     in full — capping it at STREAM_DONE would shrink the transcript and cause
+  //     the backward-jump the keep-open token exists to prevent;
+  //   • a turn already revealed this session (data flag) stays fully rendered
+  //     across ordinary rebuilds / virtualize-out+in cycles.
+  const turnEl=segment.closest('.assistant-turn');
+  const streamId=String(message._anchor_stream_id||scene.stream_id||(scene.identity&&scene.identity.stream_id)||'');
+  const justSettled=_shouldKeepSettledWorklogOpenForStreamSettle(streamId);
+  // #5966 (Codex F3): revealed-state is authoritative from the persistent set
+  // (survives cache round-trip / rebuild / switch-away), with the DOM flag as a
+  // same-render fast path.
+  const revealKey=_transparentRevealKey(S.session&&S.session.session_id, rawIdx);
+  const alreadyRevealed=_transparentRevealedTurns.has(revealKey)
+    || !!(turnEl&&turnEl.getAttribute('data-transparent-earlier-revealed')==='1');
+  const cap=_TRANSPARENT_SETTLED_ROW_CAP;
+  const slack=_TRANSPARENT_SETTLED_ROW_CAP_SLACK;
+  let startIdx=0;
+  if(!justSettled&&!alreadyRevealed&&rows.length>cap+slack){
+    startIdx=rows.length-cap;
+  }
+  // Stash the TRUE tool-row count so "Trace: N tools" reflects the whole run even
+  // while the prefix is capped; cleared on full reveal. (uncapped → remove it.)
+  if(turnEl){
+    if(startIdx>0){
+      const totalTools=rows.filter(r=>String(r.role||'')==='tool').length;
+      turnEl.setAttribute('data-transparent-total-tool-count',String(totalTools));
+    }else{
+      turnEl.removeAttribute('data-transparent-total-tool-count');
+    }
+  }
+  const renderRowAt=(idx)=>{
+    const row=rows[idx];
+    const node=_anchorSceneTransparentNodeForRow(row,{settled:true,finalAnswer,liveTokenFinalPrefixEligible:idx>lastNonTerminalWorkRowIndex});
+    if(!node) return null;
+    // #5966 (Codex F2): stamp the OWNER message index so cache-round-trip recovery
+    // resolves the correct scene in a multi-segment turn (the scene owner is often
+    // NOT the turn's first assistant segment).
+    node.setAttribute('data-anchor-owner-idx',String(rawIdx));
     if(segment.parentElement===blocks) blocks.insertBefore(node,segment);
     else blocks.appendChild(node);
+    return node;
+  };
+  let wrote=false;
+  // The "Show earlier steps" affordance sits ABOVE the retained rows (chronology:
+  // the hidden steps came first). Insert it before rendering the retained tail so
+  // it lands at the top of this turn's activity run.
+  if(startIdx>0){
+    const earlier=_buildTransparentEarlierStepsAffordance(startIdx);
+    earlier.setAttribute('data-anchor-owner-idx',String(rawIdx));
+    if(segment.parentElement===blocks) blocks.insertBefore(earlier,segment);
+    else blocks.appendChild(earlier);
+    // Reveal handler: materialize the omitted prefix in place, holding the reader's
+    // viewport on the clicked affordance (insert grows content ABOVE it).
+    earlier.addEventListener('click',()=>{
+      _revealTransparentEarlierSteps(message,segment,rawIdx,earlier);
+    });
     wrote=true;
+  }
+  for(let idx=startIdx;idx<rows.length;idx+=1){
+    if(renderRowAt(idx)) wrote=true;
   }
   if(wrote){
     const turn=segment.closest('.assistant-turn');
     if(turn) _syncTransparentEventControls(turn);
   }
   return wrote;
+}
+// #5966 tunables. Cap chosen so a normal multi-tool turn (a handful to a couple
+// dozen rows) is NEVER capped — only genuinely long reasoning runs are. Slack
+// prevents a "Show 3 earlier steps" stub: only cap when the omitted prefix is
+// worth its own row.
+const _TRANSPARENT_SETTLED_ROW_CAP=30;
+const _TRANSPARENT_SETTLED_ROW_CAP_SLACK=10;
+// t() returns the key name itself for an unknown key, so `t(k)||literal` doesn't
+// fall back. This resolves via t() only when the key is genuinely defined,
+// otherwise uses the English literal — keeping the label correct before the
+// locale keys are present in every bundle. (Fable UX i18n fast-follow.)
+function _tOrDefault(key, literal, ...args){
+  try{
+    if(typeof t==='function'){
+      const v=t(key, ...args);
+      if(v && v!==key) return v;
+    }
+  }catch(_){ }
+  return literal;
+}
+// A clean, in-flow affordance styled on the existing "Load earlier messages"
+// pill (same visual language, so it reads as native). Shows the exact hidden
+// count; the pill is the click target with a leading up-chevron.
+function _buildTransparentEarlierStepsAffordance(hiddenCount){
+  const el=document.createElement('div');
+  el.className='transparent-earlier-steps';
+  el.setAttribute('data-anchor-earlier-steps','1');
+  el.setAttribute('data-anchor-scene-row','1');
+  el.setAttribute('data-anchor-settled-scene-row','1');
+  el.setAttribute('role','button');
+  el.setAttribute('tabindex','0');
+  el.setAttribute('data-earlier-count',String(hiddenCount));
+  // i18n with English fallback, matching the sibling "Expand all"/"Collapse all"
+  // controls' t() pattern. Keys live in the en locale (i18n.js); t() falls back to
+  // en for other locales and to the key name if absent — so guard with a literal.
+  const label=hiddenCount===1
+    ? _tOrDefault('show_earlier_step_one','Show 1 earlier step')
+    : _tOrDefault('show_earlier_steps','Show '+hiddenCount+' earlier steps',hiddenCount);
+  el.setAttribute('aria-label',label);
+  el.innerHTML=`<span class="transparent-earlier-steps-chevron">${li('chevron-up',13)}</span><span class="transparent-earlier-steps-label">${esc(label)}</span>`;
+  el.addEventListener('keydown',(ev)=>{
+    if(ev.key==='Enter'||ev.key===' '){ ev.preventDefault(); el.click(); }
+  });
+  return el;
+}
+// Materialize the omitted prefix rows for a capped settled transparent turn,
+// preserving the reader's viewport position (rows are inserted ABOVE the clicked
+// affordance, so without compensation the content below would jump down).
+function _revealTransparentEarlierSteps(message, segment, rawIdx, affordanceEl){
+  const turnEl=segment.closest('.assistant-turn');
+  // #5966 (Codex F3): record the reveal in the PERSISTENT set (survives rebuild /
+  // switch-away / cache round-trip) and invalidate this session's cached HTML so
+  // the stored markup isn't re-served stale-capped.
+  const revealKey=_transparentRevealKey(S.session&&S.session.session_id, rawIdx);
+  _transparentRevealedTurns.add(revealKey);
+  try{
+    const sid=S.session&&S.session.session_id;
+    if(sid&&_sessionHtmlCache&&typeof _sessionHtmlCache.delete==='function') _sessionHtmlCache.delete(sid);
+  }catch(_){ }
+  if(turnEl){
+    turnEl.setAttribute('data-transparent-earlier-revealed','1');
+    // Full run now mounted → drop the capped-count stash so the Trace label
+    // recomputes from the (now complete) DOM.
+    turnEl.removeAttribute('data-transparent-total-tool-count');
+  }
+  const msgsEl=$('messages');
+  const prevScrollTop=msgsEl?msgsEl.scrollTop:0;
+  const prevScrollHeight=msgsEl?msgsEl.scrollHeight:0;
+  const scene=message&&message._anchor_activity_scene;
+  const blocks=_assistantTurnBlocks(turnEl);
+  if(!scene||!blocks){ if(affordanceEl) affordanceEl.remove(); return; }
+  const rows=_anchorSceneRowsForRendering(scene,{settled:true})||[];
+  const lastNonTerminalWorkRowIndex=_anchorSceneLastNonTerminalWorkRowIndex(rows);
+  const finalAnswer=String(
+    (scene&&typeof scene.final_answer==='string'&&scene.final_answer)
+    || _assistantAnchorSceneFinalAnswerText(message)
+    || (typeof msgContent==='function'?msgContent(message):'')
+    || ''
+  );
+  // The affordance's data-count tells us how many prefix rows to build (the rows
+  // rendered on the initial pass are the tail after that index).
+  const hidden=Number(affordanceEl&&affordanceEl.getAttribute('data-earlier-count'))||0;
+  const stopIdx=hidden>0?hidden:_computeTransparentHiddenPrefixCount(rows);
+  const frag=document.createDocumentFragment();
+  for(let idx=0;idx<stopIdx;idx+=1){
+    const node=_anchorSceneTransparentNodeForRow(rows[idx],{settled:true,finalAnswer,liveTokenFinalPrefixEligible:idx>lastNonTerminalWorkRowIndex});
+    if(node){ node.setAttribute('data-earlier-revealed','1'); frag.appendChild(node); }
+  }
+  // Insert the prefix where the affordance sits, then drop the affordance.
+  if(affordanceEl&&affordanceEl.parentElement===blocks){
+    blocks.insertBefore(frag,affordanceEl);
+    affordanceEl.remove();
+  }else{
+    blocks.appendChild(frag);
+  }
+  if(turnEl) _syncTransparentEventControls(turnEl);
+  // Hold the reader's position: rows landed above the old affordance point, so
+  // add the height delta to scrollTop (the app's own load-earlier idiom).
+  if(msgsEl){
+    const delta=msgsEl.scrollHeight-prevScrollHeight;
+    msgsEl.scrollTop=prevScrollTop+delta;
+  }
+}
+// The initial capped render omits rows[0 .. rows.length-cap-1]; recompute that
+// prefix length from the current scene so the reveal is exact even if the count
+// attribute is missing (cache round-trip).
+function _computeTransparentHiddenPrefixCount(rows){
+  const cap=_TRANSPARENT_SETTLED_ROW_CAP;
+  const slack=_TRANSPARENT_SETTLED_ROW_CAP_SLACK;
+  return (rows.length>cap+slack)?(rows.length-cap):0;
 }
 // One-shot token: the stream id of the turn that JUST settled at STREAM_DONE.
 // The keep-open exception applies to ONLY this one turn's settled render, then
@@ -11197,6 +14230,67 @@ function _armKeepSettledWorklogOpen(streamId){
 function _disarmKeepSettledWorklogOpen(){
   _keepSettledWorklogOpenForStreamId=null;
 }
+function _assistantTurnHasVisibleRenderedSegment(turn){
+  if(!turn||typeof turn.querySelectorAll!=='function') return null;
+  for(const seg of turn.querySelectorAll('.assistant-segment')){
+    if(seg.classList.contains('assistant-segment-worklog-source')) continue;
+    if(seg.classList.contains('assistant-segment-anchor')) continue;
+    if((seg.textContent||'').trim()) return true;
+  }
+  return false;
+}
+function _collapseJustSettledWorklogInPlace(streamId){
+  // #6414: STREAM_DONE used to render the settled turn once with its Worklog
+  // forced open, then immediately run a second full render only to collapse it.
+  // That second `innerHTML=''` rebuild removes the Worklog the user just saw and
+  // can expose a reset frame. Keep the canonical first render, then collapse its
+  // one settled group in place. The rows are released after the group is hidden;
+  // an expand still rebuilds them from the settled transcript via the normal
+  // #5839 deferred-row path.
+  const inner=$('msgInner');
+  if(!inner||!streamId) return false;
+  const group=Array.from(inner.querySelectorAll('[data-anchor-settled-scene-owner="1"]'))
+    .filter(candidate=>candidate.getAttribute('data-anchor-stream-id')===String(streamId))
+    .pop();
+  if(!group) return false;
+  const ownerTurn=typeof group.closest==='function'?group.closest('.assistant-turn'):null;
+  const ownerHasVisibleSegment=_assistantTurnHasVisibleRenderedSegment(ownerTurn);
+  if(ownerHasVisibleSegment===null) return false;
+  const disclosureKey=group.getAttribute('data-activity-disclosure-key')||'';
+  const savedDisclosure=_readActivityDisclosureState(disclosureKey);
+  const rows=_deferredWorklogRowsFromGroup(group);
+  if(!rows||!rows.length) return false;
+  const match=/^anchor-scene:(\d+)$/.exec(disclosureKey);
+  const message=match&&S.messages&&S.messages[Number(match[1])];
+  const errored=!!(message&&message._anchor_activity_scene&&
+    _anchorSceneHasErroredTerminalState(message._anchor_activity_scene));
+  const keepOpen=!ownerHasVisibleSegment
+    || savedDisclosure==='open'
+    || (errored&&savedDisclosure!=='closed')
+    || (_worklogDetailsExpandedDefault()&&savedDisclosure!=='closed');
+  if(!keepOpen){
+    const detailDisclosure=typeof _captureWorklogDetailDisclosureState==='function'
+      ? _captureWorklogDetailDisclosureState(group)
+      : null;
+    group._deferredWorklogRows=rows;
+    group._deferredWorklogDisclosure=detailDisclosure&&detailDisclosure.size
+      ? detailDisclosure
+      : null;
+    group.setAttribute('data-worklog-rows-deferred','1');
+    group.classList.add('tool-call-group-collapsed');
+    group.classList.remove('open');
+    const summary=group.querySelector('.tool-worklog-summary,.tool-call-group-summary');
+    if(summary) summary.setAttribute('aria-expanded','false');
+    _syncToolCallGroupSummary(group);
+    requestAnimationFrame(()=>{
+      if(!group.isConnected||!group.classList.contains('tool-call-group-collapsed')) return;
+      if(group.getAttribute('data-worklog-rows-deferred')!=='1') return;
+      const list=_toolWorklogListEl(group);
+      if(list) list.replaceChildren();
+    });
+  }
+  return true;
+}
 // True while a just-settled worklog is being force-rendered open (between
 // _armKeepSettledWorklogOpen and _disarmKeepSettledWorklogOpen). renderMessages()
 // consults this so it does NOT write the forced-open DOM into _sessionHtmlCache:
@@ -11237,6 +14331,19 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   if(streamId&&!_readActivityDisclosureState(activityKey)){
     _copyActivityDisclosureState(`live:${streamId}`, activityKey);
   }
+  // #5941: an errored turn that produced assistant content (tool calls /
+  // reasoning) must not hide that content behind a collapsed header — the user
+  // reads a lone error card as "nothing came back". When the settled scene's
+  // terminal_state is an error/failure (NOT a normal completion) keep the
+  // worklog EXPANDED by default so the produced response stays visible. This
+  // path is only reached for worklog-worthy scenes (the guard at the top
+  // requires >=1 tool/thinking/compression row), so a genuinely-empty errored
+  // turn — a real no_response with zero produced content — never gets here and
+  // still shows only its error card, no phantom empty body. A user who has
+  // explicitly collapsed THIS turn's worklog (saved 'closed' disclosure state)
+  // is still respected, so the default-open never fights an intentional collapse.
+  const erroredWorklogKeepOpen=_anchorSceneHasErroredTerminalState(scene)
+    && _readActivityDisclosureState(activityKey)!=='closed';
   // keepSettledWorklogOpen forces collapsed:false for the ONE height-stable settle
   // render of the just-settled turn (no STREAM_DONE shrink jump) for both pinned
   // followers AND unpinned mid-turn readers. The keep-open is made genuinely
@@ -11248,7 +14355,7 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   // (_isKeepSettledWorklogOpenArmed), so it never persists across restores.
   const group=_anchorSceneWorklogGroup(blocks,{
     live:false,
-    collapsed:!keepSettledWorklogOpen,
+    collapsed:!(keepSettledWorklogOpen||erroredWorklogKeepOpen),
     beforeAnchor:true,
     anchor:segment,
     activityKey,
@@ -11257,6 +14364,24 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   });
   if(!group) return false;
   group.setAttribute('data-anchor-settled-scene-owner','1');
+  // #5839: for a COLLAPSED settled worklog, defer building the row DOM until the
+  // user first expands it. A reasoning-heavy turn can carry 80+ activity rows;
+  // eagerly materializing them for every historical turn balloons the DOM and a
+  // later synchronous layout (e.g. opening a dropdown) tips the tab into a
+  // multi-GB freeze. The summary chip renders from data-turn-duration, not the
+  // rows, so a deferred worklog still shows its "Processed in Xs" label. On
+  // expand, _toggleActivityGroup materializes the stashed rows exactly once.
+  const collapsed=group.classList.contains('tool-call-group-collapsed');
+  if(collapsed){
+    group._deferredWorklogRows=rows;
+    group.setAttribute('data-worklog-rows-deferred','1');
+    const list=_toolWorklogListEl(group);
+    if(list) list.innerHTML='';
+    _syncToolCallGroupSummary(group);
+    return true;
+  }
+  group._deferredWorklogRows=null;
+  group.removeAttribute('data-worklog-rows-deferred');
   return _renderAnchorSceneRowsIntoWorklog(group,rows,{settled:true});
 }
 function _syncLiveWorklogReasonsForAnchor(anchor, displayTextOverride){
@@ -11759,7 +14884,7 @@ function _compressionCardsNode(state){
 function appendLiveCompressionCard(state){
   if(!S.session||!S.activeStreamId||!state) return false;
   if(isLiveAnchorActivitySceneOwner(S.activeStreamId)){
-    return _renderLiveAnchorActivitySceneForStream(S.activeStreamId, S.session.session_id, {mode:'compact_worklog'});
+    return _renderLiveAnchorActivitySceneForStream(S.activeStreamId, S.session.session_id);
   }
   const scrollSnapshot=_captureMessageScrollSnapshot();
   let turn=$('liveAssistantTurn');
@@ -12177,12 +15302,70 @@ function renderCompressionUi(){
 // in-session updates (new messages, edits, stream events).
 const _sessionHtmlCache=new Map();
 let _sessionHtmlCacheSid=null; // session_id currently rendered in the DOM
+// #5966 (Codex F3): persist which capped Transparent-Stream turns the user has
+// revealed, keyed by `${session_id}:${ownerRawIdx}`, so a switch-away/back or a
+// normal rebuild does NOT silently re-cap a turn the user already expanded. The
+// DOM `data-transparent-earlier-revealed` flag alone is lost across the
+// _sessionHtmlCache innerHTML round-trip; this survives it. Reveal also
+// invalidates that session's cached HTML so the stored markup isn't stale-capped.
+const _transparentRevealedTurns=new Set();
+function _transparentRevealKey(sessionId, ownerIdx){
+  return String(sessionId||(S.session&&S.session.session_id)||'')+':'+String(ownerIdx);
+}
 function clearMessageRenderCache(){
   _clearRenderCache();
   _sessionHtmlCache.clear();
   _sessionHtmlCacheSid=null;
   clearVisibleMessageRowCache();
   _clearMessageVirtualHeightCache();
+}
+
+// #6999: feed a structured payload field's string form through the FNV-1a
+// loop IN FULL, without materializing clipped copies or skipping the middle.
+// The previous length+head+tail clip made same-length middle-only edits
+// (tool arguments, attachment metadata, tool snippets, compression-anchor
+// keys) produce identical signatures — a deterministic stale-cache collision
+// in _sessionHtmlCache (cross-session navigation served old HTML). Hashing
+// every character keeps the signature sensitive to ANY content change at a
+// constant-allocation cost: strings are streamed char-by-char (no copy) and
+// object fields are walked key-by-key so only scalar string forms are ever
+// allocated — no integral JSON.stringify() of a whole payload, and no
+// head/tail slice copies. _renderCacheKey's length+edges shortcut is only
+// safe for the render-window geometry key, where equal span+edges means
+// equal window; here equal signature must mean equal CONTENT.
+function _addBoundedHash(add, value, depth){
+  if(value==null){ add('null'); return; }
+  const t=typeof value;
+  if(t==='string'){ add(value.length); add(value); return; }
+  if(t==='number'||t==='boolean'){ add(t); add(value); return; }
+  if(t==='object'){ _hashObjectInto(add, value, (depth||0)+1); return; }
+  add(t); add(String(value));
+}
+function _hashObjectInto(add, value, depth){
+  if(value==null){ add('null'); return; }
+  if(depth>64){
+    // Pathological depth (e.g. a cyclic structure JSON.stringify would also
+    // reject): serialize integrally so no field is silently dropped — the
+    // exact same data still yields the exact same signature.
+    try{ add(JSON.stringify(value)); }catch(e){ add('[unserializable]'); }
+    return;
+  }
+  if(Array.isArray(value)){
+    add('array'); add(value.length);
+    for(let i=0;i<value.length;i++){ add(i); _addBoundedHash(add, value[i], depth); }
+    return;
+  }
+  add('object');
+  // #6999 re-gate: walk keys in INSERTION ORDER (never sorted) so the cache
+  // signature equals the rendered projection — the tool-detail render paths
+  // use Object.entries(tc.args), which preserves insertion order. Sorting here
+  // gave opposite-insertion-order argument objects the same signature while
+  // they render DIFFERENT HTML. The explicit per-key index is the
+  // insertion-order discriminator: {alpha:A, beta:B} and {beta:B, alpha:A}
+  // now hash differently.
+  const keys=Object.keys(value);
+  add(keys.length);
+  for(let i=0;i<keys.length;i++){ add(keys[i]); add(i); _addBoundedHash(add, value[keys[i]], depth); }
 }
 
 function _messageRenderCacheSignature(){
@@ -12211,24 +15394,31 @@ function _messageRenderCacheSignature(){
     }
     if(Array.isArray(m.tool_calls)){
       add('message-tool-calls');add(m.tool_calls.length);
-      m.tool_calls.forEach(tc=>{add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.type);add(JSON.stringify(tc&&tc.function||{}));});
+      m.tool_calls.forEach(tc=>{
+        add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.type);
+        add(tc&&tc.function&&tc.function.name);
+        // function.arguments is already a string — streamed in full, no copy.
+        _addBoundedHash(add, tc&&tc.function&&tc.function.arguments);
+      });
     }
     if(Array.isArray(m._partial_tool_calls)){
       add('partial-tool-calls');add(m._partial_tool_calls.length);
       m._partial_tool_calls.forEach(tc=>{add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.snippet);});
     }
     if(_messageHasReasoningPayload(m)) add(m.reasoning||m.thinking||m._reasoning||'reasoning');
-    if(Array.isArray(m.attachments)) m.attachments.forEach(a=>add(a&&typeof a==='object'?JSON.stringify(a):a));
+    if(Array.isArray(m.attachments)) m.attachments.forEach(a=>_addBoundedHash(add, a));
   }
   const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];
   add('settled-tool-calls');add(toolCalls.length);
   toolCalls.forEach(tc=>{
     if(!tc||typeof tc!=='object'){ add(tc); return; }
-    add(tc.tid);add(tc.id);add(tc.name);add(tc.done);add(tc.is_diff);add(tc.assistant_msg_idx);add(tc.snippet);add(JSON.stringify(tc.args||{}));
+    add(tc.tid);add(tc.id);add(tc.name);add(tc.done);add(tc.is_diff);add(tc.assistant_msg_idx);
+    _addBoundedHash(add, tc.snippet);
+    _addBoundedHash(add, tc.args||{});
   });
   if(S.session){
     add(S.session.message_count);add(S.session.updated_at);add(S.session.compression_anchor_visible_idx);
-    add(JSON.stringify(S.session.compression_anchor_message_key||null));
+    _addBoundedHash(add, S.session.compression_anchor_message_key||null);
     add(S.session.compression_anchor_summary||'');
   }
   return `${messages.length}:${toolCalls.length}:${hash.toString(16)}`;
@@ -12384,6 +15574,226 @@ function _toolArgsSnapshot(args, limit){
   return out;
 }
 
+function _idLinkedHistoricalMessageText(message){
+  if(!message||typeof message!=='object') return '';
+  const content=message.content;
+  if(typeof content==='string') return content;
+  if(!Array.isArray(content)) return '';
+  return content.filter(part=>part&&typeof part==='object'&&part.type==='text').map(part=>{
+    if(!part||typeof part!=='object') return '';
+    return String(part.text||part.content||'');
+  }).join('\n');
+}
+
+function _idLinkedHistoricalMessageHasVisibleText(message){
+  return _idLinkedHistoricalMessageText(message).trim()!=='';
+}
+
+function _idLinkedHistoricalMessageRef(message, rawIdx){
+  if(message&&typeof message==='object'){
+    for(const key of ['message_id','id','local_id']){
+      const value=message[key];
+      if(typeof value==='string'&&value.trim()) return value.trim();
+      if(typeof value==='number'&&Number.isFinite(value)) return String(value);
+    }
+  }
+  return `raw_idx:${rawIdx}`;
+}
+
+function _idLinkedHistoricalToolArguments(toolCall){
+  if(!toolCall||typeof toolCall!=='object') return null;
+  const fn=toolCall.function;
+  if(!fn||typeof fn!=='object'||Array.isArray(fn)) return null;
+  const raw=fn.arguments;
+  if(raw===undefined||raw===null||raw==='') return null;
+  if(raw&&typeof raw==='object'&&!Array.isArray(raw)) return raw;
+  if(typeof raw!=='string') return null;
+  try{
+    const parsed=JSON.parse(raw);
+    return parsed&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed:null;
+  }catch(e){
+    return null;
+  }
+}
+
+function _idLinkedHistoricalToolResultRaw(message){
+  if(!message||typeof message!=='object') return null;
+  const content=message.content;
+  return typeof content==='string'?content:null;
+}
+
+function _idLinkedHistoricalRedactSnippet(value){
+  let text=String(value||'');
+  if(!text) return '';
+  if(typeof _redactToolTargetLabel==='function'){
+    try{text=_redactToolTargetLabel(text);}
+    catch(e){}
+  }
+  return text;
+}
+
+function _idLinkedHistoricalHasVisibleSidecar(message){
+  if(!message||typeof message!=='object') return false;
+  const visibleKeys=['attachments','_attachments','_statusCard','status_card','statusCard','card','cards','artifact','artifacts','files','images','media'];
+  for(const key of visibleKeys){
+    if(!Object.prototype.hasOwnProperty.call(message,key)) continue;
+    const value=message[key];
+    if(value===undefined||value===null||value===false) continue;
+    if(Array.isArray(value)&&value.length===0) continue;
+    if(typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===0) continue;
+    return true;
+  }
+  return false;
+}
+
+// Claim legacy settled ownership only when the transcript itself proves a
+// complete, user-bounded declaration/result/final-answer chain.
+function _idLinkedHistoricalTurnScene(messages, turnStart, turnEnd, options){
+  const list=Array.isArray(messages)?messages:[];
+  const start=Math.max(0,Number(turnStart)||0);
+  const end=Math.min(list.length,Math.max(start,Number(turnEnd)||0));
+  const opts=options&&typeof options==='object'?options:{};
+  const sessionId=String(opts.sessionId||opts.session_id||'').trim();
+  const api=(typeof window!=='undefined')?window.HermesAssistantTurnAnchors:null;
+  if(!sessionId||!api||typeof api.projectAssistantTurnAnchorHistoricalTranscriptScene!=='function') return null;
+
+  const declarations=[];
+  const declarationIds=new Set();
+  const declarationRefs=[];
+  const visibleAssistantIndexes=[];
+  const assistantIndexes=[];
+  const resultsById=new Map();
+  for(let rawIdx=start;rawIdx<end;rawIdx++){
+    const message=list[rawIdx];
+    if(!message||typeof message!=='object') continue;
+    const role=message.role;
+    if(role==='user'&&rawIdx===start) continue;
+    if(message._anchor_activity_scene) return null;
+    if(role==='assistant'){
+      assistantIndexes.push(rawIdx);
+      const hasVisibleText=_idLinkedHistoricalMessageHasVisibleText(message);
+      const reasoningText=_assistantReasoningPayloadText(message);
+      if(hasVisibleText) visibleAssistantIndexes.push(rawIdx);
+      if(reasoningText) return null;
+      if(_idLinkedHistoricalHasVisibleSidecar(message)) return null;
+      if(Array.isArray(message._partial_tool_calls)&&message._partial_tool_calls.length) return null;
+      if(Array.isArray(message.content)&&message.content.some(part=>part&&typeof part==='object'&&part.type==='tool_use')) return null;
+      const toolCalls=Array.isArray(message.tool_calls)?message.tool_calls:[];
+      if(toolCalls.length&&hasVisibleText) return null;
+      if(!toolCalls.length){
+        if(hasVisibleText) continue;
+        return null;
+      }
+      if(message.content!==undefined&&message.content!==null&&message.content!=='') return null;
+      const messageRef=_idLinkedHistoricalMessageRef(message,rawIdx);
+      if(!declarationRefs.includes(messageRef)) declarationRefs.push(messageRef);
+      for(const toolCall of toolCalls){
+        const callId=String(toolCall&&toolCall.id||'').trim();
+        const fn=toolCall&&toolCall.function;
+        const name=String(fn&&fn.name||'').trim();
+        const args=_idLinkedHistoricalToolArguments(toolCall);
+        if(!callId||!name||args===null||declarationIds.has(callId)) return null;
+        declarationIds.add(callId);
+        declarations.push({callId,name,args,rawIdx,messageRef});
+      }
+      continue;
+    }
+    if(role!=='tool') return null;
+    const callId=String(message.tool_call_id||'').trim();
+    if(!callId||!declarationIds.has(callId)) return null;
+    const matches=resultsById.get(callId)||[];
+    matches.push({message,rawIdx});
+    resultsById.set(callId,matches);
+  }
+
+  if(!declarations.length||visibleAssistantIndexes.length!==1) return null;
+  const ownerIndex=visibleAssistantIndexes[0];
+  if(ownerIndex!==assistantIndexes[assistantIndexes.length-1]) return null;
+  const owner=list[ownerIndex];
+  if(Array.isArray(owner.tool_calls)&&owner.tool_calls.length) return null;
+  const ownerRef=_idLinkedHistoricalMessageRef(owner,ownerIndex);
+  for(const declaration of declarations){
+    const matches=resultsById.get(declaration.callId)||[];
+    if(matches.length!==1||matches[0].rawIdx<=declaration.rawIdx||matches[0].rawIdx>=ownerIndex) return null;
+  }
+  if(resultsById.size!==declarations.length) return null;
+
+  const sourceRefs=declarationRefs.concat(ownerRef).filter((value,index,array)=>array.indexOf(value)===index);
+  const turnId=['historical',sessionId,declarationRefs[0],ownerRef].join(':');
+  const activityEvents=[];
+  for(let index=0;index<declarations.length;index++){
+    const declaration=declarations[index];
+    const resultEntry=resultsById.get(declaration.callId)[0];
+    const args=_toolArgsSnapshot(declaration.args);
+    const resultRaw=_idLinkedHistoricalToolResultRaw(resultEntry.message);
+    if(resultRaw===null) return null;
+    const resultSnippet=_idLinkedHistoricalRedactSnippet(_cliToolResultSnippet(resultRaw));
+    const patchSnippet=_cliPatchSnippetFromArgs(declaration.name,args);
+    const isDiff=_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet);
+    const snippet=_idLinkedHistoricalRedactSnippet(_cliToolCardSnippet(resultSnippet,patchSnippet));
+    const status=String(resultEntry.message.status||'').trim().toLowerCase();
+    const isError=resultEntry.message.is_error===true||status==='error'||status==='failed'||status==='failure';
+    activityEvents.push({
+      source_type:'tool_complete',
+      seq:index+1,
+      local_id:`historical:${declaration.messageRef}:tool:${declaration.callId}`,
+      payload:{
+        id:declaration.callId,
+        tid:declaration.callId,
+        tool_call_id:declaration.callId,
+        name:declaration.name,
+        args,
+        command:String(args.command||args.cmd||''),
+        snippet,
+        done:true,
+        is_error:isError,
+        is_diff:isDiff,
+        assistant_msg_idx:declaration.rawIdx,
+      },
+    });
+  }
+  let scene;
+  try{
+    scene=api.projectAssistantTurnAnchorHistoricalTranscriptScene({
+      session_id:sessionId,
+      turn_id:turnId,
+      local_id:ownerRef,
+      source_message_refs:sourceRefs,
+      activity_events:activityEvents,
+      settled_message:{role:'assistant',id:ownerRef,content:_idLinkedHistoricalMessageText(owner)},
+    },{mode:opts.mode||'compact_worklog'});
+  }catch(e){
+    return null;
+  }
+  if(!scene||scene.version!=='activity_scene_v1'||scene.activity_rows.length!==declarations.length) return null;
+  return {ownerIndex,scene};
+}
+
+function _hydrateIdLinkedHistoricalToolScenes(messages, options){
+  const list=Array.isArray(messages)?messages:[];
+  let turnStart=-1;
+  let hydrated=0;
+  const hydrateTurn=(turnEnd)=>{
+    if(turnStart<0||turnEnd<=turnStart+1) return;
+    let hydratedTurn;
+    try{hydratedTurn=_idLinkedHistoricalTurnScene(list,turnStart,turnEnd,options);}
+    catch(e){return;}
+    if(!hydratedTurn) return;
+    const owner=list[hydratedTurn.ownerIndex];
+    try{owner._anchor_activity_scene=hydratedTurn.scene;}
+    catch(e){return;}
+    if(owner._anchor_activity_scene===hydratedTurn.scene) hydrated+=1;
+  };
+  for(let rawIdx=0;rawIdx<list.length;rawIdx++){
+    const message=list[rawIdx];
+    if(!message||message.role!=='user') continue;
+    hydrateTurn(rawIdx);
+    turnStart=rawIdx;
+  }
+  hydrateTurn(list.length);
+  return hydrated;
+}
+
 function _captureMessageScrollSnapshot(){
   const el=$('messages');
   if(!el) return null;
@@ -12398,9 +15808,40 @@ function _captureMessageScrollSnapshot(){
     top:el.scrollTop,
     bottom,
     scrollHeight:el.scrollHeight,
+    inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
     pinned:readerAwayFromBottom?false:_shouldFollowMessagesOnDomReplace(),
     userUnpinned:readerAwayFromBottom?true:_messageUserUnpinned,
   };
+}
+function _messageScrollSnapshotInputChanged(snapshot){
+  if(!snapshot) return false;
+  const captured=Number(snapshot.inputGeneration);
+  const current=typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : captured;
+  return Number.isFinite(captured)&&Number.isFinite(current)&&current!==captured;
+}
+function _abandonMessageScrollSnapshot(){
+  const el=$('messages');
+  if(!el){
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
+    return;
+  }
+  _lastScrollTop=el.scrollTop||0;
+  _lastMessageClientHeight=el.clientHeight||0;
+  // A generation mismatch abandons only the stale snapshot write. Reconcile
+  // ownership from the live viewport so a reader who moved down to the true
+  // bottom is immediately re-pinned instead of being stranded sticky-unpinned.
+  const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+  if(bottomDistance<=80){
+    _messageUserUnpinned=false;
+    _scrollPinned=true;
+    _nearBottomCount=2;
+  }else{
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
+  }
 }
 function _restorePinnedMessageScrollSnapshot(snapshot){
   const el=$('messages');
@@ -12428,6 +15869,10 @@ function _restoreMessageScrollSnapshot(snapshot){
   // activity rebuilds can remount an older top-of-viewport anchor and yank a
   // pinned streaming transcript upward. Semantic anchors remain for manual
   // unpinned reading positions below.
+  if(typeof _messageScrollSnapshotInputChanged==='function'&&_messageScrollSnapshotInputChanged(snapshot)){
+    if(typeof _abandonMessageScrollSnapshot==='function') _abandonMessageScrollSnapshot();
+    return;
+  }
   if(_restorePinnedMessageScrollSnapshot(snapshot)) return;
   let restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
     ? _restoreMessageViewportAnchor(snapshot.anchor,0)
@@ -12603,13 +16048,57 @@ window._fixMobileScrollJank=function _fixMobileScrollJank(){
   });
 };
 
+// Desktop stale-snapshot residue (issue #5637 follow-up). Reached only when
+// _restoreMessageViewportAnchor already CONCEDED (anchor row unrecoverable by its
+// per-tier lookup) and the desktop fallback would otherwise write the ABSOLUTE
+// snapshot.top — which is stale once above-viewport content grew since capture,
+// yanking a still reader backward. The correct hold is the app's own realign
+// idiom: shift the CURRENT scrollTop by how far the anchor row moved since capture,
+// `scrollTop += (currentOffset - capturedOffset)` (mirrors _restoreMessageViewportAnchor
+// ui.js and _compensateScrollForMeasurementDelta). NOT `snapshot.top + delta`: a
+// row's offset is scroll-relative (rect.top - containerRect.top = rowContentPos -
+// scrollTop), so only a delta applied to the LIVE scrollTop holds the row put
+// regardless of where scrollTop was carried to. Returns the realign delta (may be
+// 0), or null when the anchor row can't be measured under the SAME per-tier guard
+// _restoreMessageViewportAnchor uses (key -> sessionIdx, never the rawIdx
+// degradation — rawIdx maps to a different message after a virtualization
+// re-window, ui.js per-tier guard) so the caller can fall back to the topPad-delta
+// idiom or keep raw rather than guessing.
+function _desktopAnchorRealignDelta(container, anchor){
+  if(!container||!anchor||typeof container.querySelector!=='function') return null;
+  const capturedOffset=Number(anchor.topOffset);
+  if(!Number.isFinite(capturedOffset)) return null;
+  const anchorKey=String(anchor.key||'');
+  let row=anchorKey
+    ? Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey)
+    : null;
+  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
+  const sessionIdx=Number(anchor.sessionIdx);
+  if(!row&&Number.isFinite(sessionIdx)) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
+  // Per-tier guard mirror (ui.js _restoreMessageViewportAnchor): a genuinely-gone
+  // anchor misses key AND sessionIdx -> concede (null). Do NOT degrade to rawIdx.
+  if(!row) return null;
+  if(typeof row.getBoundingClientRect!=='function') return null;
+  if(row.getClientRects&&row.getClientRects().length===0) return null;
+  const containerRect=container.getBoundingClientRect();
+  const rect=row.getBoundingClientRect();
+  const currentOffset=rect.top-containerRect.top;
+  return currentOffset-capturedOffset;
+}
 function _restoreMessageScrollSnapshotSameFrame(snapshot){
   const el=$('messages');
   if(!el||!snapshot) return;
   // Same-frame live DOM updates (tool/worklog/activity rows) are the hot path for
   // streaming. Pinned followers must stay tail-relative here too; restoring the
   // semantic viewport anchor is only safe for explicitly unpinned readers.
+  if(typeof _messageScrollSnapshotInputChanged==='function'&&_messageScrollSnapshotInputChanged(snapshot)){
+    if(typeof _abandonMessageScrollSnapshot==='function') _abandonMessageScrollSnapshot();
+    return;
+  }
   if(_restorePinnedMessageScrollSnapshot(snapshot)) return;
+  // A delayed rAF restore must not overwrite a position the reader changed
+  // after capture. Recent-intent timestamps are lossy; the generation is
+  // monotonic and therefore preserves snapshot ownership exactly.
   let restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
     ? _restoreMessageViewportAnchor(snapshot.anchor,0)
     : false;
@@ -12621,11 +16110,98 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   if(!restoredViaAnchor){
     const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
     const bottom=Number(snapshot.bottom);
+    // Mobile/touch viewports have native overflow anchoring to hold an
+    // unpinned reader across a rebuild. Desktop deliberately disables that
+    // browser behavior, so it must continue into the explicit fallback below.
+    const _fbTouchHold=(typeof _isTouchLikeMessageViewport==='function' && _isTouchLikeMessageViewport(el));
+    // #5637: when the reader has scrolled UP into history (userUnpinned) and the
+    // semantic anchor restore failed, do NOT snap scrollTop to the captured
+    // ABSOLUTE snapshot.top. During streaming, the live activity-scene refresh
+    // fires this every tick; above-viewport height keeps changing, so the old
+    // absolute top no longer maps to the same content and the viewport is nudged
+    // backward by an amount that grows with scrollHeight. Leaving scrollTop
+    // untouched lets the browser's own scroll anchoring hold the reader's
+    // position. Pinned / near-bottom readers still get the tail-relative restore
+    // below (that path is correct and must run).
+    if(snapshot.userUnpinned===true&&snapshot.pinned!==true&&_fbTouchHold){
+      _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+      _messageUserUnpinned=true;
+      _scrollPinned=false;
+      _nearBottomCount=0;
+      return;
+    }
     const target=(snapshot.pinned===true&&Number.isFinite(bottom))
       ? maxTop-Math.max(0,bottom)
       : Number(snapshot.top)||0;
+    // Streaming stale-snapshot guard (issue #5637). The userUnpinned check above is
+    // defeated when a live stream re-pins the state machine (a scrollHeight-collapse
+    // scroll event flips userUnpinned back to false even though the reader is up in
+    // history), so this absolute snapshot.top write still fires and yanks a still
+    // reader — snapshot.top was captured before the streaming chunk grew above-viewport
+    // height, so it is stale. Mirror the realign guard: if content grew since the
+    // snapshot AND there is no recent real input intent AND the write would move
+    // scrollTop non-trivially, refuse it and let the browser overflow-anchor hold.
+    // Pinned tail-followers (target is bottom-relative, not snapshot.top) are
+    // unaffected; an actively scrolling reader has intent and keeps the restore.
+    //
+    // Desktop guard (issue #5637 gate cert): like the realign guard, this refusal
+    // only holds where the browser's native overflow-anchor layer is active (touch
+    // viewports, `.messages` computes to `overflow-anchor:auto`). Desktop `.messages`
+    // is `overflow-anchor:none`, so refusing the absolute fallback write there would
+    // leave the reader unheld AND latch `_messageUserUnpinned=true`. Gate on
+    // `_isTouchLikeMessageViewport` so desktop keeps its absolute snapshot.top restore.
+    const _snapSH=Number(snapshot.scrollHeight);
+    const _grewSinceSnap=Number.isFinite(_snapSH)&&_snapSH>0&&(el.scrollHeight-_snapSH)>4;
+    const _fbActiveIntent=(typeof _recentMessageScrollIntent==='function' && _recentMessageScrollIntent())
+      || (typeof _recentMessageTouchScrollIntent==='function' && _recentMessageTouchScrollIntent());
+    if(_fbTouchHold && snapshot.pinned!==true && _grewSinceSnap && !_fbActiveIntent
+       && Math.abs((Math.max(0,Math.min(target,maxTop)))-el.scrollTop)>8){
+      _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+      _messageUserUnpinned=true;
+      _scrollPinned=false;
+      _nearBottomCount=0;
+      return;
+    }
+    // Desktop stale-snapshot residue fix (issue #5637 follow-up, PR #5742 round-3).
+    // On desktop (overflow-anchor:none) the touch refusal above does NOT apply — the
+    // reader must be actively held, so we write scrollTop. The ABSOLUTE snapshot.top is
+    // stale once above-viewport content grew since capture. Use the app's own realign
+    // idiom instead: shift the CURRENT scrollTop by how far the anchor row moved since
+    // capture. `scrollTop += (currentOffset - capturedOffset)` holds the row put no
+    // matter where scrollTop was carried (a row's offset is scroll-relative), which the
+    // staged `snapshot.top + delta` cannot. No arbiter: the realign is a no-op when
+    // already aligned (delta ~ 0) and heals when not. Only when the anchor row is
+    // genuinely gone (per-tier lookup concedes, no rawIdx degradation) do we fall back
+    // to the topPad-delta idiom, then to raw. Pinned/near-bottom readers took the
+    // bottom-relative target above and never reach here as unpinned.
+    let _fbTarget=Math.max(0,Math.min(target,maxTop));
+    if(!_fbTouchHold && snapshot.pinned!==true){
+      const _realign=_desktopAnchorRealignDelta(el, snapshot.anchor);
+      if(_realign!==null){
+        // Anchor row measurable: realign from the LIVE scrollTop (app idiom).
+        _fbTarget=Math.max(0,Math.min(el.scrollTop+_realign, maxTop));
+      }else{
+        // Anchor row genuinely gone. Mirror the topPad-delta idiom the anchor already
+        // carries (topPadBefore): shift by the growth of the virtual top spacer since
+        // capture so the reader is held by the same amount the content above moved.
+        const _padNow=(function(){
+          const s=el.querySelector('[data-virtual-spacer="before"]');
+          return s?(parseFloat(s.style.height||'0')||0):NaN;
+        })();
+        const _padBeforeRaw=snapshot.anchor&&snapshot.anchor.topPadBefore;
+        const _padBefore=Number(_padBeforeRaw);
+        // Require an ACTUAL captured topPadBefore (not null/undefined): Number(null) is 0,
+        // which would otherwise add the ENTIRE current spacer height to scrollTop and fling
+        // the reader far from their content (greptile P1). Only apply when it was really
+        // captured; else keep the raw fallback target.
+        if(_padBeforeRaw!=null&&Number.isFinite(_padNow)&&Number.isFinite(_padBefore)){
+          _fbTarget=Math.max(0,Math.min(el.scrollTop+(_padNow-_padBefore), maxTop));
+        }
+        // else: no measurable anchor and no topPad geometry -> keep raw target.
+      }
+    }
     _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-    el.scrollTop=Math.max(0,Math.min(target,maxTop));
+    el.scrollTop=_fbTarget;
   }
   _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
   if(snapshot.pinned===true){
@@ -12643,7 +16219,13 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   }
 }
 function _renderMessagesWithScrollSnapshot(options){
-  const scrollSnapshot=_captureMessageScrollSnapshot();
+  // Accept an optional pre-captured scroll snapshot via _prescrollSnapshot.
+  // When provided, it is used INSTEAD of capturing a fresh one from the current
+  // DOM state — essential for the STREAM_DONE collapse render: the caller has
+  // already captured the snapshot from the LIVE DOM (before keep-open was armed),
+  // and re-capturing from the intermediate expanded-worklog state would capture
+  // stale anchors that no longer exist after the worklog collapses. (#6385)
+  const scrollSnapshot=(options&&options._prescrollSnapshot)||_captureMessageScrollSnapshot();
   renderMessages({...(options||{}),preserveScroll:true});
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
 }
@@ -12653,6 +16235,9 @@ function _transparentStreamOrderedParts(message){
   if(!message||message.role!=='assistant'||message._live||!Array.isArray(message.content)) return null;
   if(message._anchor_activity_scene) return null;
   const ordered=[];
+  const messageTs=typeof _firstValidTimestampSeconds==='function'
+    ? _firstValidTimestampSeconds(message._ts, message.timestamp, message.created_at)
+    : (message._ts||message.timestamp||message.created_at);
   let hasText=false;
   let hasTool=false;
   for(const part of message.content){
@@ -12672,6 +16257,10 @@ function _transparentStreamOrderedParts(message){
         toolUseId,
         name:part.name||'tool',
         input:(part.input&&typeof part.input==='object')?part.input:{},
+        ts:part.ts,
+        timestamp:part.timestamp,
+        created_at:part.created_at,
+        message_ts:messageTs,
       });
       hasTool=true;
     }
@@ -12717,11 +16306,29 @@ function _collectToolResultSnippetsByTid(messages){
   }
   return resultsByTid;
 }
-function _transparentOrderedToolCall(part, rawIdx, toolCallsByTid, resultsByTid, persistedByTid){
+function _transparentOrderedToolCall(part, rawIdx, toolCallsByTid, resultsByTid, persistedByTid, messageTs){
   const tid=String(part&&part.toolUseId||'').trim();
+  const firstValidTimestampSeconds=typeof _firstValidTimestampSeconds==='function'
+    ? _firstValidTimestampSeconds
+    : function(...values){
+        for(const value of values){
+          const stamp=Number(value);
+          if(Number.isFinite(stamp)&&stamp>0) return stamp>1e12?stamp/1000:stamp;
+        }
+        return null;
+      };
+  const messageStamp=firstValidTimestampSeconds(messageTs, part&&part.message_ts);
+  const partStamp=firstValidTimestampSeconds(part&&part.ts, part&&part.timestamp, part&&part.created_at);
   const liveTool=tid&&toolCallsByTid&&toolCallsByTid.get(tid);
   if(liveTool){
     const next={...liveTool};
+    const hasEventStamp=firstValidTimestampSeconds(next.ts, next.timestamp, next.created_at, next.started_at, next.completed_at);
+    const fallbackStamp=partStamp||messageStamp;
+    if(!hasEventStamp&&fallbackStamp){
+      next.ts=fallbackStamp;
+      next.timestamp=fallbackStamp;
+      next.created_at=fallbackStamp;
+    }
     const liveSnip=(resultsByTid&&resultsByTid[tid])||(persistedByTid&&persistedByTid[tid])||'';
     if(liveSnip){
       const patchSnippet=_cliPatchSnippetFromArgs(next.name||part.name||'tool', next.args||part.input||{});
@@ -12735,6 +16342,8 @@ function _transparentOrderedToolCall(part, rawIdx, toolCallsByTid, resultsByTid,
   const args=(part&&part.input&&typeof part.input==='object')?part.input:{};
   const patchSnippet=_cliPatchSnippetFromArgs(name,args);
   const resultSnippet=(resultsByTid&&tid&&resultsByTid[tid])||(persistedByTid&&tid&&persistedByTid[tid])||'';
+  const fallbackStamp=partStamp||messageStamp;
+  const primaryStamp=firstValidTimestampSeconds(part&&part.ts, part&&part.timestamp, part&&part.created_at, fallbackStamp);
   return {
     name,
     tid,
@@ -12744,6 +16353,9 @@ function _transparentOrderedToolCall(part, rawIdx, toolCallsByTid, resultsByTid,
     snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
     is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
     done:true,
+    ts:primaryStamp||undefined,
+    timestamp:primaryStamp||undefined,
+    created_at:primaryStamp||undefined,
   };
 }
 function _assistantTurnAnchorSettledFinalAnswer(message, content, context){
@@ -12765,6 +16377,36 @@ function _assistantTurnAnchorSettledFinalAnswer(message, content, context){
       console.warn('assistant turn anchor settled-final projection failed',err);
     }
     return null;
+  }
+}
+// Re-anchor a pinned/tail-following reader to the settled bottom after a full
+// renderMessages() rebuild, eliminating the one-frame mid-stream jitter. MUST be scheduled
+// in a MICROTASK from the end of renderMessages (see the queueMicrotask call site), NOT run
+// synchronously. Why: the mid-stream re-render bug is that renderMessages wipes #msgInner
+// then rebuilds, and the pinned tail-follow path (scrollIfPinned → scrollToBottom) writes
+// scrollTop while still INSIDE the render sync stack, where the browser reports a TRANSIENT
+// scrollHeight a few px short of the settled value (layout is batched — every geometry read
+// inside the sync stack returns the mid-settle height). So scrollToBottom lands scrollTop a
+// little HIGH (short of the true tail); that intermediate is painted this frame and the
+// settle rAF corrects it the next frame → a fast ~1-row back-and-forth bounce (~82px). A
+// microtask runs AFTER the sync stack unwinds (layout has flushed, so scrollHeight/clientHeight
+// are the settled values) but BEFORE the browser paints — so writing the now-correct settled
+// max here lands the tail exactly and the short intermediate never reaches the screen. Only
+// fires for a pre-wipe tail-follower left short of the settled max, so an unpinned reader
+// parked in history is never moved (orthogonal to the unpinned jump-back class). The
+// _programmaticScroll latch (armed at the wipe) keeps the scroll listener from misreading
+// this write as a manual unpin. Idempotent: a no-op once scrollTop already equals the max.
+function _reanchorPinnedTailAfterRender(wasNearTail){
+  if(!wasNearTail) return;
+  const el=$('messages');
+  if(!el) return;
+  const settledMax=Math.max(0, el.scrollHeight-el.clientHeight);
+  if(el.scrollTop < settledMax-1){
+    _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+    el.scrollTop=settledMax;
+    _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+    _nearBottomCount=2;
+    _scrollPinned=true;
   }
 }
 function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
@@ -12792,6 +16434,22 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
     return;
   }
   if(S.activeStreamId){
+    // Mid-stream re-render (tool completion, activity-scene refresh, clarify echo).
+    // renderMessages() wipes #msgInner (inner.innerHTML='') then rebuilds; that wipe
+    // collapses scrollHeight toward the empty-table height, and the browser is FORCED
+    // to clamp #messages.scrollTop down to the new (near-zero) max. For a reader who
+    // scrolled UP into history (unpinned), scrollIfPinned() is a no-op — so it does NOT
+    // undo that clamp, and the reader is stranded at the top (the scroll jump-back). The
+    // wipe-to-empty clamp is a browser primitive (device-agnostic; JS never writes the
+    // scrollTop), so the passive no-op cannot preserve position here. renderMessages()
+    // captured a pre-wipe snapshot for exactly this case (its scrollSnapshot init fires
+    // when _messageUserUnpinned), so restore the unpinned reader's viewport instead of
+    // the no-op. Pinned/tail-following readers keep scrollIfPinned() (correct live-follow).
+    if(_messageUserUnpinned && scrollSnapshot){
+      _restoreMessageScrollSnapshot(scrollSnapshot);
+      _maybeShowNewMessageScrollCue(scrollSnapshot);
+      return;
+    }
     scrollIfPinned();
     return;
   }
@@ -12820,6 +16478,71 @@ function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualW
   return true;
 }
 
+// #6345: parse the synthetic wakeup body back into display fields. Mirrors the
+// two structured api/background_process.format_wakeup_prompt shapes (pinned by
+// tests/test_background_process_wakeup_format.py); other event kinds return
+// null and keep the raw-notice fallback.
+function _parseProcessWakeupBody(text){
+  const s=String(text||'');
+  // Header groups are single-line by grammar; the output group captures the
+  // rest verbatim (leading indentation / trailing blank lines preserved). The
+  // watch suppression note is intentionally NOT split out of the output — real
+  // process output can contain the identical text, so stripping it would drop
+  // legitimate content (#6350 review finding 2). It rides along in `output`.
+  let m=s.match(/^\[IMPORTANT: Background process ([^\n]*?) completed \(exit_code=([^)\n]*)\)\.\nCommand: ([^\n]*)\nOutput:\n([\s\S]*)\]$/);
+  if(m) return {type:'completion',taskId:m[1],exitCode:m[2],command:m[3],output:m[4],pattern:null};
+  m=s.match(/^\[IMPORTANT: Background process ([^\n]*?) matched watch pattern "(.*)"\.\nCommand: ([^\n]*)\nMatched output:\n([\s\S]*)\]$/);
+  if(m) return {type:'watch_match',taskId:m[1],pattern:m[2],command:m[3],output:m[4],exitCode:null};
+  return null;
+}
+// Server-stamped _wakeup_meta (authoritative when present) merged over the
+// client parse; the output section only ever comes from the parse because the
+// meta deliberately carries header fields only.
+function _processWakeupInfo(m, text){
+  const parsed=_parseProcessWakeupBody(text);
+  const meta=(m&&m._wakeup_meta&&typeof m._wakeup_meta==='object')?m._wakeup_meta:null;
+  if(!parsed&&!meta) return null;
+  const pick=(metaKey,parsedKey)=>{
+    if(meta&&meta[metaKey]!=null) return meta[metaKey];
+    return parsed?parsed[parsedKey]:null;
+  };
+  return {
+    type:String(pick('type','type')||''),
+    taskId:String(pick('task_id','taskId')||''),
+    command:String(pick('command','command')||''),
+    exitCode:pick('exit_code','exitCode'),
+    pattern:pick('pattern','pattern'),
+    output:parsed?parsed.output:null,
+  };
+}
+function _processWakeupCardHtml(info, rawText, extras){
+  const isWatch=info.type==='watch_match';
+  const exitStr=info.exitCode==null?'':String(info.exitCode);
+  // Signal-killed processes report negative exit codes (subprocess returncode).
+  const exitKnown=/^-?\d+$/.test(exitStr);
+  const exitOk=exitStr==='0';
+  let chip;
+  if(isWatch){
+    chip=`<span class="process-wakeup-chip watch" title="${esc(t('process_wakeup_matched'))}">${li('eye',11)}<code title="${esc(String(info.pattern||''))}">${esc(String(info.pattern||''))}</code></span>`;
+  }else{
+    const cls=exitOk?'ok':(exitKnown?'fail':'neutral');
+    const icon=exitOk?li('check',11):(exitKnown?li('x',11):'');
+    chip=`<span class="process-wakeup-chip ${cls}">${icon}<span>exit ${esc(exitStr||'?')}</span></span>`;
+  }
+  const cmdHtml=info.command?`<code class="process-wakeup-cmd" title="${esc(info.command)}">${esc(info.command)}</code>`:'';
+  // Preserve output byte-for-byte for the <pre>; trim ONLY for the
+  // empty/non-empty decision so leading indentation and trailing blank lines
+  // survive (#6350 review finding 1).
+  const outRaw=info.output!=null?String(info.output):String(rawText||'');
+  const outHtml=outRaw.trim()?`<pre class="process-wakeup-text">${esc(outRaw)}</pre>`:'';
+  const cmdRow=info.command?`<div class="process-wakeup-cmd-row"><code>${esc(info.command)}</code></div>`:'';
+  // The collapsed watch chip truncates the pattern; surface the full,
+  // wrapping value in the expanded detail so touch/keyboard users can read it
+  // without relying on a hover tooltip (#6350 review finding 4).
+  const patternRow=(isWatch&&info.pattern)?`<div class="process-wakeup-pattern-row"><span class="process-wakeup-detail-key">${esc(t('process_wakeup_matched'))}</span><code>${esc(String(info.pattern))}</code></div>`:'';
+  return `<details class="process-wakeup-card"><summary class="process-wakeup-summary"><span class="process-wakeup-toggle">${li('chevron-right',12)}</span><span class="process-wakeup-label">${li('terminal',13)}<span>${esc(t('process_wakeup_label'))}</span></span>${cmdHtml}${chip}${extras.timeHtml||''}</summary><div class="process-wakeup-detail">${extras.filesHtml||''}${patternRow}${cmdRow}<div class="msg-body process-wakeup-body">${outHtml}</div>${extras.footHtml||''}</div></details>`;
+}
+
 function renderMessages(options){
   _lastMessageRenderAt=performance.now();
   const preserveScroll=!!(options&&options.preserveScroll);
@@ -12830,6 +16553,10 @@ function renderMessages(options){
   const scrollSnapshot=(preserveScroll||_messageUserUnpinned)?_captureMessageScrollSnapshot():null;
   const inner=$('msgInner');
   const sid=S.session?S.session.session_id:null;
+  if(!S.busy&&Array.isArray(S.messages)&&typeof _hydrateIdLinkedHistoricalToolScenes==='function'){
+    const activityMode=typeof chatActivityMode==='function'?chatActivityMode():'compact_worklog';
+    _hydrateIdLinkedHistoricalToolScenes(S.messages,{sessionId:sid,mode:activityMode});
+  }
   const msgCount=S.messages.length;
   // During session switch, S.messages is intentionally cleared while the full
   // message fetch is still in flight. Other async updates can still call
@@ -12880,6 +16607,7 @@ function renderMessages(options){
       _messageVirtualWindowKey=renderWindowKey;
       _sessionHtmlCacheSid=sid;
       _rehydrateTransparentStreamDom(inner);
+      _rehydrateDeferredWorklogsFromCache(inner);
       _wireMessageWindowLoadEarlierButton();
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
@@ -12905,22 +16633,27 @@ function renderMessages(options){
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
     if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
-      // wipe if it is GENUINELY live — either an active stream is still running
-      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
-      // was written for), or the turn already holds real rendered content (a
-      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
-      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
-      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
-      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
-      // be preserved: re-attaching it on a session-updated swap re-render pins
-      // an avatar-only empty turn OVER the settled transcript, hiding the real
-      // (already-persisted) answer. That is the reported blank. Reproduced +
-      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
-      // empty live-turn survived the swap → blank; gating on real-content /
-      // active-stream clears it while a genuine live turn still renders.
-      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
-      if(_hasRealLiveContent || S.activeStreamId){
+      // Live-turn preservation requires a PROVABLE live owner — never bare DOM
+      // content. (#6948) The live turn is preserved across the wipe only while
+      // (a) the stream is genuinely active (S.activeStreamId — the #3877
+      // mid-stream flicker case this preserve was written for), or (b) the
+      // current message projection (S.messages) still carries explicit
+      // live-assistant evidence — a client-side _live / _activityBurstId /
+      // _liveSegmentSeq marker merged in from the INFLIGHT tail or a server
+      // journal snapshot (the reconnect / terminal-projection case). A settled
+      // transcript has neither, so a contentful but DEAD live node (stream
+      // ended — S.activeStreamId cleared — while INFLIGHT[sid] was not yet
+      // cleaned) is no longer preserved: re-attaching it over the settled
+      // transcript pinned a second copy of the same assistant message (#6948;
+      // data was always clean — state.db, sidecar, and /api/session each hold
+      // one row; the duplicate existed only in the rendered DOM). The #5390
+      // blank-turn guard (对话消失) is preserved: a dead EMPTY shell has no live
+      // projection either, so it is still dropped with the wipe instead of
+      // pinning an avatar-only blank turn over the settled answer.
+      const _hasLiveAssistantProjection=Array.isArray(S.messages)&&S.messages.some(m=>
+        m&&m.role==='assistant'&&(m._live||m._activityBurstId!==undefined||m._liveSegmentSeq!==undefined)
+      );
+      if(S.activeStreamId || _hasLiveAssistantProjection){
         _preservedLiveTurn=_lt;
       }
     }
@@ -12960,6 +16693,29 @@ function renderMessages(options){
   // Mobile scroll-jank fix: temporarily disable overflow-anchor so Chromium
   // cannot re-anchor to the topmost row during the DOM wipe-and-rebuild gap.
   if(window._fixMobileScrollJank) window._fixMobileScrollJank();
+  // Capture whether the reader was at/near the tail BEFORE the wipe. A tail-follower
+  // hit by a mid-stream re-render gets a one-frame jitter: the wipe+rebuild lands the
+  // sync scrollTop write against a transient layout whose above-viewport height is a
+  // few px short of the settled value, so the browser clamps scrollTop a little high;
+  // the settle rAF corrects it the next frame, producing a fast ~1-row back-and-forth
+  // bounce. We remember the pre-wipe near-tail state here (geometry, not closure pin
+  // flags — the wipe's clamp scroll event can transiently perturb those) so the tail
+  // of renderMessages can re-anchor to the settled bottom before the intermediate is
+  // painted. See _reanchorPinnedTailAfterRender + its queueMicrotask call site.
+  const _preWipeNearTail=(()=>{
+    const _m=$('messages');
+    if(!_m) return false;
+    return (_m.scrollHeight-_m.scrollTop-_m.clientHeight)<=8;
+  })();
+  // Pre-wipe capture: read the still-laid-out user rows' REAL heights before the wipe below
+  // destroys them, and persist so the rebuild reserves the real off-screen height. This is
+  // the non-virtualized analog of #5638's virtualized measure pass (which never runs when
+  // _virtualizeTranscript===false). Without it, a fresh off-screen tall user row reserves
+  // only the flat contain-intrinsic-size estimate, scrollHeight shrinks, and the browser
+  // clamps scrollTop → the jump-back. Reading pre-wipe (not post-render) is what makes the
+  // measurement reliable — the old elements have painted, so their rect height is real even
+  // off-screen; a post-render read of a fresh off-screen row returns its collapsed reserve.
+  if(typeof _rememberRenderedUserRowIntrinsicHeights==='function') _rememberRenderedUserRowIntrinsicHeights();
   // The DOM wipe can briefly collapse #msgInner to zero height, causing the
   // browser to clamp #messages.scrollTop to 0 and emit a scroll event.  That
   // event is a render artifact, not user intent; if the scroll listener sees it
@@ -12988,6 +16744,17 @@ function renderMessages(options){
     rawIdx++;
   }
   const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
+  // #6999: the turn-content maps MUST see the FULL visWithIdx, not the
+  // virtual render window. _assistantTurnFinalVisibleContentMap /
+  // _assistantTurnVisibleContentMap derive the echo-strip context for a
+  // rendered assistant row from ALL assistant siblings of its turn
+  // (ui.js:10783-10830). Windowed-out siblings are still input context even
+  // though their own rows are not read: cutting through an assistant run
+  // loses the final/visible answer used to strip reasoning echoes, and
+  // concatenating head+tail across an omitted user boundary would merge
+  // distinct turns into one run (duplicate final-answer in Worklog/Thinking,
+  // or later-turn prose used as an echo-strip input). Turn context must
+  // always be complete — never cut mid-run, never head+tail with a gap.
   const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
   const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
@@ -13216,11 +16983,13 @@ function renderMessages(options){
         }
       }
     }
+    const isProcessWakeup=m&&m._source==='process_wakeup';
     const isUser=m.role==='user';
     if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
       content='**Error:** No response received after context compression. Please retry.';
     }
     const displayContent=isUser?_stripAttachedFilesMarkerForDisplay(_stripWorkspaceDisplayPrefix(content)):content;
+    const rowDisplayContent=displayContent;
     if(!isUser&&_isAssistantEmptyPlaceholderContent(m, displayContent)){
       content='';
     }
@@ -13245,17 +17014,35 @@ function renderMessages(options){
       }).join('')}</div>`;
     }
     let bodyHtml = _getCachedRender(displayContent, isUser);
+    // Message-level media snapshots: settled assistant messages carry a
+    // path→digest map (written at settle time) freezing the file bytes the
+    // turn emitted. Stamp it AFTER the text-keyed render cache so identical
+    // text with different snapshots (old/new comparison) never collides.
+    if(!isUser && m && m._media_snapshots && typeof m._media_snapshots==='object'){
+      bodyHtml = _stampMediaSnapshots(bodyHtml, m._media_snapshots);
+    }
     if(!isUser&&m.provider_details){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
+    const recoveryPayload=(!isUser&&m._compressionRecovery)
+      ? m._compressionRecovery
+      : (!isUser&&isLastAssistant&&isTurnFinalAssistant&&typeof _activeCompressionRecoveryPayload==='function' ? _activeCompressionRecoveryPayload() : null);
+    const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
+    if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
-    const forkBtn  = `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const readOnlySession=typeof _isReadOnlySession==='function'
+      ? _isReadOnlySession(S.session)
+      : !!(S.session&&(S.session.read_only||S.session.is_read_only));
+    const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+      ? _isBranchableReadOnlySession(S.session)
+      : false;
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -13279,6 +17066,71 @@ function renderMessages(options){
       continue;
     }
 
+    if(isProcessWakeup){
+      currentAssistantTurn=null;
+      let row=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
+      if(row&&(!row.classList.contains('msg-row')||row.classList.contains('assistant-turn'))) row=null;
+      const processText=String(rowDisplayContent||'').trim();
+      const processFootHtml=`<div class="msg-foot">${timeHtml}<span class="msg-actions">${copyBtn}</span></div>`;
+      // #6345: structured completions/watch-matches render as a collapsed
+      // summary card; anything unparseable keeps the raw notice below so the
+      // fallback is never worse than the old full-text dump.
+      const wakeupInfo=_processWakeupInfo(m, processText);
+      let noticeClass='process-wakeup-notice';
+      let noticeInnerHtml;
+      if(wakeupInfo){
+        noticeClass+=' process-wakeup-notice-card';
+        const exitStr=wakeupInfo.exitCode==null?'':String(wakeupInfo.exitCode);
+        if(wakeupInfo.type==='completion'&&/^-?\d+$/.test(exitStr)&&exitStr!=='0') noticeClass+=' process-wakeup-fail';
+        noticeInnerHtml=_processWakeupCardHtml(wakeupInfo, processText, {timeHtml, filesHtml, footHtml:`<div class="msg-foot"><span class="msg-actions">${copyBtn}</span></div>`});
+      }else{
+        const processTextHtml=processText?`<pre class="process-wakeup-text">${esc(processText)}</pre>`:'';
+        noticeInnerHtml=`<div class="process-wakeup-label">${li('terminal',13)}<span>${esc(t('process_wakeup_label'))}</span></div>${filesHtml}<div class="msg-body process-wakeup-body">${processTextHtml}</div>${processFootHtml}`;
+      }
+      const nextRowHtml=`<div class="${noticeClass}">${noticeInnerHtml}</div>`;
+      if(row){
+        row.className='msg-row process-wakeup-row';
+        row.id=_userMessageDomId(rawIdx);
+        row.dataset.msgIdx=rawIdx;
+        row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
+        row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
+        row.dataset.role='process_wakeup';
+        delete row.dataset.editing;
+        // Compare against the HTML we last SET (expando), not live innerHTML:
+        // a user-expanded <details> serializes an open attribute into
+        // innerHTML, which would force a rebuild-and-collapse on every
+        // streaming rerender. The expando comparison is
+        // serialization-independent while still rebuilding when the markup
+        // genuinely changes (locale/timestamp format); open state is
+        // user-driven, so it is captured and restored across rebuilds.
+        if(row.dataset.rawText!==processText||row._wakeupRenderedHtml!==nextRowHtml){
+          const _priorCard=row.querySelector&&row.querySelector('details.process-wakeup-card');
+          const _wasOpen=!!(_priorCard&&_priorCard.open);
+          row.dataset.rawText=processText;
+          row._wakeupRenderedHtml=nextRowHtml;
+          row.innerHTML=nextRowHtml;
+          if(_wasOpen){
+            const _card=row.querySelector('details.process-wakeup-card');
+            if(_card) _card.open=true;
+          }
+        }
+      }else{
+        row=document.createElement('div');
+        row.className='msg-row process-wakeup-row';
+        row.id=_userMessageDomId(rawIdx);
+        row.dataset.msgIdx=rawIdx;
+        row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
+        row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
+        row.dataset.role='process_wakeup';
+        row.dataset.rawText=processText;
+        row._wakeupRenderedHtml=nextRowHtml;
+        row.innerHTML=nextRowHtml;
+      }
+      inner.appendChild(row);
+      userRows.set(rawIdx, row);
+      continue;
+    }
+
     if(isUser){
       currentAssistantTurn=null;
       let row=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
@@ -13286,6 +17138,7 @@ function renderMessages(options){
       const newRawText=String(displayContent).trim();
       const nextRowHtml=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
       if(row){
+        row.className='msg-row';
         row.id=_userMessageDomId(rawIdx);
         row.dataset.msgIdx=rawIdx;
         row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
@@ -13307,6 +17160,14 @@ function renderMessages(options){
         row.dataset.rawText=newRawText;
         row.innerHTML=nextRowHtml;
       }
+      // Reserve this user row's real off-screen height up front so a wipe-and-rebuild
+      // does not collapse scrollHeight to the flat 96px estimate (the collapse that
+      // clamps/re-anchors the viewport on mobile — #5637/#5638, both jump classes). Uses
+      // the remembered measured height when this row has been measured before, else a
+      // content-length estimate; the measure pass refines it exactly next frame. The
+      // typeof guard keeps renderMessages runnable in the node test harnesses that
+      // extract it without this helper (they stub every collaborator by name).
+      if(typeof _applyUserRowIntrinsicHeight==='function') _applyUserRowIntrinsicHeight(row, newRawText);
       inner.appendChild(row);
       userRows.set(rawIdx, row);
       continue;
@@ -13353,7 +17214,7 @@ function renderMessages(options){
       orderedTransparentParts.forEach((part, partIdx)=>{
         if(!part) return;
         if(part.kind==='tool'){
-          const toolCall=_transparentOrderedToolCall(part, rawIdx, transparentOrderedToolCallsByTid, transparentToolResultsByTid, transparentPersistedSnippetByTid);
+        const toolCall=_transparentOrderedToolCall(part, rawIdx, transparentOrderedToolCallsByTid, transparentToolResultsByTid, transparentPersistedSnippetByTid);
           const toolRow=_decorateTransparentEventRow(buildToolCard(toolCall),{
             type:'tool',
             name:toolCall&&toolCall.name,
@@ -13380,10 +17241,15 @@ function renderMessages(options){
         if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))) orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
         const isLastTextPart=partIdx===lastTextPartIdx;
         const partBodyHtml=_getCachedRender(partDisplayText,false);
+        // Message-level media snapshots: transparent ordered segments carry the
+        // same per-message path→digest map as the main transcript; stamp it so
+        // historical previews freeze (&snap=) instead of following overwrites.
+        // Inlined in the template (no intermediate variable) so test-harness
+        // block extraction of the ordered-segment slice stays self-contained.
         if(isLastTextPart&&statusHtml){
           orderedSeg.insertAdjacentHTML('beforeend', statusHtml);
         }
-        orderedSeg.insertAdjacentHTML('beforeend', `${isLastTextPart?filesHtml:''}<div class="msg-body">${partBodyHtml}</div>${isLastTextPart?footHtml:''}`);
+        orderedSeg.insertAdjacentHTML('beforeend', `${isLastTextPart?filesHtml:''}<div class="msg-body">${(typeof m!=='undefined'&&m&&m._media_snapshots&&typeof m._media_snapshots==='object')?_stampMediaSnapshots(partBodyHtml,m._media_snapshots):partBodyHtml}</div>${isLastTextPart?footHtml:''}`);
         blocks.appendChild(orderedSeg);
         if(!firstSeg) firstSeg=orderedSeg;
       });
@@ -13440,9 +17306,10 @@ function renderMessages(options){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml);
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);
     if(statusHtml){
       seg.insertAdjacentHTML('beforeend', statusHtml);
+      if(hasVisibleBody) seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
     }else if(hasVisibleBody){
       seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
     }else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){
@@ -13893,11 +17760,13 @@ function renderMessages(options){
       // position). Keyed by the assistant turn element. (Trifecta finding O-Bug1.)
       const transparentSeenThinking=new Map();
       for(const entry of activityOrder){
+        const {aIdx,segmentSeq,burstId,cards,thinkingIdx,includeAnchorReason}=entry;
+        const sourceMsg=aIdx>=0?S.messages[aIdx]:null;
         const event={
           ...entry,
-          thinkingText:entry.thinkingIdx!==null?assistantThinking.get(entry.thinkingIdx):'',
+          ts:sourceMsg&&((sourceMsg._ts!==undefined&&sourceMsg._ts!==null)?sourceMsg._ts:sourceMsg.timestamp),
+          thinkingText:thinkingIdx!==null?assistantThinking.get(thinkingIdx):'',
         };
-        const {aIdx,segmentSeq,burstId,cards}=event;
         if(aIdx<assistantIdxs[0]) continue;
         const anchorRow=_assistantAnchorForActivity(aIdx,segmentSeq,burstId);
         if(!anchorRow) continue;
@@ -13931,6 +17800,7 @@ function renderMessages(options){
               type:'thinking',
               text:event.thinkingText,
               preview:event.thinkingText,
+              ts:event.ts,
               segmentSeq,
               burstId,
             });
@@ -13945,6 +17815,7 @@ function renderMessages(options){
             name:event.toolCall&&event.toolCall.name,
             status:_transparentToolStatus(event.toolCall,true),
             toolCall:event.toolCall,
+            ts:event.ts,
             segmentSeq,
             burstId,
           });
@@ -13961,7 +17832,15 @@ function renderMessages(options){
     }
   }
   _restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);
-  _messageVirtualWindowKey=renderWindowKey;
+  // #5839 fix: deferred settled worklogs have no rows yet at restore time, so
+  // the disclosure restore above can't reach their detail elements. Stash the
+  // captured state on each still-deferred group; _materializeDeferredWorklogRows
+  // re-applies it (key-scoped + idempotent) once the rows exist on expand.
+  if(worklogDetailDisclosureState&&worklogDetailDisclosureState.size){
+    inner.querySelectorAll('[data-worklog-rows-deferred="1"]').forEach(group=>{
+      group._deferredWorklogDisclosure=worklogDetailDisclosureState;
+    });
+  }
   // Render per-turn duration and optional token usage on assistant messages.
   // Duration stays visible even when token usage is disabled, because it answers
   // the basic "how long did that turn take?" UX question. Only walk rendered
@@ -13973,7 +17852,7 @@ function renderMessages(options){
       const msg=S.messages[mi]||{};
       if(msg.role!=='assistant') continue;
       const routing=msg._gatewayRouting||null;
-      const gatewayText=_formatGatewayModelLabel(S.session&&S.session.model||'', '', routing);
+      const gatewayText=_formatGatewayModelLabel(String(msg._usedModel||'').trim()||(S.session&&S.session.model)||'', '', routing);
       const failoverText=_gatewayRoutingFailoverText(routing);
       const modelWarningText=_gatewayModelWarningText(routing);
       const hasTurnUsage=!!msg._turnUsage;
@@ -13982,12 +17861,13 @@ function renderMessages(options){
       // Worklog above the final answer.
       const compactWorklogForMessage=isCompactWorklogMode()&&(toolCallAssistantIdxs.has(mi)||assistantThinking.has(mi));
       const durationText=compactWorklogForMessage?'':_formatTurnDuration(msg._turnDuration);
-      if(!hasTurnUsage&&!durationText&&!gatewayText&&!failoverText&&!modelWarningText) continue;
+      const usedModelText=_usedModelTurnChipLabel(msg);
+      if(!hasTurnUsage&&!durationText&&!gatewayText&&!failoverText&&!modelWarningText&&!usedModelText) continue;
       const seg=assistantSegments.get(mi);
       const row=seg?seg.closest('.assistant-turn'):null;
       const footerRows=row?row.querySelectorAll('.msg-foot'):[];
       const targetFoot=footerRows.length?footerRows[footerRows.length-1]:null;
-      if(!targetFoot||targetFoot.querySelector('.msg-usage-inline,.msg-duration-inline,.msg-gateway-inline,.gateway-failover-inline,.msg-model-warning-inline')) continue;
+      if(!targetFoot||targetFoot.querySelector('.msg-usage-inline,.msg-duration-inline,.msg-gateway-inline,.gateway-failover-inline,.msg-model-warning-inline,.msg-used-model-inline')) continue;
       const fragments=[];
       if(modelWarningText){
         const warning=document.createElement('span');
@@ -14012,6 +17892,23 @@ function renderMessages(options){
         duration.className='msg-duration-inline';
         duration.textContent=`Done in ${durationText}`;
         fragments.push(duration);
+      }
+      // The transparent turn footer owns the model label (.lf-model) whenever
+      // the turn has transparent event rows — skip the generic chip there so
+      // exactly one model label renders per turn. Model sits after duration to
+      // match the transparent footer order (elapsed · model · …).
+      const _transparentFooterOwnsModel=usedModelText&&isTransparentStream()&&row&&(()=>{
+        const blocks=_assistantTurnBlocks(row);
+        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
+      })();
+      if(usedModelText&&!_transparentFooterOwnsModel){
+        const usedModel=document.createElement('span');
+        usedModel.className='msg-used-model-inline';
+        usedModel.textContent=usedModelText;
+        // Preserve the full (uncompacted) model id on hover where available.
+        const usedModelFull=String(msg._usedModel||'').trim();
+        if(usedModelFull&&usedModelFull!==usedModelText) usedModel.title=usedModelFull;
+        fragments.push(usedModel);
       }
       if(window._showTokenUsage&&hasTurnUsage){
         const usage=document.createElement('span');
@@ -14060,26 +17957,31 @@ function renderMessages(options){
       }
       _applyTransparentRowFading(turn);
       if(hasTransparentRows){
-        // Find the corresponding message to read duration/usage.
-        const seg=turn.querySelector('.assistant-segment');
+        // Read turn metadata from the final metadata-bearing assistant segment,
+        // not querySelector's first match — a tool turn's activity segment
+        // precedes the answer, and the metadata lives on the last message
+        // (#6068 gate round 2: multi-segment turns lost the model label).
+        const msg=_transparentTurnMetaMessage(turn);
         let durationText='';
+        let modelText='';
+        let modelTitle='';
         let ttftText='';
         let tokensText='';
-        if(seg){
-          const mi=seg.getAttribute('data-msg-idx');
-          if(mi!=null){
-            const msg=S.messages[Number(mi)]||{};
-            if(msg._turnDuration!=null) durationText=_formatTurnDuration(msg._turnDuration);
-            if(msg._firstTokenMs!=null) ttftText=_formatFirstToken(msg._firstTokenMs);
-            if(msg._turnUsage){
-              const inTok=msg._turnUsage.input_tokens||0;
-              const outTok=msg._turnUsage.output_tokens||0;
-              tokensText=`${_fmtTokens(inTok)} in · ${_fmtTokens(outTok)} out`;
-            }
+        if(msg){
+          if(msg._turnDuration!=null) durationText=_formatTurnDuration(msg._turnDuration);
+          modelText=_usedModelTurnChipLabel(msg);
+          if(modelText) modelTitle=String(msg._usedModel||'').trim();
+          if(msg._firstTokenMs!=null) ttftText=_formatFirstToken(msg._firstTokenMs);
+          if(msg._turnUsage){
+            const inTok=msg._turnUsage.input_tokens||0;
+            const outTok=msg._turnUsage.output_tokens||0;
+            tokensText=`${_fmtTokens(inTok)} in · ${_fmtTokens(outTok)} out`;
           }
         }
         _renderTransparentTurnFooter(turn,{
           durationText,
+          modelText,
+          modelTitle,
           ttftText,
           tokensText,
           statusText: t('done')||'Done',
@@ -14109,11 +18011,12 @@ function renderMessages(options){
   // (Opus advisor, stage-342).
   {
     const _turnHasVisibleContent=(turn)=>{
-      const segs=turn.querySelectorAll('.assistant-segment');
-      for(const seg of segs){
-        // A segment shows real content only when it is NOT worklog-folded AND its
-        // body/files/status actually painted (the anchor-only placeholder class
-        // carries no visible body).
+      if(typeof _assistantTurnHasVisibleRenderedSegment==='function'){
+        return _assistantTurnHasVisibleRenderedSegment(turn)===true;
+      }
+      // Keep the extracted renderMessages test harness self-contained.
+      if(!turn||typeof turn.querySelectorAll!=='function') return false;
+      for(const seg of turn.querySelectorAll('.assistant-segment')){
         if(seg.classList.contains('assistant-segment-worklog-source')) continue;
         if(seg.classList.contains('assistant-segment-anchor')) continue;
         if((seg.textContent||'').trim()) return true;
@@ -14133,6 +18036,9 @@ function renderMessages(options){
           group.classList.add('open');
           const summary=group.querySelector('.tool-call-group-summary,.activity-summary');
           if(summary) summary.setAttribute('aria-expanded','true');
+          // #5839: this turn is otherwise blank, so materialize any deferred
+          // settled rows now that we're force-expanding the worklog to fill it.
+          if(typeof _materializeDeferredWorklogRows==='function') _materializeDeferredWorklogRows(group);
         }
         // `revealed` means "this turn has a non-empty Worklog group that the user
         // can see" — NOT "we just expanded something". An already-open non-empty
@@ -14283,6 +18189,20 @@ function renderMessages(options){
     }
   }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
+  // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
+  // not synchronously: inside this render sync stack the browser still reports a transient
+  // scrollHeight (layout is batched), so a synchronous re-anchor would read the SAME short
+  // value scrollToBottom already clamped against and be a no-op. The microtask runs after the
+  // stack unwinds (scrollHeight has flushed to the settled value) but before the browser
+  // paints this frame, so writing the settled max lands the tail exactly and the ~1-row high
+  // intermediate never reaches the screen. Only re-anchors a pre-wipe tail-follower left short
+  // of the settled max — an unpinned reader parked in history is never moved (orthogonal to
+  // the unpinned jump-back class). See _reanchorPinnedTailAfterRender for the full rationale.
+  // (typeof guards mirror the _deferClearProgrammaticScroll call below so standalone
+  // renderMessages() test harnesses that don't define these helpers still run.)
+  if(typeof queueMicrotask==='function' && typeof _reanchorPinnedTailAfterRender==='function'){
+    queueMicrotask(()=>_reanchorPinnedTailAfterRender(_preWipeNearTail));
+  }
   _recycleStash.clear();
   if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll(160);
 }
@@ -14412,6 +18332,20 @@ function _toolTargetLabel(tc){
   else raw=a.cmd||a.command||a.path||a.file_path||a.file||a.uri||a.url||a.query||a.pattern||a.dir||a.task||a.name||'';
   return _redactToolTargetLabel(_decodeToolLabelEntities(String(raw).split('\n')[0].trim()));
 }
+function _toolReadRangeLabel(tc){
+  const name=String(tc&&tc.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'_');
+  if(name!=='read_file') return '';
+  const args=tc&&tc.args||{};
+  const offset=args.offset;
+  if(!Number.isSafeInteger(offset)||offset<=0) return '';
+  const limit=args.limit;
+  if(limit===undefined) return `L${offset}`;
+  if(!Number.isSafeInteger(limit)||limit<=0) return '';
+  if(limit===1) return `L${offset}`;
+  const span=limit-1;
+  if(offset>Number.MAX_SAFE_INTEGER-span) return '';
+  return `L${offset}-${offset+span}`;
+}
 function _toolFullCommandLabel(tc){
   // Full (multi-line) shell command for the EXPANDED detail lead. Mirrors the
   // shell raw-extraction in _toolTargetLabel but WITHOUT the .split('\n')[0]
@@ -14426,7 +18360,12 @@ function _toolVisibleTargetLabel(tc, opts){
   const target=_toolTargetLabel(tc);
   if(!target) return '';
   const kind=_toolActionKind(tc);
-  if(kind==='read'||kind==='write') return _shortToolLabel(_toolPathBasename(target)||target, opts.limit||112);
+  if(kind==='read'||kind==='write'){
+    let text=_toolPathBasename(target)||target;
+    const range=kind==='read'?_toolReadRangeLabel(tc):'';
+    if(range) text=opts.rangeFirst?`${range} · ${text}`:`${text} · ${range}`;
+    return _shortToolLabel(text, opts.limit||112);
+  }
   if(kind==='skill'){
     const suffix=_toolI18n('tool_target_skill_suffix', 'skill');
     const text=target.toLowerCase().endsWith(String(suffix).toLowerCase())?target:`${target} ${suffix}`;
@@ -15035,8 +18974,9 @@ function appendLiveToolCard(tc){
   const opts=arguments[1]||{};
   if(opts.sessionId&&S.session.session_id!==opts.sessionId) return;
   if(opts.streamId&&S.activeStreamId!==opts.streamId) return;
+  if(typeof isFinalAnswerOnlyMode==='function'&&isFinalAnswerOnlyMode()) return;
   if(isLiveAnchorActivitySceneOwner(opts.streamId||S.activeStreamId)){
-    _renderLiveAnchorActivitySceneForStream(opts.streamId||S.activeStreamId, opts.sessionId||S.session.session_id, {mode:'compact_worklog'});
+    _renderLiveAnchorActivitySceneForStream(opts.streamId||S.activeStreamId, opts.sessionId||S.session.session_id);
     return;
   }
   let turn=$('liveAssistantTurn');
@@ -15068,11 +19008,14 @@ function appendLiveToolCard(tc){
     if(tid){
       const existing=inner.querySelector(`.transparent-event-row[data-live-tid="${CSS.escape(tid)}"],.tool-card-row[data-live-tid="${CSS.escape(tid)}"]`);
       if(existing){
+        const replacementTs=_transparentEventTimestampSeconds(existing,{toolCall:tc});
         const replacement=_decorateTransparentEventRow(buildToolCard(tc),{
           type:'tool',
           name:tc&&tc.name,
           status:_transparentToolStatus(tc),
           toolCall:tc,
+          ts:replacementTs,
+          live:true,
           segmentSeq:effectiveSegmentSeq,
           burstId,
         });
@@ -15108,6 +19051,7 @@ function appendLiveToolCard(tc){
       name:tc&&tc.name,
       status:_transparentToolStatus(tc),
       toolCall:tc,
+      live:true,
       segmentSeq:effectiveSegmentSeq,
       burstId,
     });
@@ -15195,17 +19139,33 @@ function _findLiveAssistantAnchorForSegment(inner, segmentSeq){
 }
 
 function clearLiveToolCards(){
+  const preserveDom=!!(arguments[0]&&arguments[0].preserveDom);
   if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
-  const inner=_assistantTurnBlocks($('liveAssistantTurn'));
-  if(inner) inner.querySelectorAll('.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]:not(.transparent-event-row),[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  if(!preserveDom){
+    const inner=_assistantTurnBlocks($('liveAssistantTurn'));
+    if(inner) inner.querySelectorAll('.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]:not(.transparent-event-row),[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  }
   // Reset the per-turn user expand intent so the next turn starts at the
   // default collapsed state (#1298).
   if(typeof _clearLiveActivityUserIntent==='function') _clearLiveActivityUserIntent();
-  // Legacy #liveToolCards container cleanup — kept for safety in case any
-  // leftover cards were inserted there before this refactor took effect.
+  // Legacy #liveToolCards container cleanup (sibling to the settled-rendered
+  // subtree). Always clear/hide it to avoid leaking stale fallback content.
   const container=$('liveToolCards');
   if(container){container.innerHTML='';container.style.display='none';}
 }
+function _hideLiveActivityForFinalAnswerOnly(){
+  clearLiveToolCards();
+  if(typeof removeThinking==='function') removeThinking();
+  const turn=$('liveAssistantTurn');
+  const inner=_assistantTurnBlocks(turn);
+  if(inner){
+    inner.querySelectorAll('.transparent-event-row,.agent-activity-thinking,.wl-reason,#liveRunStatus,.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid],[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  }
+  const legacyThinking=$('thinkingRow');
+  if(legacyThinking) legacyThinking.remove();
+  if(turn&&inner&&!inner.children.length) turn.remove();
+}
+if(typeof window!=='undefined') window._hideLiveActivityForFinalAnswerOnly=_hideLiveActivityForFinalAnswerOnly;
 function _removeEmptyLiveWorklogShells(inner){
   if(!inner) return;
   inner.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-worklog-shell="1"],.tool-call-group[data-live-worklog-shell="1"]').forEach(group=>{
@@ -15231,13 +19191,14 @@ function _setLiveWorklogThinkingPlaceholder(group){
 }
 function ensureLiveWorklogShell(){
   if(!S.session) return null;
+  if(typeof isFinalAnswerOnlyMode==='function'&&isFinalAnswerOnlyMode()) return null;
   const activeStreamId=S.activeStreamId||'';
-  if(activeStreamId&&typeof _renderLiveAnchorActivitySceneForStream==='function'&&_renderLiveAnchorActivitySceneForStream(activeStreamId, S.session.session_id, {mode:'compact_worklog'})){
+  if(activeStreamId&&typeof _renderLiveAnchorActivitySceneForStream==='function'&&_renderLiveAnchorActivitySceneForStream(activeStreamId, S.session.session_id)){
     _dedupeLiveProcessedWorklogAnchors($('liveAssistantTurn'));
     return $('liveAssistantTurn');
   }
   if(activeStreamId&&isLiveAnchorActivitySceneOwner(activeStreamId)){
-    _renderLiveAnchorActivitySceneForStream(activeStreamId, S.session.session_id, {mode:'compact_worklog'});
+    _renderLiveAnchorActivitySceneForStream(activeStreamId, S.session.session_id);
     _dedupeLiveProcessedWorklogAnchors($('liveAssistantTurn'));
     return $('liveAssistantTurn');
   }
@@ -15337,6 +19298,11 @@ async function submitEdit(msgIdx, newText) {
   if(!S.session || S.busy) return;
   const initialSid = S.session.session_id;
   const absoluteKeepCount = _oldestIdx + msgIdx;
+  // #5924: capture the deliberate-pick signal up front (pre-network), scoped to
+  // initialSid — a non-default session model (vs profile default), which is
+  // inference-free and survives the failed send's marker consumption. See
+  // _deliberateSessionModelPick. null → no re-arm → server resolution runs.
+  const _recoveryPick=_deliberateSessionModelPick(initialSid);
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
@@ -15346,39 +19312,43 @@ async function submitEdit(msgIdx, newText) {
       session_id: initialSid,
       keep_count: absoluteKeepCount
     })});
+    // #5924 SILENT-race guard: a session switch during the truncate await must not
+    // let this recovery apply session A's intent (truncate/re-arm/send) to the
+    // newly-visible session.
+    if(!S.session || S.session.session_id !== initialSid) return;
     S.messages = S.messages.slice(0, absoluteKeepCount);
     renderMessages();
     $('msg').value = newText;
+    // #5924 (Facet 1 + Facet 4): edit-resubmit is a recovery send. Re-arm the
+    // Re-arm the single-shot explicit-pick marker from the captured non-default
+    // pick — only if still safe at fire time (session unchanged, current model
+    // still matches, no newer onchange marker to clobber). See _reArmRecoveryPick.
+    _reArmRecoveryPick(initialSid, _recoveryPick);
     await send();
   } catch(e) { setStatus(t('edit_failed') + e.message); }
 }
 
 async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
-  const row = btn.closest('[data-msg-idx]');
-  if(!row) return;
-  const assistantIdx = parseInt(row.dataset.msgIdx, 10);
-  const absoluteKeepCount = _oldestIdx + assistantIdx;
+  const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
+  if(!row)return;
+  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
   const initialSid = S.session.session_id;
-  let lastUserText = '';
-  for(let i = assistantIdx - 1; i >= 0; i--) {
-    const m = S.messages[i];
-    if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
-  }
-  if(!lastUserText) return;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
   if(!S.session || S.session.session_id !== initialSid) return;
+  if(!S.session.regeneration_revision){ setStatus(t('regen_failed')); return; }
+  let latestAssistantIndex=-1;
+  for(let i=S.messages.length-1;i>=0;i--){
+    if(S.messages[i]?.role==='assistant'){latestAssistantIndex=i;break;}
+  }
+  if(clickedAbsoluteIndex!==latestAssistantIndex){
+    setStatus(t('regen_failed'));
+    return;
+  }
   try {
-    await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
-      session_id: initialSid,
-      keep_count: absoluteKeepCount
-    })});
-    S.messages = S.messages.slice(0, absoluteKeepCount);
-    renderMessages();
-    $('msg').value = lastUserText;
-    await send();
+    await startRegeneration(initialSid, S.session.regeneration_revision);
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
@@ -15652,7 +19622,8 @@ function loadDiffInline(container){
   root.querySelectorAll('.diff-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    fetch('api/media?path='+encodeURIComponent(path))
+    const snapQuery=_mediaSnapQuery(el);
+    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>DIFF_MAX_SIZE){
@@ -15676,7 +19647,28 @@ function loadDiffInline(container){
 
 const CSV_MAX_SIZE=256*1024; // 256 KB cap for inline CSV rendering
 
-function buildCsvTablePreview(path, text){
+function _mediaSessionQuery(){
+  const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+  return mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'';
+}
+
+// Message-level media snapshots: lazy preview loaders (pdf/html/csv/diff/
+// excalidraw) build their fetch URL from data-path at load time. The stamping
+// pass in _stampMediaSnapshots carries the content digest in data-snap;
+// append it here so the preview shows the file as the message emitted it.
+function _mediaSnapQuery(el){
+  const snap=el&&el.dataset?el.dataset.snap:'';
+  return (snap&&/^[0-9a-f]{64}$/.test(snap))?('&snap='+snap):'';
+}
+
+function _csvMediaUrl(path, opts={}){
+  let url='api/media?path='+encodeURIComponent(path)+_mediaSessionQuery();
+  if(opts.snap) url+='&snap='+encodeURIComponent(opts.snap);
+  if(opts.download) url+='&download=1';
+  return url;
+}
+
+function buildCsvTablePreview(path, text, downloadUrl=''){
   if(typeof text!=='string') return {errorKey:'csv_error'};
   if(text.length>CSV_MAX_SIZE) return {errorKey:'csv_too_large'};
   const rows=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(r=>r.trim());
@@ -15691,13 +19683,19 @@ function buildCsvTablePreview(path, text){
   const headers=rows[0].split(sep).map(c=>c.trim().replace(/^["']|["']$/g,''));
   const bodyRows=rows.slice(1).map(r=>'<tr>'+r.split(sep).map(c=>`<td>${esc(c.trim().replace(/^["']|["']$/g,''))}</td>`).join('')+'</tr>').join('');
   const headerRow=headers.map(h=>`<th>${esc(h)}</th>`).join('');
+  const fname=path.split('/').pop()||path;
+  const downloadLink=downloadUrl
+    ? `<a class="csv-download-link msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+    : '';
   return {
-    html:`<div class="csv-table-wrap"><div class="pre-header">${esc(path.split('/').pop())} <span style="opacity:.5;font-size:11px">${t('csv_header_note')}</span></div><table class="csv-table"><thead><tr>${headerRow}</tr></thead><tbody>${bodyRows}</tbody></table></div>`,
+    html:`<div class="csv-table-wrap"><div class="pre-header csv-preview-header"><span class="csv-preview-title">${esc(fname)} <span style="opacity:.5;font-size:11px">${t('csv_header_note')}</span></span>${downloadLink}</div><table class="csv-table"><thead><tr>${headerRow}</tr></thead><tbody>${bodyRows}</tbody></table></div>`,
   };
 }
 
 function _csvPreviewErrorHtml(path, errorKey){
-  return `<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
+  const fname=path.split('/').pop()||path;
+  const downloadUrl=_csvMediaUrl(path,{download:true});
+  return `<div class="diff-inline-error">${esc(fname)}<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
 }
 
 function loadCsvInline(container){
@@ -15705,10 +19703,13 @@ function loadCsvInline(container){
   root.querySelectorAll('.csv-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    fetch('api/media?path='+encodeURIComponent(path))
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const mediaUrl=_csvMediaUrl(path,{snap:snap||undefined});
+    const downloadUrl=_csvMediaUrl(path,{download:true,snap:snap||undefined});
+    fetch(mediaUrl)
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
-        const preview=buildCsvTablePreview(path, text);
+        const preview=buildCsvTablePreview(path, text, downloadUrl);
         el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error');
       })
       .catch(()=>{
@@ -15723,7 +19724,8 @@ function loadExcalidrawInline(container){
   root.querySelectorAll('.excalidraw-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    fetch('api/media?path='+encodeURIComponent(path))
+    const snapQuery=_mediaSnapQuery(el);
+    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>EXCALIDRAW_MAX_SIZE){
@@ -15852,14 +19854,15 @@ function loadPdfInline(container){
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
     const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+    const snapQuery=_mediaSnapQuery(el);
     const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
+    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
     const loadPdf=(pdfjsLib)=>{
       fetch(mediaUrl)
         .then(r=>{if(!r.ok) throw new Error(r.status); return r.arrayBuffer();})
         .then(buf=>{
           if(buf.byteLength>PDF_MAX_SIZE){
-            const dlUrl=publicMediaUrl+'&download=1';
+            const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
             return;
           }
@@ -15867,7 +19870,7 @@ function loadPdfInline(container){
         })
         .then(pdf=>{
           if(!pdf) return;
-          const dlUrl=publicMediaUrl+'&download=1';
+          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           const total=pdf.numPages;
           const pagesLabel=total>1?` · ${total} pages`:'';
           const wrap=document.createElement('div');
@@ -15906,7 +19909,7 @@ function loadPdfInline(container){
           renderPage(1);
         })
         .catch(()=>{
-          const dlUrl=publicMediaUrl+'&download=1';
+          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
         });
     };
@@ -15926,7 +19929,7 @@ function loadPdfInline(container){
       window.addEventListener('pdfjs-ready',()=>{ _pdfjsReady=true; loadPdf(window._pdfjsLib); },{once:true});
       setTimeout(()=>{
         if(!_pdfjsReady){
-          const dlUrl=publicMediaUrl+'&download=1';
+          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           if(el.parentNode){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
           }
@@ -15947,22 +19950,23 @@ function loadHtmlInline(container){
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
     const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+    const snapQuery=_mediaSnapQuery(el);
     const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
-    fetch(mediaUrl)
+    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
+    fetch(mediaUrl, {cache:'no-store'})
       .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
-          const openUrl=publicMediaUrl+'&inline=1';
+          const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
           el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
           return;
         }
-        const openUrl=publicMediaUrl+'&inline=1';
+        const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
       .catch(()=>{
-        const dlUrl=publicMediaUrl+'&download=1';
+        const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
         el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_error')}</span></div>`;
       });
   });
@@ -16159,9 +20163,20 @@ function appendThinking(text='', options){
   // without this check they would pollute the new session's DOM.
   options=options||{};
   const allowPendingPlaceholder=!!(options&&options.pending===true);
+  const anchorRenderFallback=!!(options&&options.anchorRenderFallback===true);
+  if(typeof isFinalAnswerOnlyMode==='function'&&isFinalAnswerOnlyMode()) return;
   if(!S.session||(!S.activeStreamId&&!allowPendingPlaceholder)) return;
-  if(!allowPendingPlaceholder&&isLiveAnchorActivitySceneOwner(S.activeStreamId)){
-    _renderLiveAnchorActivitySceneForStream(S.activeStreamId, S.session.session_id, {mode:'compact_worklog'});
+  if(options.sessionId&&String(options.sessionId)!==String(S.session.session_id||'')) return;
+  if(options.streamId&&String(options.streamId)!==String(S.activeStreamId||'')) return;
+  const existingLiveTurn=$('liveAssistantTurn');
+  if(anchorRenderFallback&&existingLiveTurn&&existingLiveTurn.dataset&&
+      existingLiveTurn.dataset.sessionId&&
+      String(existingLiveTurn.dataset.sessionId)!==String(S.session.session_id||'')){
+    if(!_resetMismatchedLiveAssistantTurnForSession(existingLiveTurn, S.session.session_id)) return;
+  }
+  if(anchorRenderFallback&&existingLiveTurn&&_updateLiveAnchorReasoningRowForFallback(existingLiveTurn,text,options)) return;
+  if(!allowPendingPlaceholder&&!anchorRenderFallback&&isLiveAnchorActivitySceneOwner(S.activeStreamId)){
+    _renderLiveAnchorActivitySceneForStream(S.activeStreamId, S.session.session_id);
     return;
   }
   const empty=$('emptyState');
@@ -16224,10 +20239,19 @@ function appendThinking(text='', options){
       }
       row.id='thinkingRow';
       row.setAttribute('data-thinking-active','1');
+      const existingEventAt=row.getAttribute('data-event-at');
+      const nextTs=_firstValidTimestampSeconds(
+        options.ts,
+        options.timestamp,
+        options.created_at,
+        existingEventAt
+      );
       _decorateTransparentEventRow(row,{
         type:'thinking',
         text:clean,
         preview:clean,
+        ts:nextTs||undefined,
+        live:true,
         segmentSeq,
         burstId,
       });
@@ -16374,22 +20398,123 @@ function _visibleWorkspaceEntries(entries){
   const list=Array.isArray(entries)?entries:[];
   return S.showHiddenWorkspaceFiles?list:list.filter(item=>!_workspaceShouldHideEntry(item));
 }
+const WORKSPACE_SORT_KEYS=['name-asc','name-desc','created-desc','modified-desc'];
+const WORKSPACE_SORT_DEFAULT='name-asc';
+function _normalizeWorkspaceSortKey(value){
+  return WORKSPACE_SORT_KEYS.includes(value)?value:WORKSPACE_SORT_DEFAULT;
+}
+function _workspaceEntryRank(item){
+  const rank=item&&item.workspace_sort_rank;
+  return rank===0||rank===1||rank===2?rank:1;
+}
+function _workspaceEntryTimestampKey(item,field){
+  const raw=item&&item[field];
+  if(typeof raw==='string'){
+    const value=raw.trim();
+    if(!/^[+-]?\d+$/.test(value))return null;
+    const negative=value[0]==='-';
+    const digits=value.replace(/^[+-]/,'').replace(/^0+(?=\d)/,'');
+    if(digits==='0')return '0';
+    return negative?'-'+digits:digits;
+  }
+  if(typeof raw==='number') return Number.isInteger(raw)?String(raw):null;
+  if(typeof raw==='bigint') return String(raw);
+  return null;
+}
+function _compareWorkspaceTimestampDesc(a,b,field){
+  const av=_workspaceEntryTimestampKey(a,field),bv=_workspaceEntryTimestampKey(b,field);
+  if(av==null&&bv==null)return 0;
+  if(av==null)return 1;
+  if(bv==null)return -1;
+  const an=av[0]==='-',bn=bv[0]==='-';
+  if(an!==bn)return an?1:-1;
+  const aa=an?av.slice(1):av,bb=bn?bv.slice(1):bv;
+  if(aa.length!==bb.length)return an?aa.length-bb.length:bb.length-aa.length;
+  return aa===bb?0:(an?(aa<bb?-1:1):(aa<bb?1:-1));
+}
+function _workspaceSortComparator(key){
+  if(key==='name-desc') return (a,b)=>String(b.name||'').toLowerCase().localeCompare(String(a.name||'').toLowerCase());
+  const field=key==='created-desc'?'birthtime_ns':'mtime_ns';
+  return (a,b)=>_compareWorkspaceTimestampDesc(a,b,field);
+}
+function _workspaceCreatedSortAvailable(){return !!(S.session&&S.session.workspace&&S._workspaceBirthtimeSeen);}
+function _effectiveWorkspaceSortKey(){
+  const key=_normalizeWorkspaceSortKey(S.workspaceSortKey);
+  return key==='created-desc'&&!_workspaceCreatedSortAvailable()?WORKSPACE_SORT_DEFAULT:key;
+}
+function _workspaceEntriesForRender(entries){
+  const list=_visibleWorkspaceEntries(entries);
+  const key=_effectiveWorkspaceSortKey();
+  if(key===WORKSPACE_SORT_DEFAULT)return list;
+  const cmp=_workspaceSortComparator(key);
+  return list.slice().sort((a,b)=>{
+    const rank=_workspaceEntryRank(a)-_workspaceEntryRank(b);
+    return rank!==0?rank:cmp(a,b);
+  });
+}
+function _resetWorkspaceBirthtimeSupport(scope=''){
+  S._workspaceBirthtimeSeen=false;
+  S._workspaceBirthtimeWorkspace=String(scope||'');
+  _syncWorkspacePrefsIndicators();
+  _syncWorkspaceSortMenuState();
+}
+function _syncWorkspaceBirthtimeSupportScope(scope=''){
+  const next=String(scope||'');
+  if(S._workspaceBirthtimeWorkspace!==next) _resetWorkspaceBirthtimeSupport(next);
+}
+function _noteWorkspaceBirthtimeSupport(entries){
+  if(S._workspaceBirthtimeSeen)return;
+  if((Array.isArray(entries)?entries:[]).some(e=>_workspaceEntryTimestampKey(e,'birthtime_ns')!==null)){
+    S._workspaceBirthtimeSeen=true;
+    S._workspaceBirthtimeWorkspace=String((S.session&&S.session.workspace)||S._workspaceBirthtimeWorkspace||'');
+    _syncWorkspacePrefsIndicators();
+    _syncWorkspaceSortMenuState();
+  }
+}
+function _syncWorkspacePrefsIndicators(ind=$('workspaceHiddenIndicator'),dot=$('workspacePrefsDot')){
+  if(ind){
+    if(S.showHiddenWorkspaceFiles){ind.hidden=false;ind.removeAttribute('hidden');}
+    else{ind.hidden=true;ind.setAttribute('hidden','');}
+  }
+  if(dot){
+    const active=S.showHiddenWorkspaceFiles||_effectiveWorkspaceSortKey()!==WORKSPACE_SORT_DEFAULT;
+    if(active){dot.hidden=false;dot.removeAttribute('hidden');}
+    else{dot.hidden=true;dot.setAttribute('hidden','');}
+  }
+}
+function _syncWorkspaceSortMenuState(menu=_workspacePrefsMenu){
+  if(!menu||!menu.querySelectorAll)return;
+  const active=_effectiveWorkspaceSortKey();
+  const createdOk=_workspaceCreatedSortAvailable();
+  menu.querySelectorAll('.workspace-prefs-item--radio').forEach(row=>{
+    const input=row&&row.querySelector?row.querySelector('input[name="workspaceSortKey"]'):null;
+    if(!input)return;
+    const checked=input.value===active;
+    const disabled=input.value==='created-desc'&&!createdOk;
+    input.checked=checked;
+    input.disabled=disabled;
+    row.setAttribute('aria-checked',checked?'true':'false');
+    row.setAttribute('aria-disabled',disabled?'true':'false');
+    if(row.classList&&row.classList.toggle) row.classList.toggle('is-disabled',disabled);
+    if(input.value==='created-desc'){
+      const copy=row.querySelector('.workspace-prefs-copy');
+      let meta=row.querySelector('.workspace-prefs-meta');
+      if(disabled){
+        if(!meta&&copy&&typeof document!=='undefined'){
+          meta=document.createElement('span');
+          meta.className='workspace-prefs-meta';
+          copy.appendChild(meta);
+        }
+        if(meta)meta.textContent=typeof t==='function'?t('workspace_sort_created_unavailable'):'Creation time is not reported by this server or platform.';
+      }else if(meta)meta.remove();
+    }
+  });
+  if(menu===_workspacePrefsMenu&&typeof _workspacePrefsAnchor!=='undefined'&&_workspacePrefsAnchor&&typeof _positionWorkspacePrefsMenu==='function') _positionWorkspacePrefsMenu(_workspacePrefsAnchor);
+}
 function _syncWorkspaceHiddenToggle(){
   const el=$('workspaceShowHiddenFiles');
   if(el)el.checked=!!S.showHiddenWorkspaceFiles;
-  // Reflect "hidden files are visible" state on the panel heading + kebab dot,
-  // so users can see they've flipped a non-default workspace pref without
-  // having to open the menu. The menu itself stays out of the way otherwise.
-  const ind=$('workspaceHiddenIndicator');
-  if(ind){
-    if(S.showHiddenWorkspaceFiles){ ind.hidden=false; ind.removeAttribute('hidden'); }
-    else { ind.hidden=true; ind.setAttribute('hidden',''); }
-  }
-  const dot=$('workspacePrefsDot');
-  if(dot){
-    if(S.showHiddenWorkspaceFiles){ dot.hidden=false; dot.removeAttribute('hidden'); }
-    else { dot.hidden=true; dot.setAttribute('hidden',''); }
-  }
+  _syncWorkspacePrefsIndicators($('workspaceHiddenIndicator'),$('workspacePrefsDot'));
 }
 function toggleWorkspaceHiddenFiles(value){
   S.showHiddenWorkspaceFiles=!!value;
@@ -16398,6 +20523,14 @@ function toggleWorkspaceHiddenFiles(value){
   renderFileTree();
 }
 try{S.showHiddenWorkspaceFiles=localStorage.getItem('hermes-workspace-show-hidden-files')==='1';}catch(_){}
+try{S.workspaceSortKey=_normalizeWorkspaceSortKey(localStorage.getItem('hermes-workspace-sort-key'));}catch(_){S.workspaceSortKey=WORKSPACE_SORT_DEFAULT;}
+function setWorkspaceSortKey(value){
+  S.workspaceSortKey=_normalizeWorkspaceSortKey(value);
+  try{localStorage.setItem('hermes-workspace-sort-key',S.workspaceSortKey);}catch(_){ }
+  _syncWorkspacePrefsIndicators();
+  _syncWorkspaceSortMenuState();
+  renderFileTree();
+}
 
 // ── Workspace preferences kebab menu (#1793 UX refinement) ───────────────
 // The "Show hidden files" toggle used to live as a permanent inline row
@@ -16435,6 +20568,35 @@ function _buildWorkspacePrefsMenu(){
   const menu=document.createElement('div');
   menu.className='workspace-prefs-menu open';
   menu.setAttribute('role','menu');
+  const group=document.createElement('div');
+  group.className='workspace-prefs-group';
+  group.setAttribute('role','group');
+  const groupLabel=(typeof t==='function'?t('workspace_sort_by'):'Sort by');
+  group.setAttribute('aria-label',groupLabel);
+  const head=document.createElement('div');
+  head.className='workspace-prefs-grouplabel';
+  head.textContent=groupLabel;
+  group.appendChild(head);
+  const createdOk=_workspaceCreatedSortAvailable();
+  const active=_effectiveWorkspaceSortKey();
+  [['name-asc','workspace_sort_name_asc'],['name-desc','workspace_sort_name_desc'],['created-desc','workspace_sort_created_desc'],['modified-desc','workspace_sort_modified_desc']].forEach(([key,i18nKey])=>{
+    const disabled=key==='created-desc'&&!createdOk;
+    const row=document.createElement('label');
+    row.className='workspace-prefs-item workspace-prefs-item--radio'+(disabled?' is-disabled':'');
+    row.setAttribute('role','menuitemradio');
+    row.setAttribute('aria-checked',active===key?'true':'false');
+    row.setAttribute('aria-disabled',disabled?'true':'false');
+    row.innerHTML='<input type="radio" name="workspaceSortKey" value="'+esc(key)+'" id="workspaceSort_'+esc(key)+'"'+(disabled?' disabled':'')+' onchange="setWorkspaceSortKey(this.value)">'+
+      '<span class="workspace-prefs-copy"><span class="workspace-prefs-name">'+esc(typeof t==='function'?t(i18nKey):key)+'</span>'+
+      (disabled?'<span class="workspace-prefs-meta">'+esc(typeof t==='function'?t('workspace_sort_created_unavailable'):'Creation time is not reported by this server or platform.')+'</span>':'')+'</span>';
+    const input=row.querySelector('input');
+    if(input)input.checked=active===key;
+    group.appendChild(row);
+  });
+  menu.appendChild(group);
+  const sep=document.createElement('div');
+  sep.className='workspace-prefs-sep';
+  menu.appendChild(sep);
   // The checkbox keeps id="workspaceShowHiddenFiles" so existing call
   // sites (and the existing test_issue1793_file_tree_cruft_filter test)
   // can find it the same way as before. Only the parent container moves.
@@ -16636,25 +20798,40 @@ if(!S._expandedDirs) S._expandedDirs=new Set();
 if(!S._dirCache) S._dirCache={};
 
 function renderFileTree(){
-  const box=$('fileTree');box.innerHTML='';
+  const box=$('fileTree');
+  // #5657: capture the scroll position before wiping the container. box.innerHTML=''
+  // detaches every row, collapsing scrollHeight so the browser clamps scrollTop to 0;
+  // without this, every expand/collapse, breadcrumb nav, refresh, and hidden-files
+  // toggle that re-runs renderFileTree() teleports the reader back to the top of a
+  // long tree. Restored only after the normal render tail below — the two early-return
+  // paths (no-workspace hides the box; empty-dir has nothing to scroll) legitimately
+  // reset. A plain scrollTop restore suffices here: expand/collapse insert/remove rows
+  // BELOW the clicked disclosure, so the clicked row keeps its offset from the top (no
+  // getBoundingClientRect anchor delta needed — that's only for prepend-above cases).
+  const prevScrollTop=box?box.scrollTop:0;
+  box.innerHTML='';
   // Cache current dir entries
   S._dirCache[S.currentDir||'.']=S.entries;
   // Show empty-state when no workspace is set or the directory is empty (#703)
   const emptyEl=$('wsEmptyState');
   const hasWorkspace=!!(S.session&&S.session.workspace);
   if(!hasWorkspace){
+    _syncWorkspaceBirthtimeSupportScope('');
     if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display='flex';}
     box.style.display='none';
     return;
   }
+  _noteWorkspaceBirthtimeSupport(S.entries);
   if(emptyEl) emptyEl.style.display='none';
   box.style.display='';
-  const visibleEntries=_visibleWorkspaceEntries(S.entries);
+  const visibleEntries=_workspaceEntriesForRender(S.entries);
   if(!visibleEntries.length){
     if(emptyEl){emptyEl.textContent=t('workspace_empty_dir');emptyEl.style.display='flex';}
     return;
   }
   _renderTreeItems(box, visibleEntries, 0);
+  // #5657: restore the pre-wipe scroll position now that the tree is tall again.
+  if(box) box.scrollTop=prevScrollTop;
 }
 
 let _wsActiveDragPath=null;
@@ -17035,7 +21212,7 @@ function _renderTreeItems(container, entries, depth){
 
     // Render children if directory is expanded
     if(isDirLike&&S._expandedDirs.has(item.path)){
-      const children=_visibleWorkspaceEntries(S._dirCache[item.path]||[]);
+      const children=_workspaceEntriesForRender(S._dirCache[item.path]||[]);
       if(children.length){
         _renderTreeItems(container, children, depth+1);
       }else{
@@ -17157,6 +21334,22 @@ function _showFileContextMenu(e, item){
       }
     };
     menu.appendChild(copyPathItem);
+
+    const copyRelPathItem=document.createElement('div');
+    copyRelPathItem.textContent=t('copy_relative_path');
+    copyRelPathItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    copyRelPathItem.onmouseenter=()=>copyRelPathItem.style.background='var(--hover-bg)';
+    copyRelPathItem.onmouseleave=()=>copyRelPathItem.style.background='';
+    copyRelPathItem.onclick=async()=>{
+      menu.remove();
+      try{
+        const rel=_normalizeWorkspaceRelPath(item.path)||item.path;
+        await _copyTextWithFallback(rel,t('path_copied'),t('path_copy_failed'));
+      }catch(err){
+        showToast(t('path_copy_failed')+(err.message||err));
+      }
+    };
+    menu.appendChild(copyRelPathItem);
   }
 
   if(isDirLike){
@@ -17167,9 +21360,9 @@ function _showFileContextMenu(e, item){
     dlItem.onmouseleave=()=>dlItem.style.background='';
     dlItem.onclick=()=>{
       menu.remove();
-      const url='/api/folder/download?session_id='+encodeURIComponent(S.session.session_id)
+      const rel='/api/folder/download?session_id='+encodeURIComponent(S.session.session_id)
               + '&path='+encodeURIComponent(item.path||'');
-      window.location.href=url;
+      window.location.href=new URL(rel.slice(1), document.baseURI||location.href).href;
     };
     menu.appendChild(dlItem);
   }
@@ -17251,8 +21444,10 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws) return;
     try{
-      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      // System-minted session (#6022): explicit worktree:false — creating a
+      // file from a blank page must not inherit the config worktree default.
+      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(r.session);S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
@@ -17282,8 +21477,10 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws) return;
     try{
-      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws})});
-      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      // System-minted session (#6022): explicit worktree:false — creating a
+      // folder from a blank page must not inherit the config worktree default.
+      const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(r.session);S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;
@@ -17373,18 +21570,65 @@ function addFiles(files){
   }
   renderTray();
 }
-async function uploadPendingFiles(){
-  if(!S.pendingFiles.length||!S.session)return[];
-  const names=[];let failures=0;
+const _uploadPendingFilesProgressBySession=new Map();
+function _uploadPendingFilesCurrentSession(sessionId){
+  return !!(!sessionId||(S.session&&S.session.session_id===sessionId));
+}
+function _uploadPendingFilesHideProgressBar(){
   const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
-  barWrap.classList.add('active');bar.style.width='0%';
-  const total=S.pendingFiles.length;
+  if(!bar||!barWrap)return;
+  barWrap.classList.remove('active');
+  bar.style.width='0%';
+  if(barWrap.dataset)delete barWrap.dataset.uploadSessionId;
+}
+function _uploadPendingFilesShowProgressBar(owner,percent){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  if(barWrap.dataset)barWrap.dataset.uploadSessionId=owner;
+  barWrap.classList.add('active');
+  bar.style.width=`${Math.max(0,Math.min(100,Number(percent)||0))}%`;
+}
+function _uploadPendingFilesSyncProgressForSession(sessionId){
+  const owner=String(sessionId||'');
+  const state=owner?_uploadPendingFilesProgressBySession.get(owner):null;
+  if(state){_uploadPendingFilesShowProgressBar(owner,state.percent);return;}
+  _uploadPendingFilesHideProgressBar();
+}
+function _uploadPendingFilesUpdateProgress(sessionId,percent){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  const owner=String(sessionId||'');
+  const activeForOwner=barWrap.dataset&&barWrap.dataset.uploadSessionId===owner;
+  if(percent===null){
+    if(owner)_uploadPendingFilesProgressBySession.delete(owner);
+    if(activeForOwner){
+      _uploadPendingFilesHideProgressBar();
+    }
+    return;
+  }
+  const clamped=Math.max(0,Math.min(100,Number(percent)||0));
+  if(owner)_uploadPendingFilesProgressBySession.set(owner,{percent:clamped});
+  if(!_uploadPendingFilesCurrentSession(sessionId)){
+    if(activeForOwner)_uploadPendingFilesHideProgressBar();
+    return;
+  }
+  _uploadPendingFilesShowProgressBar(owner,clamped);
+}
+async function uploadPendingFiles(options={}){
+  const opts=options||{};
+  const pendingFiles=Array.isArray(opts.files)?opts.files.filter(Boolean):[...(S.pendingFiles||[])];
+  const sessionId=String(opts.sessionId||(S.session&&S.session.session_id)||'');
+  if(!pendingFiles.length||!sessionId)return[];
+  const clearPending=!(opts&&opts.clearPending===false);
+  const names=[];let failures=0;
+  _uploadPendingFilesUpdateProgress(sessionId,0);
+  const total=pendingFiles.length;
   for(let i=0;i<total;i++){
-    const f=S.pendingFiles[i];
+    const f=pendingFiles[i];
     try{
       if(f&&f.size>MAX_UPLOAD_BYTES)throw new Error(_uploadTooLargeMessage(f));
       const fd=new FormData();
-      fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
+      fd.append('session_id',sessionId);fd.append('file',f,f.name);
       const isArchive=_ARCHIVE_EXTS.test(f.name);
       const url=new URL(isArchive?'api/upload/extract':'api/upload',document.baseURI||location.href).href;
       const res=await fetch(url,{method:'POST',credentials:'include',body:fd});
@@ -17394,15 +21638,16 @@ async function uploadPendingFiles(){
       if(data.error)throw new Error(data.error);
       if(isArchive){
         names.push({name: data.dest, path: data.dest, extracted: data.extracted});
-        if(typeof loadDir==='function')loadDir(S.currentDir||'.');
+        if(typeof loadDir==='function'&&_uploadPendingFilesCurrentSession(sessionId))loadDir(S.currentDir||'.');
       }else{
         names.push({name: data.filename, path: data.path, mime: data.mime, size: data.size, is_image: !!data.is_image});
       }
     }catch(e){failures++;setStatus(`\u274c ${t('upload_failed')}${f.name} \u2014 ${e.message}`);}
-    bar.style.width=`${Math.round((i+1)/total*100)}%`;
+    _uploadPendingFilesUpdateProgress(sessionId,Math.round((i+1)/total*100));
   }
-  barWrap.classList.remove('active');bar.style.width='0%';
-  S.pendingFiles=[];renderTray();
+  _uploadPendingFilesUpdateProgress(sessionId,null);
+  if(clearPending&&_uploadPendingFilesCurrentSession(sessionId)){S.pendingFiles=[];renderTray();}
+  else if(typeof renderTray==='function'&&_uploadPendingFilesCurrentSession(sessionId))renderTray();
   if(failures===total&&total>0)throw new Error(t('all_uploads_failed',total));
   // Show extraction summary
   const extracted=names.filter(n=>n.extracted);
