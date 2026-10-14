@@ -435,6 +435,7 @@ Full list of environment variables:
 |---|---|---|
 | `HERMES_WEBUI_AGENT_DIR` | auto-discovered | Path to the Hermes Agent source or installed module root |
 | `HERMES_WEBUI_PYTHON` | auto-discovered | Python executable |
+| `HERMES_WEBUI_SKIP_PIP_INSTALL` | *(unset)* | Set truthy (`1`/`true`/`yes`/`on`) to skip startup pip/uv installs. Also honored: `HERMES_DISABLE_LAZY_INSTALLS`. Startup still skips the install when the interpreter can already import the Agent, and a read-only or permission failure is logged once and not retried |
 | `HERMES_WEBUI_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for all IPv4, `::` for all IPv6, `::1` for IPv6 loopback) |
 | `HERMES_WEBUI_PORT` | `8787` | Port |
 | `HERMES_WEBUI_STATE_DIR` | `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) | Where sessions and state are stored. **Note (upgrade):** the default now follows `HERMES_HOME` — if you previously relocated `HERMES_HOME` to a non-default base **without** setting `HERMES_WEBUI_STATE_DIR`, your WebUI state now resolves to `$HERMES_HOME/webui` instead of the old platform-default `~/.hermes/webui`. To keep using the old location, set `HERMES_WEBUI_STATE_DIR` to it (or move the directory). Installs with `HERMES_HOME` unset or at the default base are unaffected. |

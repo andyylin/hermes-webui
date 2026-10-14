@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from api.paths import _platform_default_hermes_home
+from managed_agent_startup import install_failure_is_readonly, runtime_pip_install_disabled
 
 # Credential files that should never be world-readable
 _SENSITIVE_FILES = (
@@ -299,6 +300,39 @@ def _trusted_agent_dir(agent_dir: Path) -> bool:
         return False
 
 
+def requirement_names(requirements_text: str) -> list[str]:
+    """Distribution names from a requirements.txt body, skipping comments and options."""
+    names: list[str] = []
+    for raw in requirements_text.splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line or line[:1] in '-#' or line.startswith(('git+', 'http://', 'https://')):
+            continue
+        name: list[str] = []
+        for ch in line:
+            if ch.isalnum() or ch in '._-':
+                name.append(ch)
+            else:
+                break
+        dist = ''.join(name).strip('._-')
+        if dist:
+            names.append(dist)
+    return names
+
+
+def distributions_installed(names: list[str]) -> bool:
+    """True when every distribution name is already installed in this interpreter."""
+    if not names:
+        return False
+    import importlib.metadata as metadata
+
+    for name in names:
+        try:
+            metadata.version(name)
+        except metadata.PackageNotFoundError:
+            return False
+    return True
+
+
 def auto_install_agent_deps(expected_agent_dir: Path | None = None) -> bool:
     enabled = os.environ.get('HERMES_WEBUI_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes')
     if not enabled:
@@ -317,6 +351,10 @@ def auto_install_agent_deps(expected_agent_dir: Path | None = None) -> bool:
     req_file = agent_dir / 'requirements.txt'
     pyproject = agent_dir / 'pyproject.toml'
     if req_file.exists():
+        names = requirement_names(req_file.read_text(encoding='utf-8'))
+        if names and distributions_installed(names):
+            print(f'[ok] Requirements already satisfied ({req_file}); skipping pip install.', flush=True)
+            return True
         install_args = [sys.executable, '-m', 'pip', 'install', '--quiet', '-r', str(req_file)]
         print(f'     Installing from {req_file} ...', flush=True)
     elif pyproject.exists():
@@ -325,11 +363,26 @@ def auto_install_agent_deps(expected_agent_dir: Path | None = None) -> bool:
     else:
         print('[!!] Auto-install skipped: no requirements.txt or pyproject.toml in agent dir.', flush=True)
         return False
+    if runtime_pip_install_disabled():
+        print(
+            '[!!] Auto-install skipped: HERMES_WEBUI_SKIP_PIP_INSTALL or '
+            'HERMES_DISABLE_LAZY_INSTALLS is set.',
+            flush=True,
+        )
+        return False
     try:
         result = subprocess.run(install_args, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
+            detail = result.stderr or result.stdout or ''
+            if install_failure_is_readonly(detail):
+                print(
+                    '[!!] pip install failed because the environment is read-only or '
+                    'not writable. Continuing without retrying.',
+                    flush=True,
+                )
+                return False
             print(f'[!!] pip install failed (exit {result.returncode}):', flush=True)
-            for line in (result.stderr or '').splitlines()[-10:]:
+            for line in (detail).splitlines()[-10:]:
                 print(f'     {line}', flush=True)
             return False
         print('[ok] pip install completed.', flush=True)

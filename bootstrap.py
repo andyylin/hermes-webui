@@ -20,6 +20,12 @@ import webbrowser
 from pathlib import Path
 
 from api import startup as _startup
+from managed_agent_startup import (
+    imports_without_install,
+    install_failure_is_readonly,
+    interpreter_install_target_writable,
+    runtime_pip_install_disabled,
+)
 
 
 INSTALLER_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
@@ -193,6 +199,94 @@ def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = No
     return check.returncode == 0
 
 
+def _requirements_already_satisfied(python_exe: str) -> bool:
+    """True when ``requirements.txt`` distributions are already installed there.
+
+    Missing files and probes that do not run count as not satisfied, so a fresh
+    checkout still installs. A mocked or failed probe must not look like success.
+    """
+    req = REPO_ROOT / "requirements.txt"
+    if not req.is_file() or not python_exe or not os.access(python_exe, os.X_OK):
+        return False
+    names = _startup.requirement_names(req.read_text(encoding="utf-8"))
+    if not names:
+        return False
+    script = (
+        "import importlib.metadata as metadata, sys\n"
+        "for name in sys.argv[1:]:\n"
+        "    try:\n"
+        "        metadata.version(name)\n"
+        "    except metadata.PackageNotFoundError:\n"
+        "        raise SystemExit(1)\n"
+        "raise SystemExit(0)\n"
+    )
+    try:
+        result = subprocess.run(
+            [python_exe, "-c", script, *names],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return getattr(result, "returncode", None) == 0
+
+
+def _install_failure_text(exc: BaseException) -> str:
+    parts = [str(exc)]
+    for attr in ("stderr", "stdout", "output"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        if value:
+            parts.append(str(value))
+    errno_value = getattr(exc, "errno", None)
+    if errno_value is not None:
+        parts.append(f"errno {errno_value}")
+    return "\n".join(parts)
+
+
+def _pip_install_webui_requirements(venv_python: Path) -> str:
+    """Install WebUI requirements once.
+
+    Returns ``satisfied`` (nothing to do), ``ok`` (install finished), or
+    ``readonly`` (one read-only/permission failure; the caller must not retry).
+    """
+    if _requirements_already_satisfied(str(venv_python)):
+        info("WebUI requirements already satisfied; skipping pip install.")
+        return "satisfied"
+    info("Installing WebUI dependencies into local virtualenv")
+    commands = (
+        [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "-r",
+            str(REPO_ROOT / "requirements.txt"),
+        ],
+    )
+    for command in commands:
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            detail = _install_failure_text(exc)
+            errno_value = exc.errno if isinstance(exc, OSError) else None
+            if install_failure_is_readonly(detail, errno_value):
+                warn(
+                    "pip install failed because the Python environment is read-only "
+                    "or not writable. Continuing without retrying. Set "
+                    "HERMES_WEBUI_SKIP_PIP_INSTALL=1 on managed hosts to skip this step."
+                )
+                return "readonly"
+            if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                warn(exc.stderr[-2000:])
+            raise
+    return "ok"
+
+
 def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None) -> str:
     """Return a Python executable that can run both WebUI and Hermes Agent.
 
@@ -201,8 +295,15 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
     import path. In that case the server starts healthy, then chat fails later
     with "AIAgent not available". Prefer the agent venv when it is usable, and
     validate the final interpreter before starting the server.
+
+    Startup does not install when the interpreter can already import the Agent
+    and YAML without a sync, when ``HERMES_WEBUI_SKIP_PIP_INSTALL`` or
+    ``HERMES_DISABLE_LAZY_INSTALLS`` is set, or when the interpreter's
+    site-packages is read-only. A pip install that fails with a permission or
+    read-only error is logged once and is not retried.
     """
-    if _python_can_run_webui_and_agent(python_exe, agent_dir):
+    agent_dir_text = str(agent_dir) if agent_dir else None
+    if imports_without_install(python_exe, agent_dir_text):
         return python_exe
 
     agent_candidates: list[Path] = []
@@ -216,8 +317,30 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
             agent_candidates.append(agent_dir / rel)
         for candidate in agent_candidates:
             if str(candidate) != python_exe and candidate.exists():
-                if _python_can_run_webui_and_agent(str(candidate), agent_dir):
+                if imports_without_install(str(candidate), agent_dir_text):
                     return str(candidate)
+
+    if runtime_pip_install_disabled():
+        info(
+            "Skipping runtime pip install "
+            "(HERMES_WEBUI_SKIP_PIP_INSTALL or HERMES_DISABLE_LAZY_INSTALLS)."
+        )
+        return python_exe
+
+    if interpreter_install_target_writable(python_exe) is False:
+        warn(
+            "Skipping runtime pip install: the Python environment is read-only "
+            "or not writable. Continuing without installing or retrying."
+        )
+        return python_exe
+
+    if _python_can_run_webui_and_agent(python_exe, agent_dir):
+        return python_exe
+
+    for candidate in agent_candidates:
+        if str(candidate) != python_exe and candidate.exists():
+            if _python_can_run_webui_and_agent(str(candidate), agent_dir):
+                return str(candidate)
 
     if (os.getenv("HERMES_WEBUI_DISABLE_LOCAL_VENV") or "").strip().lower() in {"1", "true", "yes", "on"}:
         raise RuntimeError(
@@ -243,25 +366,11 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
         # so this is safe to set unconditionally.
         venv.EnvBuilder(with_pip=True, symlinks=True).create(venv_dir)
 
-    info("Installing WebUI dependencies into local virtualenv")
-    subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
-        check=True,
-    )
-    subprocess.run(
-        [
-            str(venv_python),
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            "-r",
-            str(REPO_ROOT / "requirements.txt"),
-        ],
-        check=True,
-    )
+    outcome = _pip_install_webui_requirements(venv_python)
     if _python_can_run_webui_and_agent(str(venv_python), agent_dir):
         return str(venv_python)
+    if outcome == "readonly":
+        return python_exe
     raise RuntimeError(
         "Python environment cannot import both WebUI dependencies and Hermes Agent. "
         "Set HERMES_WEBUI_PYTHON to the Hermes Agent venv Python or install the "

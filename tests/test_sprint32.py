@@ -31,9 +31,11 @@ class TestAutoInstallAgentDeps:
         agent_dir = tmp_path / 'hermes-agent'
         agent_dir.mkdir()
         req = agent_dir / 'requirements.txt'
-        req.write_text('pyyaml\n')
+        req.write_text('not-a-real-webui-dist\n')
         env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
         with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            os.environ.pop('HERMES_WEBUI_SKIP_PIP_INSTALL', None)
             with patch('api.startup._trusted_agent_dir', return_value=True):
                 with patch('subprocess.run') as mock_run:
                     mock_run.return_value = MagicMock(returncode=0, stderr='')
@@ -56,6 +58,8 @@ class TestAutoInstallAgentDeps:
         (agent_dir / 'pyproject.toml').write_text('[project]\nname="hermes-agent"\n')
         env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
         with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            os.environ.pop('HERMES_WEBUI_SKIP_PIP_INSTALL', None)
             with patch('api.startup._trusted_agent_dir', return_value=True):
                 with patch('subprocess.run') as mock_run:
                     mock_run.return_value = MagicMock(returncode=0, stderr='')
@@ -107,6 +111,8 @@ class TestAutoInstallAgentDeps:
         (agent_dir / 'requirements.txt').write_text('somepkg\n')
         env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
         with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            os.environ.pop('HERMES_WEBUI_SKIP_PIP_INSTALL', None)
             with patch('api.startup._trusted_agent_dir', return_value=True):
                 with patch('subprocess.run') as mock_run:
                     mock_run.return_value = MagicMock(returncode=1, stderr='ERROR: could not find package')
@@ -120,7 +126,62 @@ class TestAutoInstallAgentDeps:
         (agent_dir / 'requirements.txt').write_text('somepkg\n')
         env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
         with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            os.environ.pop('HERMES_WEBUI_SKIP_PIP_INSTALL', None)
             with patch('api.startup._trusted_agent_dir', return_value=True):
                 with patch('subprocess.run', side_effect=subprocess.TimeoutExpired('pip', 120)):
                     assert auto_install_agent_deps(expected_agent_dir=agent_dir) is False
         assert 'timed out' in capsys.readouterr().out.lower()
+
+    def test_skips_when_skip_pip_install_set(self, tmp_path, capsys):
+        agent_dir = tmp_path / 'hermes-agent'
+        agent_dir.mkdir()
+        (agent_dir / 'requirements.txt').write_text('somepkg\n')
+        env = {
+            'HERMES_WEBUI_AGENT_DIR': str(agent_dir),
+            'HERMES_WEBUI_AUTO_INSTALL': '1',
+            'HERMES_WEBUI_SKIP_PIP_INSTALL': '1',
+        }
+        with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            with patch('api.startup._trusted_agent_dir', return_value=True):
+                with patch('subprocess.run') as mock_run:
+                    assert auto_install_agent_deps(expected_agent_dir=agent_dir) is False
+                    mock_run.assert_not_called()
+        assert 'HERMES_WEBUI_SKIP_PIP_INSTALL' in capsys.readouterr().out
+
+    def test_skips_when_requirements_already_installed(self, tmp_path, capsys):
+        agent_dir = tmp_path / 'hermes-agent'
+        agent_dir.mkdir()
+        (agent_dir / 'requirements.txt').write_text('already-there>=1\n')
+        env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
+        with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            os.environ.pop('HERMES_WEBUI_SKIP_PIP_INSTALL', None)
+            with patch('api.startup._trusted_agent_dir', return_value=True):
+                with patch('importlib.metadata.version', return_value='1.2.3'):
+                    with patch('subprocess.run') as mock_run:
+                        assert auto_install_agent_deps(expected_agent_dir=agent_dir) is True
+                        mock_run.assert_not_called()
+        assert 'already satisfied' in capsys.readouterr().out.lower()
+
+    def test_readonly_pip_failure_does_not_retry(self, tmp_path, capsys):
+        agent_dir = tmp_path / 'hermes-agent'
+        agent_dir.mkdir()
+        (agent_dir / 'requirements.txt').write_text('somepkg\n')
+        env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
+        with patch.dict('os.environ', env, clear=False):
+            os.environ.pop('HERMES_DISABLE_LAZY_INSTALLS', None)
+            os.environ.pop('HERMES_WEBUI_SKIP_PIP_INSTALL', None)
+            with patch('api.startup._trusted_agent_dir', return_value=True):
+                with patch('subprocess.run') as mock_run:
+                    mock_run.return_value = MagicMock(
+                        returncode=1,
+                        stderr='ERROR: [Errno 30] Read-only file system: \'/opt/venv\'',
+                        stdout='',
+                    )
+                    assert auto_install_agent_deps(expected_agent_dir=agent_dir) is False
+                    assert mock_run.call_count == 1
+        out = capsys.readouterr().out.lower()
+        assert 'read-only' in out
+        assert 'without retrying' in out

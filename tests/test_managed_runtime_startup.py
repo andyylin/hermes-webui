@@ -119,6 +119,71 @@ def test_legacy_agent_without_bootstrap_is_not_put_at_front_of_sys_path(tmp_path
     assert "INDEX -1" in result.stdout
 
 
+def test_skip_pip_install_suppresses_agent_sync(tmp_path):
+    """The opt-out must reach hermes_bootstrap so uv sync does not run."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "run_agent.py").write_text("class AIAgent: pass\n", encoding="utf-8")
+    (agent_dir / "pydantic_core.py").write_text("x = 1\n", encoding="utf-8")
+    marker = tmp_path / "install-marker"
+    (agent_dir / "hermes_bootstrap.py").write_text(
+        "import os, pathlib\n"
+        f"path = pathlib.Path({str(marker)!r})\n"
+        "flag = os.environ.get('HERMES_DISABLE_LAZY_INSTALLS', '').strip().lower()\n"
+        "path.write_text('suppressed' if flag in ('1', 'true', 'yes', 'on') else 'installed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("HERMES_DISABLE_LAZY_INSTALLS", None)
+    env["HERMES_WEBUI_AGENT_DIR"] = str(agent_dir)
+    env["HERMES_WEBUI_SKIP_PIP_INSTALL"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", "import managed_agent_startup as m; m.activate_managed_agent()"],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "suppressed"
+    assert "Skipping startup dependency install" in result.stdout
+
+
+def test_satisfied_agent_imports_skip_sync(tmp_path):
+    """An interpreter that can already import the Agent must not sync."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "run_agent.py").write_text("class AIAgent: pass\n", encoding="utf-8")
+    (agent_dir / "pydantic_core.py").write_text("x = 1\n", encoding="utf-8")
+    (agent_dir / "yaml.py").write_text("parsed = True\n", encoding="utf-8")
+    marker = tmp_path / "install-marker"
+    (agent_dir / "hermes_bootstrap.py").write_text(
+        "import os, pathlib\n"
+        f"path = pathlib.Path({str(marker)!r})\n"
+        "flag = os.environ.get('HERMES_DISABLE_LAZY_INSTALLS', '').strip().lower()\n"
+        "path.write_text('suppressed' if flag in ('1', 'true', 'yes', 'on') else 'installed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("HERMES_DISABLE_LAZY_INSTALLS", None)
+    env.pop("HERMES_WEBUI_SKIP_PIP_INSTALL", None)
+    env["HERMES_WEBUI_AGENT_DIR"] = str(agent_dir)
+    result = subprocess.run(
+        [sys.executable, "-c", "import managed_agent_startup as m; m.activate_managed_agent()"],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert marker.read_text(encoding="utf-8") == "suppressed"
+    assert "already importable" in result.stdout
+
+
 def test_server_propagates_bootstrap_system_exit(tmp_path):
     """The Agent's own relaunch/repair exit (SystemExit) is not swallowed."""
     agent_dir = tmp_path / "exiting-agent"
