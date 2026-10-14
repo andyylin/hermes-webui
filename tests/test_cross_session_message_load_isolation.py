@@ -91,6 +91,7 @@ LOAD_SESSION_SRC = _extract_function(SESSIONS_SRC, "loadSession")
 ENSURE_MESSAGES_LOADED_SRC = _extract_function(SESSIONS_SRC, "_ensureMessagesLoaded")
 INFLIGHT_HAS_VISIBLE_STATE_SRC = _extract_function(SESSIONS_SRC, "_inflightHasVisibleLiveState")
 SELECT_LIVE_RECOVERY_INFLIGHT_SRC = _extract_function(SESSIONS_SRC, "_selectLiveRecoveryInflight")
+MERGE_PENDING_SESSION_MESSAGE_SRC = _extract_function(SESSIONS_SRC, "_mergePendingSessionMessage")
 
 
 def _normalise_ws(s: str) -> str:
@@ -238,7 +239,6 @@ function createEnvironment() {
   globalThis._sessionProfileMismatchFromError = () => null;
   globalThis._switchProfileForSessionLoad = async () => {};
   globalThis._clearSameSessionForceReloadHint = () => { clearHintCalls += 1; };
-  globalThis._clearStuckSessionOnBoot = () => {};
   globalThis._setSessionViewedCount = () => {};
   // #4946: loadSession() now routes its viewed-count/unread clear through
   // _acknowledgeSessionVisit(). This harness exercises cross-session load
@@ -348,6 +348,7 @@ let toastCalls = [];
 // Source under test
 __INFLIGHT_HAS_VISIBLE_STATE_SRC__
 __SELECT_LIVE_RECOVERY_INFLIGHT_SRC__
+__MERGE_PENDING_SESSION_MESSAGE_SRC__
 __LOAD_SESSION_SRC__
 __ENSURE_MESSAGES_LOADED_SRC__
 
@@ -576,10 +577,12 @@ runAll()
 '''
 
 
-def _run_node(script: str) -> dict:
+def _run_node(script: str, tmp_path: Path) -> dict:
     assert NODE is not None, "node is required"
+    script_path = tmp_path / "cross-session-message-load-isolation.mjs"
+    script_path.write_text(script, encoding="utf-8")
     completed = subprocess.run(
-        [NODE, "--input-type=module", "-e", script],
+        [NODE, str(script_path)],
         cwd=str(REPO),
         text=True,
         capture_output=True,
@@ -593,7 +596,7 @@ def _run_node(script: str) -> dict:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
+def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
     script = (
         _NODE_SCRIPT_TEMPLATE.replace(
             "__INFLIGHT_HAS_VISIBLE_STATE_SRC__", INFLIGHT_HAS_VISIBLE_STATE_SRC
@@ -601,10 +604,13 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
         .replace(
             "__SELECT_LIVE_RECOVERY_INFLIGHT_SRC__", SELECT_LIVE_RECOVERY_INFLIGHT_SRC
         )
+        .replace(
+            "__MERGE_PENDING_SESSION_MESSAGE_SRC__", MERGE_PENDING_SESSION_MESSAGE_SRC
+        )
         .replace("__LOAD_SESSION_SRC__", LOAD_SESSION_SRC)
         .replace("__ENSURE_MESSAGES_LOADED_SRC__", ENSURE_MESSAGES_LOADED_SRC)
     )
-    body = _run_node(script)
+    body = _run_node(script, tmp_path)
 
     cross = body["crossSessionOrdering"]
     stale = body["staleIdleCatch"]

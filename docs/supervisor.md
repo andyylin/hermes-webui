@@ -136,6 +136,26 @@ journalctl --user -u hermes-webui.service -f
 systemd sets ``INVOCATION_ID`` and ``JOURNAL_STREAM`` (when stdio is wired to
 the journal), both of which auto-promote to foreground mode.
 
+### Managed or read-only virtualenvs
+
+A pre-provisioned interpreter (``HERMES_WEBUI_PYTHON`` pointing at a shared
+venv) on a host with ``ProtectSystem=full`` cannot ``pip`` or ``uv sync`` at
+startup. Bootstrap and ``managed_agent_startup`` skip that install when the
+interpreter can already import the Agent and its YAML dependency, or when
+either of these is set:
+
+- ``HERMES_WEBUI_SKIP_PIP_INSTALL=1`` — WebUI opt-out for the startup install
+- ``HERMES_DISABLE_LAZY_INSTALLS=1`` — the Agent's existing opt-out; WebUI
+  honors it the same way
+
+Set the variable on the unit (or the launcher that execs ``start.sh`` /
+``bootstrap.py``). When relaunch is suppressed this way, keep
+``HERMES_WEBUI_PYTHON`` pointed at the store interpreter the service should
+run. If an install is still attempted and the target is read-only, startup
+logs one warning and continues; it does not retry the install.
+
+The rpi5 unit and launcher that would set this live outside this repo.
+
 ## supervisord (cross-platform)
 
 ``/etc/supervisor/conf.d/hermes-webui.conf``:

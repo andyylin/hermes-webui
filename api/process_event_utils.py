@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import inspect
 import logging
+import math
 import re
 import threading
 import time
@@ -137,7 +139,38 @@ def attach_wakeup_display_meta(msg: Any, source: Any) -> None:
         msg["_wakeup_meta"] = meta
 
 
-def stamp_message_source(msg: Any, source: Any) -> None:
+def is_hidden_transcript_row(msg: Any) -> bool:
+    """Return True when a transcript row is internal and must never render.
+
+    Single predicate every transcript consumer calls — restore window, retry
+    target, content search, title derivation, HTML export, public shares, and
+    visible counts — so a hidden row hidden in one surface stays hidden in all
+    of them (#quiet-delegation gate review). Keyed on the typed ``_source``
+    stamp only, never on content: content sniffing would misclassify real user
+    rows whose text merely resembles a wakeup envelope.
+    """
+    return isinstance(msg, dict) and msg.get("_source") == "delegation_wakeup"
+
+
+def build_active_turn_token(stream_id: Any, started_at: Any) -> str | None:
+    """Return the exact eager-row token for one active WebUI turn."""
+    if not stream_id:
+        return None
+    try:
+        started = float(started_at)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(started) or started <= 0:
+        return None
+    return f"{str(stream_id).strip()}:{started:.17g}"
+
+
+def stamp_message_source(
+    msg: Any,
+    source: Any,
+    *,
+    active_turn_token: Any = None,
+) -> None:
     """Stamp ``_source`` and any display metadata on a materialized user turn.
 
     Single choke point for every path that persists a non-``webui`` user turn
@@ -147,6 +180,8 @@ def stamp_message_source(msg: Any, source: Any) -> None:
     and the cancel outer-finally recovery. ``webui`` turns are left untouched to
     preserve the existing "``_source`` omitted for the default source" contract.
     """
+    if isinstance(msg, dict) and active_turn_token:
+        msg["_active_turn_token"] = str(active_turn_token)
     if not isinstance(msg, dict) or not source or source == "webui":
         return
     msg["_source"] = source
@@ -166,6 +201,26 @@ def _claim_bounded_local(delegation_id: str) -> bool:
 def _release_bounded_local(delegation_id: str) -> None:
     with _LEGACY_ASYNC_DELIVERY_LOCK:
         _LEGACY_ASYNC_DELIVERY_IDS.pop(delegation_id, None)
+
+
+def restore_durable_process_completions(process_registry: Any) -> None:
+    """Rehydrate the Agent's durable completion ledger before a WebUI drain.
+
+    Current Hermes Agent builds restore durable async-delegation completions on
+    first consume (``ProcessRegistry.restore_completions()``) instead of on
+    import. WebUI reads ``completion_queue`` directly rather than through
+    ``drain_notifications()``, so it must cross that boundary itself or a
+    completion that survived a restart stays in the ledger undelivered. The
+    Agent method is once-per-process and replays in the launch profile scope;
+    older builds without it keep their import-time restore.
+    """
+    restore = getattr(process_registry, "restore_completions", None)
+    if not callable(restore):
+        return
+    try:
+        restore()
+    except Exception:
+        logger.warning("Failed to restore durable process completions", exc_info=True)
 
 
 def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> bool:
@@ -430,16 +485,46 @@ def complete_async_delegation_delivery(
     _mark_legacy_async_delivery_complete(claim.delegation_id)
 
 
+def _release_accepts_retryable(release_fn: Any) -> bool:
+    """Whether the core ``release_event_delivery`` supports ``retryable=``.
+
+    Older Agent cores predate the keyword; calling them with it would raise
+    ``TypeError`` and skip the release entirely.
+    """
+    try:
+        params = inspect.signature(release_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "retryable" in params:
+        return params["retryable"].kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def release_async_delegation_delivery(
     evt: Any,
     claim: AsyncDelegationDeliveryClaim,
+    *,
+    retryable: bool = False,
 ) -> None:
-    """Release a failed claim so a later WebUI consumer can retry it."""
+    """Release a failed claim so a later WebUI consumer can retry it.
+
+    ``retryable=True`` tells the core the refusal was transient, so the claimed
+    attempt is refunded instead of counting against the bounded delivery
+    budget (``tools.async_delegation.release_event_delivery(...,
+    retryable=True)``). A core that predates the keyword gets a plain release:
+    the attempt is then consumed as before, never an exception.
+    """
     try:
         if claim.durable:
             from tools.async_delegation import release_event_delivery
 
-            release_event_delivery(evt, claim.claim_id)
+            if retryable and _release_accepts_retryable(release_event_delivery):
+                release_event_delivery(evt, claim.claim_id, retryable=True)
+            else:
+                release_event_delivery(evt, claim.claim_id)
     except Exception:
         logger.warning(
             "Failed to release durable async delegation delivery for %s",
